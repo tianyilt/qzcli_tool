@@ -1,0 +1,17 @@
+#!/usr/bin/env python3
+"""
+qzcli 可执行入口
+"""
+
+import sys
+import os
+
+# 添加项目路径
+script_dir = os.path.dirname(os.path.abspath(__file__))
+project_dir = os.path.dirname(script_dir)
+sys.path.insert(0, project_dir)
+
+from qzcli.cli import main
+
+if __name__ == "__main__":
+    sys.exit(main())
