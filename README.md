@@ -37,8 +37,8 @@ pip install rich requests
 # 1. 登录（自动获取 cookie）
 qzcli login
 
-# 2. 更新资源缓存
-qzcli res -u
+# 2. 更新资源缓存（首次使用或工作空间变更后必须执行）
+qzcli res -u -w 分布式
 
 # 3. 查看空余节点
 qzcli avail
@@ -46,6 +46,9 @@ qzcli avail
 # 4. 查看运行中的任务
 qzcli ls -c -r
 ```
+
+> **重要**: 如果遇到 `未找到名称为 'xxx' 的工作空间` 错误，请先执行 `qzcli res -u` 更新缓存。
+> 工作空间信息需要先通过 API 获取并缓存到本地，之后才能使用名称（如 `CI-情景智能`）进行查询。
 
 ## 推荐工作流
 
