@@ -19,10 +19,10 @@ qzcli login -u 用户名 -p 密码 && qzcli avail
 分布式
   计算组                          空节点     低优空余    总节点     空GPU GPU类型     
   ---------------------------------------------------------------------------
-  H200-3号机房-2                    3        1    234  40/1872 H200      
-  H200-3号机房                      0        0    574   1/4584 H200      
-  H200-2号机房                      0        0    242   2/1933 H200      
-  cuda12.8版本H100                 0        0    203  25/1624 H100   
+  某gpu2-3号机房-2                    3        1    xxx  x/xxx 某gpu2      
+  某gpu2-3号机房                      0        0    xxx   x/xxx 某gpu2      
+  某gpu2-2号机房                      0        0    xxx   x/xxx 某gpu2      
+  cuda12.8版本某gpu1                 0        0    xxx  x/xxx 某gpu1   
 ```
 
 ## 安装依赖
@@ -59,11 +59,11 @@ qzcli login && qzcli avail
 # CI-情景智能
 #   计算组                          空节点    总节点 GPU类型     
 #   -----------------------------------------------------
-#   OV3蒸馏训练组                       4      8 H200      
-#   openveo训练组                     1     79 H200      
+#   OV3蒸馏训练组                       4      xxx 某gpu2      
+#   openveo训练组                     1     xxx 某gpu2      
 #   ...
 # 分布式
-#   H200-2号机房                      1    200 H200      
+#   某gpu2-2号机房                      1    xxx 某gpu2      
 ```
 
 ### 提交任务前
@@ -73,7 +73,7 @@ qzcli login && qzcli avail
 qzcli avail -n 4 -e
 
 # 输出：
-# ✓ [CI-情景智能] OV3蒸馏训练组  4 空节点 [H200]
+# ✓ [CI-情景智能] OV3蒸馏训练组  4 空节点 [某gpu2]
 # WORKSPACE_ID="ws-xxx"
 # LOGIC_COMPUTE_GROUP_ID="lcg-xxx"
 ```
@@ -196,9 +196,9 @@ qzcli ws -p "长视频"
 CI-情景智能
   计算组                          空节点    总节点 GPU类型     
   -----------------------------------------------------
-  OV3蒸馏训练组                       4      8 H200      
+  OV3蒸馏训练组                       4      8 某gpu2      
     空闲: qb-prod-gpu1006, qb-prod-gpu1029, qb-prod-gpu1034, qb-prod-gpu1064
-  openveo训练组                     1     79 H200      
+  openveo训练组                     1     79 某gpu2      
     空闲: qb-prod-gpu2000
 ```
 
@@ -209,12 +209,12 @@ CI-情景智能
 
 [1] ● 运行中 | 44分钟前 | 44分36秒
     eval-OpenVeo3-I2VA-A14B-1227-8s...
-    8×H200 | 4节点 | GPU资源组
+    8×某gpu2 | 4节点 | GPU资源组
     https://qz.sii.edu.cn/jobs/distributedTrainingDetail/job-xxx
 
 [2] ● 运行中 | 58分钟前 | 56分47秒
     sglang-eval-A14B-360p-wsd-105000...
-    8×H200 | 2节点 | GPU资源组
+    8×某gpu2 | 2节点 | GPU资源组
 ```
 
 ## 配置文件
