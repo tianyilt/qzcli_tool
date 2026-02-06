@@ -5,8 +5,8 @@
 ## 特性
 
 - **一键登录**: `qzcli login` 通过 CAS 认证自动获取 cookie，无需手动复制
-- **资源发现**: 自动发现工作空间、计算组、规格等资源并本地缓存
-- **节点查询**: 查询各计算组空余节点，帮助决定任务提交位置
+- **资源发现**: `qzcli res -u` 自动发现工作空间、计算组、规格等资源并本地缓存
+- **节点查询**: `qzcli avail` 查询各计算组空余节点，支持低优任务统计
 - **任务列表**: 美观的卡片式显示，完整 URL 方便点击
 - **状态监控**: watch 模式实时跟踪任务进度
 
@@ -17,12 +17,12 @@ qzcli login -u 用户名 -p 密码 && qzcli avail
 ```
 ```
 分布式
-  计算组                          空节点     低优空余    总节点     空GPU GPU类型     
-  ---------------------------------------------------------------------------
-  某gpu2-3号机房-2                    3        1    xxx  x/xxx 某gpu2      
-  某gpu2-3号机房                      0        0    xxx   x/xxx 某gpu2      
-  某gpu2-2号机房                      0        0    xxx   x/xxx 某gpu2      
-  cuda12.8版本某gpu1                 0        0    xxx  x/xxx 某gpu1   
+  计算组                          空节点     总节点     空GPU GPU类型     
+  -----------------------------------------------------------------
+  某gpu2-3号机房-2                    3      xxx  x/xxx 某gpu2      
+  某gpu2-3号机房                      0      xxx   x/xxx 某gpu2      
+  某gpu2-2号机房                      0      xxx   x/xxx 某gpu2      
+  cuda12.8版本某gpu1                 0      xxx  x/xxx 某gpu1   
 ```
 
 ## 安装依赖
@@ -77,10 +77,11 @@ qzcli login && qzcli avail
 # 找有 4 个空闲节点的计算组
 qzcli avail -n 4 -e
 
-# 输出：
-# ✓ [CI-情景智能] OV3蒸馏训练组  4 空节点 [某gpu2]
-# WORKSPACE_ID="ws-xxx"
-# LOGIC_COMPUTE_GROUP_ID="lcg-xxx"
+# 如果需要考虑低优任务占用的节点（较慢，但更准确地反映潜在可用资源）
+qzcli avail --lp -n 4
+
+# 如果开启了 --lp (low priority) 模式，建议配合 -w 指定工作空间以加快速度
+qzcli avail --lp -w CI -n 4
 ```
 
 ### 查看任务
@@ -136,8 +137,11 @@ qzcli res -w CI -u
 # 给工作空间设置别名
 qzcli res -w ws-xxx --name 我的空间
 
-# 查看空余节点
+# 查看空余节点（默认不包含低优任务统计，速度较快）
 qzcli avail
+
+# 查看空余节点（包含低优任务统计，即：空节点 + 低优任务占用的节点）
+qzcli avail --lp
 
 # 只查看 CI 工作空间
 qzcli avail -w CI
