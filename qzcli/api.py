@@ -556,6 +556,78 @@ class QzAPI:
         
         return result.get("data", {})
 
+    def list_workspaces(self, cookie: str) -> List[Dict[str, Any]]:
+        """
+        获取用户可访问的工作空间列表
+        
+        Args:
+            cookie: 浏览器 cookie 字符串
+            
+        Returns:
+            工作空间列表 [{"id": "ws-xxx", "name": "工作空间名称"}, ...]
+        """
+        url = f"{self.base_url}/api/v1/workspace/list"
+        
+        payload = {
+            "page_num": 1,
+            "page_size": 100,
+        }
+        
+        headers = {
+            "accept": "application/json, text/plain, */*",
+            "accept-language": "en-US,en;q=0.9",
+            "cache-control": "no-cache",
+            "content-type": "application/json",
+            "cookie": cookie,
+            "origin": "https://qz.sii.edu.cn",
+            "pragma": "no-cache",
+            "referer": "https://qz.sii.edu.cn/jobs/home",
+            "sec-ch-ua": '"Not(A:Brand";v="8", "Chromium";v="144"',
+            "sec-ch-ua-mobile": "?0",
+            "sec-ch-ua-platform": '"macOS"',
+            "sec-fetch-dest": "empty",
+            "sec-fetch-mode": "cors",
+            "sec-fetch-site": "same-origin",
+            "user-agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/144.0.0.0 Safari/537.36",
+        }
+        
+        response = requests.post(
+            url,
+            json=payload,
+            headers=headers,
+            timeout=60,
+        )
+        
+        if response.status_code == 401:
+            raise QzAPIError("Cookie 已过期或无效，请重新获取", 401)
+        
+        if response.status_code != 200:
+            raise QzAPIError(f"请求失败: HTTP {response.status_code}", response.status_code)
+        
+        try:
+            result = response.json()
+        except Exception:
+            raise QzAPIError("响应不是有效的 JSON，请检查 cookie 是否正确")
+        
+        if result.get("code") != 0:
+            raise QzAPIError(
+                f"API 请求失败: {result.get('message', '未知错误')}",
+                result.get("code")
+            )
+        
+        data = result.get("data", {})
+        workspaces = data.get("workspaces", [])
+        
+        # 规范化返回格式
+        return [
+            {
+                "id": ws.get("id", ""),
+                "name": ws.get("name", ws.get("cn_name", "")),
+            }
+            for ws in workspaces
+            if ws.get("id")
+        ]
+
     def login_with_cas(self, username: str, password: str) -> str:
         """
         通过 CAS 统一认证登录，获取 session cookie

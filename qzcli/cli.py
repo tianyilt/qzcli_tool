@@ -577,6 +577,58 @@ def cmd_workspaces(args):
     workspace_input = args.workspace
     cookie_data = get_cookie()
     
+    # 如果使用 -u 但没有指定工作空间，自动发现所有可访问的工作空间
+    if args.update and not workspace_input:
+        if not cookie_data or not cookie_data.get("cookie"):
+            display.print_error("未设置 cookie，请先运行: qzcli login")
+            return 1
+        
+        cookie = cookie_data["cookie"]
+        display.print("[dim]正在获取可访问的工作空间列表...[/dim]")
+        
+        try:
+            workspaces = api.list_workspaces(cookie)
+            if not workspaces:
+                display.print_warning("未找到可访问的工作空间")
+                return 0
+            
+            display.print(f"\n[bold]发现 {len(workspaces)} 个可访问的工作空间[/bold]\n")
+            
+            # 更新每个工作空间
+            for ws in workspaces:
+                ws_id = ws.get("id")
+                ws_name = ws.get("name", "")
+                display.print(f"[dim]正在更新 {ws_name or ws_id}...[/dim]")
+                
+                try:
+                    # 获取任务列表
+                    result = api.list_jobs_with_cookie(ws_id, cookie, page_size=200)
+                    jobs = result.get("jobs", [])
+                    
+                    # 提取资源信息
+                    resources = api.extract_resources_from_jobs(jobs)
+                    
+                    # 保存到本地缓存
+                    save_resources(ws_id, resources, ws_name)
+                    
+                    projects_count = len(resources.get("projects", []))
+                    cg_count = len(resources.get("compute_groups", []))
+                    display.print(f"  ✓ {ws_name or ws_id}: {projects_count} 项目, {cg_count} 计算组")
+                except Exception as e:
+                    display.print_warning(f"  ✗ {ws_name or ws_id}: {e}")
+            
+            display.print("")
+            display.print_success("工作空间缓存更新完成！")
+            display.print("[dim]使用 qzcli res --list 查看所有已缓存的工作空间[/dim]")
+            return 0
+            
+        except QzAPIError as e:
+            if "401" in str(e) or "过期" in str(e):
+                display.print_error("Cookie 已过期，请重新登录: qzcli login")
+            else:
+                display.print_error(f"获取工作空间列表失败: {e}")
+            return 1
+    
     if not workspace_input:
         workspace_id = cookie_data.get("workspace_id", "") if cookie_data else ""
     elif workspace_input.startswith("ws-"):
@@ -635,7 +687,97 @@ def cmd_workspaces(args):
             total = result.get("total", 0)
             
             if not jobs:
-                display.print("未找到任务记录")
+                display.print("[dim]未找到自己的任务，尝试从工作空间任务获取资源信息...[/dim]")
+                
+                projects_found = {}
+                compute_groups_found = {}
+                gpu_types_found = {}  # 从节点获取 GPU 类型
+                
+                # 1. 先从 list_task_dimension 获取项目信息（包含所有用户的任务）
+                try:
+                    task_data = api.list_task_dimension(workspace_id, cookie, page_size=200)
+                    tasks = task_data.get("task_dimensions", [])
+                    
+                    for task in tasks:
+                        # 提取项目
+                        proj = task.get("project", {})
+                        proj_id = proj.get("id", "")
+                        proj_name = proj.get("name", "")
+                        if proj_id and proj_id not in projects_found:
+                            projects_found[proj_id] = {
+                                "id": proj_id,
+                                "name": proj_name,
+                                "workspace_id": workspace_id,
+                            }
+                except QzAPIError:
+                    pass
+                
+                # 2. 从 list_node_dimension 获取计算组和 GPU 类型信息
+                try:
+                    node_data = api.list_node_dimension(workspace_id, cookie, page_size=500)
+                    nodes = node_data.get("node_dimensions", [])
+                    
+                    for node in nodes:
+                        # 尝试从 logic_compute_group 获取计算组
+                        lcg_info = node.get("logic_compute_group", {})
+                        lcg_id = lcg_info.get("id", "")
+                        lcg_name = lcg_info.get("name", "")
+                        if lcg_id and lcg_id not in compute_groups_found:
+                            gpu_info = node.get("gpu_info", {})
+                            gpu_type = gpu_info.get("gpu_product_simple", "")
+                            compute_groups_found[lcg_id] = {
+                                "id": lcg_id,
+                                "name": lcg_name,
+                                "gpu_type": gpu_type,
+                                "workspace_id": workspace_id,
+                            }
+                        
+                        # 收集 GPU 类型信息
+                        gpu_info = node.get("gpu_info", {})
+                        gpu_type = gpu_info.get("gpu_product_simple", "")
+                        if gpu_type and gpu_type not in gpu_types_found:
+                            gpu_types_found[gpu_type] = {
+                                "type": gpu_type,
+                                "display": gpu_info.get("gpu_type_display", ""),
+                                "memory_gb": gpu_info.get("gpu_memory_size_gb", 0),
+                            }
+                except QzAPIError:
+                    pass
+                
+                # 构建资源数据
+                resources = {
+                    "projects": list(projects_found.values()),
+                    "compute_groups": list(compute_groups_found.values()),
+                    "specs": [],
+                }
+                
+                # 保存到本地缓存
+                ws_name = pending_name or ""
+                save_resources(workspace_id, resources, ws_name)
+                
+                # 显示结果
+                display.print_success("已添加工作空间到缓存")
+                
+                if projects_found:
+                    display.print(f"\n[bold]项目 ({len(projects_found)} 个)[/bold]")
+                    for proj in projects_found.values():
+                        display.print(f"  - {proj['name']}")
+                        display.print(f"    [cyan]{proj['id']}[/cyan]")
+                
+                if compute_groups_found:
+                    display.print(f"\n[bold]计算组 ({len(compute_groups_found)} 个)[/bold]")
+                    for cg in compute_groups_found.values():
+                        display.print(f"  - {cg['name']} [{cg['gpu_type']}]")
+                        display.print(f"    [cyan]{cg['id']}[/cyan]")
+                
+                if gpu_types_found:
+                    display.print(f"\n[bold]可用 GPU 类型 ({len(gpu_types_found)} 种)[/bold]")
+                    for gt in gpu_types_found.values():
+                        display.print(f"  - {gt['type']} ({gt['display']}, {gt['memory_gb']}GB)")
+                
+                if not projects_found and not compute_groups_found:
+                    display.print("[dim]未发现项目或计算组信息[/dim]")
+                
                 return 0
             
             # 提取资源信息
