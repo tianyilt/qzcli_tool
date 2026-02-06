@@ -560,17 +560,21 @@ class QzAPI:
         """
         获取用户可访问的工作空间列表
         
+        通过 /api/v1/project/list 获取项目列表，从中提取工作空间信息。
+        每个项目的 space_list 字段包含该项目关联的工作空间。
+        
         Args:
             cookie: 浏览器 cookie 字符串
             
         Returns:
             工作空间列表 [{"id": "ws-xxx", "name": "工作空间名称"}, ...]
         """
-        url = f"{self.base_url}/api/v1/workspace/list"
+        url = f"{self.base_url}/api/v1/project/list"
         
         payload = {
-            "page_num": 1,
+            "page": 1,
             "page_size": 100,
+            "filter": {}
         }
         
         headers = {
@@ -581,7 +585,7 @@ class QzAPI:
             "cookie": cookie,
             "origin": "https://qz.sii.edu.cn",
             "pragma": "no-cache",
-            "referer": "https://qz.sii.edu.cn/jobs/home",
+            "referer": "https://qz.sii.edu.cn/operations/projects",
             "sec-ch-ua": '"Not(A:Brand";v="8", "Chromium";v="144"',
             "sec-ch-ua-mobile": "?0",
             "sec-ch-ua-platform": '"macOS"',
@@ -616,17 +620,22 @@ class QzAPI:
             )
         
         data = result.get("data", {})
-        workspaces = data.get("workspaces", [])
+        items = data.get("items", [])
         
-        # 规范化返回格式
-        return [
-            {
-                "id": ws.get("id", ""),
-                "name": ws.get("name", ws.get("cn_name", "")),
-            }
-            for ws in workspaces
-            if ws.get("id")
-        ]
+        # 从项目的 space_list 中提取工作空间（去重）
+        workspaces = {}
+        for proj in items:
+            space_list = proj.get("space_list", [])
+            for space in space_list:
+                ws_id = space.get("id", "")
+                ws_name = space.get("name", "")
+                if ws_id and ws_id not in workspaces:
+                    workspaces[ws_id] = {
+                        "id": ws_id,
+                        "name": ws_name,
+                    }
+        
+        return list(workspaces.values())
 
     def login_with_cas(self, username: str, password: str) -> str:
         """
