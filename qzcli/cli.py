@@ -955,34 +955,37 @@ def cmd_avail(args):
         
         display.print(f"[dim]正在查询 {ws_name} 的 {len(compute_groups)} 个计算组...[/dim]")
         
-        # 获取任务数据，用于统计低优任务占用的节点
+        # 低优任务统计（仅在 --lp 参数启用时计算）
         node_low_priority_gpu = defaultdict(int)  # node_name -> low_priority_gpu_count
-        low_priority_threshold = 3  # 优先级 <= 3 为低优任务
         
-        try:
-            # 分页获取所有任务
-            tasks = []
-            page_num = 1
-            while True:
-                task_data = api.list_task_dimension(workspace_id, cookie, page_num=page_num, page_size=200)
-                page_tasks = task_data.get("task_dimensions", [])
-                tasks.extend(page_tasks)
-                if len(tasks) >= task_data.get("total", 0) or not page_tasks:
-                    break
-                page_num += 1
+        if args.low_priority:
+            display.print(f"[dim]正在获取低优任务数据（这可能较慢）...[/dim]")
+            low_priority_threshold = 3  # 优先级 <= 3 为低优任务
             
-            # 统计每个节点上低优任务占用的 GPU 数
-            for task in tasks:
-                priority = task.get("priority", 10)
-                if priority <= low_priority_threshold:
-                    gpu_total = task.get("gpu", {}).get("total", 0)
-                    nodes_occupied = task.get("nodes_occupied", {}).get("nodes", [])
-                    # 平均分配 GPU 到各节点（多节点任务）
-                    gpu_per_node = gpu_total // len(nodes_occupied) if nodes_occupied else 0
-                    for node_name in nodes_occupied:
-                        node_low_priority_gpu[node_name] += gpu_per_node if len(nodes_occupied) > 1 else gpu_total
-        except QzAPIError:
-            pass  # 获取任务数据失败不影响主要功能
+            try:
+                # 分页获取所有任务
+                tasks = []
+                page_num = 1
+                while True:
+                    task_data = api.list_task_dimension(workspace_id, cookie, page_num=page_num, page_size=200)
+                    page_tasks = task_data.get("task_dimensions", [])
+                    tasks.extend(page_tasks)
+                    if len(tasks) >= task_data.get("total", 0) or not page_tasks:
+                        break
+                    page_num += 1
+                
+                # 统计每个节点上低优任务占用的 GPU 数
+                for task in tasks:
+                    priority = task.get("priority", 10)
+                    if priority <= low_priority_threshold:
+                        gpu_total = task.get("gpu", {}).get("total", 0)
+                        nodes_occupied = task.get("nodes_occupied", {}).get("nodes", [])
+                        # 平均分配 GPU 到各节点（多节点任务）
+                        gpu_per_node = gpu_total // len(nodes_occupied) if nodes_occupied else 0
+                        for node_name in nodes_occupied:
+                            node_low_priority_gpu[node_name] += gpu_per_node if len(nodes_occupied) > 1 else gpu_total
+            except QzAPIError:
+                pass  # 获取任务数据失败不影响主要功能
         
         try:
             for lcg_id, lcg_info in compute_groups.items():
@@ -1036,9 +1039,9 @@ def cmd_avail(args):
                                     "gpu_total": gpu_total,
                                 })
                             
-                            # 检查是否为低优空余节点（低优任务占满整节点，>=8卡）
+                            # 检查是否为低优空余节点（低优任务占满整节点）
                             low_priority_gpu = node_low_priority_gpu.get(node_name, 0)
-                            if low_priority_gpu >= 8 and gpu_used > 0:
+                            if low_priority_gpu >= gpu_total and gpu_used > 0:
                                 low_priority_free_nodes.append({
                                     "name": node_name,
                                     "low_priority_gpu": low_priority_gpu,
@@ -1079,31 +1082,44 @@ def cmd_avail(args):
     
     # 如果指定了节点需求，过滤并推荐
     if required_nodes:
-        # 按空闲节点数降序排序（跨工作空间），考虑低优空余
-        all_results.sort(key=lambda x: (x["free_nodes"] + x.get("low_priority_free_nodes", 0), x["free_nodes"]), reverse=True)
-        # 可用条件：空闲节点 + 低优空余节点 >= 需求
-        available = [r for r in all_results if r["free_nodes"] + r.get("low_priority_free_nodes", 0) >= required_nodes]
+        # 按空闲节点数降序排序
+        if args.low_priority:
+            # 考虑低优空余
+            all_results.sort(key=lambda x: (x["free_nodes"] + x.get("low_priority_free_nodes", 0), x["free_nodes"]), reverse=True)
+            available = [r for r in all_results if r["free_nodes"] + r.get("low_priority_free_nodes", 0) >= required_nodes]
+        else:
+            all_results.sort(key=lambda x: x["free_nodes"], reverse=True)
+            available = [r for r in all_results if r["free_nodes"] >= required_nodes]
         
         if not available:
-            display.print(f"[red]没有计算组有 >= {required_nodes} 个可用节点（空闲+低优空余）[/red]\n")
+            if args.low_priority:
+                display.print(f"[red]没有计算组有 >= {required_nodes} 个可用节点（空闲+低优空余）[/red]\n")
+            else:
+                display.print(f"[red]没有计算组有 >= {required_nodes} 个空闲节点[/red]\n")
             display.print("当前各计算组节点情况：")
             for r in all_results:
-                lp_free = r.get('low_priority_free_nodes', 0)
-                display.print(f"  [{r['workspace_name']}] {r['name']}: {r['free_nodes']} 空节点 + {lp_free} 低优空余 [{r['gpu_type']}]")
+                if args.low_priority:
+                    lp_free = r.get('low_priority_free_nodes', 0)
+                    display.print(f"  [{r['workspace_name']}] {r['name']}: {r['free_nodes']} 空节点 + {lp_free} 低优空余 [{r['gpu_type']}]")
+                else:
+                    display.print(f"  [{r['workspace_name']}] {r['name']}: {r['free_nodes']} 空节点 [{r['gpu_type']}]")
             return 1
         
         display.print(f"需要 {required_nodes} 个节点，以下计算组可用：\n")
         
         for r in available:
-            lp_free = r.get('low_priority_free_nodes', 0)
-            total_avail = r['free_nodes'] + lp_free
-            display.print(f"[green]✓[/green] [{r['workspace_name']}] [bold]{r['name']}[/bold]  {r['free_nodes']} 空节点 + {lp_free} 低优空余 = {total_avail} 可用 [{r['gpu_type']}]")
+            if args.low_priority:
+                lp_free = r.get('low_priority_free_nodes', 0)
+                total_avail = r['free_nodes'] + lp_free
+                display.print(f"[green]✓[/green] [{r['workspace_name']}] [bold]{r['name']}[/bold]  {r['free_nodes']} 空节点 + {lp_free} 低优空余 = {total_avail} 可用 [{r['gpu_type']}]")
+            else:
+                display.print(f"[green]✓[/green] [{r['workspace_name']}] [bold]{r['name']}[/bold]  {r['free_nodes']} 空节点 [{r['gpu_type']}]")
             display.print(f"  [cyan]{r['id']}[/cyan]")
             # 显示空闲节点列表
             if args.verbose and r.get('free_node_list'):
                 node_names = [n['name'] for n in r['free_node_list']]
                 display.print(f"  [dim]空闲节点: {', '.join(node_names)}[/dim]")
-            if args.verbose and r.get('low_priority_free_node_list'):
+            if args.verbose and args.low_priority and r.get('low_priority_free_node_list'):
                 lp_node_names = [n['name'] for n in r['low_priority_free_node_list']]
                 display.print(f"  [dim]低优空余: {', '.join(lp_node_names)}[/dim]")
         
@@ -1128,13 +1144,24 @@ def cmd_avail(args):
         for ws_name, results in by_workspace.items():
             results.sort(key=lambda x: (x["free_nodes"], x.get("low_priority_free_nodes", 0)), reverse=True)
             display.print(f"[bold]{ws_name}[/bold]")
-            display.print(f"{'  计算组':<27} {'空节点':>6} {'低优空余':>8} {'总节点':>6} {'空GPU':>8} {'GPU类型':<10}")
-            display.print("  " + "-" * 75)
+            
+            # 根据是否启用低优计算显示不同表头
+            if args.low_priority:
+                display.print(f"{'  计算组':<27} {'空节点':>6} {'低优空余':>8} {'总节点':>6} {'空GPU':>8} {'GPU类型':<10}")
+                display.print("  " + "-" * 75)
+            else:
+                display.print(f"{'  计算组':<27} {'空节点':>6} {'总节点':>6} {'空GPU':>8} {'GPU类型':<10}")
+                display.print("  " + "-" * 65)
+            
             for r in results:
                 name_display = r['name'][:23] if len(r['name']) > 23 else r['name']
                 free_gpu_str = f"{r.get('total_free_gpus', 0)}/{r.get('total_gpus', 0)}"
-                low_priority_free = r.get('low_priority_free_nodes', 0)
-                display.print(f"  {name_display:<25} {r['free_nodes']:>6} {low_priority_free:>8} {r['total_nodes']:>6} {free_gpu_str:>8} {r['gpu_type']:<10}")
+                
+                if args.low_priority:
+                    low_priority_free = r.get('low_priority_free_nodes', 0)
+                    display.print(f"  {name_display:<25} {r['free_nodes']:>6} {low_priority_free:>8} {r['total_nodes']:>6} {free_gpu_str:>8} {r['gpu_type']:<10}")
+                else:
+                    display.print(f"  {name_display:<25} {r['free_nodes']:>6} {r['total_nodes']:>6} {free_gpu_str:>8} {r['gpu_type']:<10}")
                 
                 # 显示空闲 GPU 分布（-v 模式）
                 if args.verbose:
@@ -1148,7 +1175,7 @@ def cmd_avail(args):
                     if r.get('free_node_list'):
                         node_names = [n['name'] for n in r['free_node_list']]
                         display.print(f"    [dim]全空节点: {', '.join(node_names)}[/dim]")
-                    if r.get('low_priority_free_node_list'):
+                    if args.low_priority and r.get('low_priority_free_node_list'):
                         lp_node_names = [n['name'] for n in r['low_priority_free_node_list']]
                         display.print(f"    [dim]低优空余: {', '.join(lp_node_names)}[/dim]")
             display.print("")
@@ -1707,6 +1734,7 @@ def main():
     avail_parser.add_argument("--nodes", "-n", type=int, help="需要的节点数（推荐模式：找出满足条件的计算组）")
     avail_parser.add_argument("--export", "-e", action="store_true", help="输出可用于脚本的环境变量格式")
     avail_parser.add_argument("--verbose", "-v", action="store_true", help="显示空闲节点名称列表")
+    avail_parser.add_argument("--lp", "--low-priority", action="store_true", dest="low_priority", help="计算低优任务占用节点（较慢）")
     
     # usage 命令
     usage_parser = subparsers.add_parser("usage", help="统计工作空间的 GPU 使用分布")
