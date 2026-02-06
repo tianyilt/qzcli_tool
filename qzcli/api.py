@@ -556,6 +556,67 @@ class QzAPI:
         
         return result.get("data", {})
 
+    def get_cluster_basic_info(self, workspace_id: str, cookie: str) -> Dict[str, Any]:
+        """
+        获取工作空间的集群和计算组信息
+        
+        Args:
+            workspace_id: 工作空间 ID
+            cookie: 浏览器 cookie 字符串
+            
+        Returns:
+            包含 clusters, compute_groups, resource_types 的字典
+        """
+        url = f"{self.base_url}/api/v1/cluster_metric/cluster_basic_info"
+        
+        payload = {
+            "workspace_id": workspace_id
+        }
+        
+        headers = {
+            "accept": "application/json, text/plain, */*",
+            "accept-language": "en-US,en;q=0.9",
+            "cache-control": "no-cache",
+            "content-type": "application/json",
+            "cookie": cookie,
+            "origin": "https://qz.sii.edu.cn",
+            "pragma": "no-cache",
+            "referer": f"https://qz.sii.edu.cn/jobs/spacesOverview?spaceId={workspace_id}",
+            "sec-ch-ua": '"Not(A:Brand";v="8", "Chromium";v="144"',
+            "sec-ch-ua-mobile": "?0",
+            "sec-ch-ua-platform": '"macOS"',
+            "sec-fetch-dest": "empty",
+            "sec-fetch-mode": "cors",
+            "sec-fetch-site": "same-origin",
+            "user-agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/144.0.0.0 Safari/537.36",
+        }
+        
+        response = requests.post(
+            url,
+            json=payload,
+            headers=headers,
+            timeout=60,
+        )
+        
+        if response.status_code == 401:
+            raise QzAPIError("Cookie 已过期或无效，请重新获取", 401)
+        
+        if response.status_code != 200:
+            raise QzAPIError(f"请求失败: HTTP {response.status_code}", response.status_code)
+        
+        try:
+            result = response.json()
+        except Exception:
+            raise QzAPIError("响应不是有效的 JSON，请检查 cookie 是否正确")
+        
+        if result.get("code") != 0:
+            raise QzAPIError(
+                f"API 请求失败: {result.get('message', '未知错误')}",
+                result.get("code")
+            )
+        
+        return result.get("data", {})
+
     def list_workspaces(self, cookie: str) -> List[Dict[str, Any]]:
         """
         获取用户可访问的工作空间列表

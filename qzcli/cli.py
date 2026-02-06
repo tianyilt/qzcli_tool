@@ -601,12 +601,37 @@ def cmd_workspaces(args):
                 display.print(f"[dim]正在更新 {ws_name or ws_id}...[/dim]")
                 
                 try:
-                    # 获取任务列表
+                    # 1. 从任务历史提取项目和规格信息
                     result = api.list_jobs_with_cookie(ws_id, cookie, page_size=200)
                     jobs = result.get("jobs", [])
-                    
-                    # 提取资源信息
                     resources = api.extract_resources_from_jobs(jobs)
+                    
+                    # 2. 使用 cluster_basic_info API 获取完整的计算组列表
+                    try:
+                        cluster_info = api.get_cluster_basic_info(ws_id, cookie)
+                        compute_groups_from_api = []
+                        
+                        for cg in cluster_info.get("compute_groups", []):
+                            for lcg in cg.get("logic_compute_groups", []):
+                                lcg_id = lcg.get("logic_compute_group_id", "")
+                                lcg_name = lcg.get("logic_compute_group_name", "")
+                                brand = lcg.get("brand", "")
+                                resource_types = lcg.get("resource_types", [])
+                                gpu_type = resource_types[0] if resource_types else ""
+                                
+                                if lcg_id:
+                                    compute_groups_from_api.append({
+                                        "id": lcg_id,
+                                        "name": lcg_name,
+                                        "gpu_type": brand or gpu_type,
+                                        "workspace_id": ws_id,
+                                    })
+                        
+                        # 合并计算组（API 获取的优先）
+                        if compute_groups_from_api:
+                            resources["compute_groups"] = compute_groups_from_api
+                    except Exception:
+                        pass  # 获取计算组失败不影响其他资源
                     
                     # 保存到本地缓存
                     save_resources(ws_id, resources, ws_name)
