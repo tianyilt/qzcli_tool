@@ -13,6 +13,7 @@ from .config import (
     save_token_cache,
     clear_token_cache,
 )
+from .crypto import encrypt_password
 
 
 class QzAPIError(Exception):
@@ -777,20 +778,21 @@ class QzAPI:
         
         cas_login_url = current_url
         login_page_html = resp.text
-        
-        # Step 4: 解析登录表单，获取隐藏字段
+
+        encrypted_password = encrypt_password(password)
+
         lt_match = re.search(r'name="lt"\s+value="([^"]+)"', login_page_html)
         execution_match = re.search(r'name="execution"\s+value="([^"]+)"', login_page_html)
-        
-        # 构建登录表单数据
+
         login_data = {
             "username": username,
-            "password": password,
+            "password": encrypted_password,
             "_eventId": "submit",
             "submit": "登 录",
             "loginType": "1",
+            "encrypted": "true",
         }
-        
+
         if lt_match:
             login_data["lt"] = lt_match.group(1)
         if execution_match:

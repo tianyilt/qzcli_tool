@@ -1,3 +1,2 @@
-# qzcli 依赖
 requests>=2.28
 rich>=13.0
