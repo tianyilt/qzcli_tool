@@ -6,8 +6,9 @@ qzcli - 启智平台任务管理 CLI
 import sys
 import time
 import argparse
+import unicodedata
 from pathlib import Path
-from typing import Optional, List
+from typing import Optional, List, Sequence
 
 from . import __version__
 from .config import (
@@ -20,6 +21,121 @@ from .config import (
 from .api import get_api, QzAPIError
 from .store import get_store, JobRecord
 from .display import get_display, format_duration, format_time_ago
+
+try:
+    from rich.table import Table
+    from rich import box
+    RICH_TABLE_AVAILABLE = True
+except ImportError:
+    RICH_TABLE_AVAILABLE = False
+    Table = None  # type: ignore
+    box = None  # type: ignore
+
+
+def _char_display_width(ch: str) -> int:
+    """计算单个字符在终端中的显示宽度（中文等宽字符按 2 计算）。"""
+    if not ch:
+        return 0
+    if unicodedata.combining(ch):
+        return 0
+    if unicodedata.east_asian_width(ch) in ("F", "W"):
+        return 2
+    return 1
+
+
+def _display_width(text: object) -> int:
+    """计算字符串在终端中的显示宽度。"""
+    return sum(_char_display_width(ch) for ch in str(text))
+
+
+def _truncate_display_text(text: object, max_width: int) -> str:
+    """按显示宽度截断文本。"""
+    value = str(text)
+    if max_width <= 0:
+        return ""
+    if _display_width(value) <= max_width:
+        return value
+    if max_width <= 3:
+        return "." * max_width
+
+    keep_width = max_width - 3
+    chars = []
+    used = 0
+    for ch in value:
+        ch_width = _char_display_width(ch)
+        if used + ch_width > keep_width:
+            break
+        chars.append(ch)
+        used += ch_width
+    return "".join(chars) + "..."
+
+
+def _format_cell(text: object, width: int, align: str = "left") -> str:
+    """按显示宽度对齐单元格内容。"""
+    value = _truncate_display_text(text, width)
+    padding = max(0, width - _display_width(value))
+    if align == "right":
+        return " " * padding + value
+    return value + " " * padding
+
+
+def _render_plain_table(
+    headers: Sequence[str],
+    rows: Sequence[Sequence[object]],
+    aligns: Sequence[str],
+    *,
+    min_widths: Optional[Sequence[int]] = None,
+    max_widths: Optional[Sequence[int]] = None,
+    section_break_after_rows: Optional[Sequence[int]] = None,
+    indent: str = "  ",
+    col_gap: int = 2,
+) -> List[str]:
+    """渲染纯文本表格（按显示宽度对齐，兼容中文）。"""
+    col_count = len(headers)
+    if col_count == 0:
+        return []
+
+    min_widths = min_widths or [0] * col_count
+    max_widths = max_widths or [0] * col_count
+    align_list = list(aligns) if aligns else ["left"] * col_count
+    if len(align_list) < col_count:
+        align_list.extend(["left"] * (col_count - len(align_list)))
+
+    col_widths: List[int] = []
+    for i in range(col_count):
+        width = _display_width(headers[i])
+        for row in rows:
+            if i < len(row):
+                width = max(width, _display_width(row[i]))
+        if i < len(min_widths):
+            width = max(width, min_widths[i])
+        if i < len(max_widths) and max_widths[i] > 0:
+            width = min(width, max_widths[i])
+        col_widths.append(width)
+
+    def build_line(cells: Sequence[object]) -> str:
+        rendered = []
+        for i in range(col_count):
+            value = cells[i] if i < len(cells) else ""
+            rendered.append(_format_cell(value, col_widths[i], align_list[i]))
+        return indent + (" " * col_gap).join(rendered)
+
+    lines = [build_line(headers)]
+    separator = indent + "-" * (sum(col_widths) + col_gap * (col_count - 1))
+    lines.append(separator)
+    section_breaks = set(section_break_after_rows or [])
+    for row_idx, row in enumerate(rows):
+        lines.append(build_line(row))
+        if row_idx in section_breaks and row_idx < len(rows) - 1:
+            lines.append(separator)
+    return lines
+
+
+def _format_percent(numerator: int, denominator: int) -> str:
+    """格式化百分比。"""
+    if denominator <= 0:
+        return "-"
+    return f"{(numerator / denominator) * 100:.1f}%"
 
 
 def cmd_init(args):
@@ -1135,50 +1251,199 @@ def cmd_avail(args):
                 spec = list(specs.values())[0]
                 display.print(f'SPEC_ID="{spec["id"]}"  # {spec.get("gpu_count", 0)}x {spec.get("gpu_type", "")}')
     else:
-        # 按工作空间分组，组内按空闲节点数降序
-        from collections import defaultdict
-        by_workspace = defaultdict(list)
-        for r in all_results:
-            by_workspace[r['workspace_name']].append(r)
-        
-        for ws_name, results in by_workspace.items():
-            results.sort(key=lambda x: (x["free_nodes"], x.get("low_priority_free_nodes", 0)), reverse=True)
-            display.print(f"[bold]{ws_name}[/bold]")
-            
-            # 根据是否启用低优计算显示不同表头
+        # 全分区统一大表展示
+        if args.low_priority:
+            sorted_results = sorted(
+                all_results,
+                key=lambda x: (
+                    x["free_nodes"] + x.get("low_priority_free_nodes", 0),
+                    x["free_nodes"],
+                    x.get("total_free_gpus", 0),
+                ),
+                reverse=True,
+            )
+        else:
+            sorted_results = sorted(
+                all_results,
+                key=lambda x: (x["free_nodes"], x.get("total_free_gpus", 0)),
+                reverse=True,
+            )
+
+        workspace_order: List[str] = []
+        workspace_grouped_results: dict[str, List[dict]] = {}
+        for r in sorted_results:
+            ws_name = r.get("workspace_name", "")
+            if ws_name not in workspace_grouped_results:
+                workspace_grouped_results[ws_name] = []
+                workspace_order.append(ws_name)
+            workspace_grouped_results[ws_name].append(r)
+
+        grouped_results: List[dict] = []
+        section_break_after_rows: List[int] = []
+        row_cursor = 0
+        for ws_name in workspace_order:
+            ws_rows = workspace_grouped_results[ws_name]
+            grouped_results.extend(ws_rows)
+            row_cursor += len(ws_rows)
+            if row_cursor < len(sorted_results):
+                section_break_after_rows.append(row_cursor - 1)
+
+        total_groups = len(sorted_results)
+        total_free_nodes = sum(r.get("free_nodes", 0) for r in sorted_results)
+        total_nodes = sum(r.get("total_nodes", 0) for r in sorted_results)
+        total_free_gpus = sum(r.get("total_free_gpus", 0) for r in sorted_results)
+        total_gpus = sum(r.get("total_gpus", 0) for r in sorted_results)
+        total_used_gpus = max(0, total_gpus - total_free_gpus)
+        total_gpu_util_ratio = _format_percent(total_used_gpus, total_gpus)
+
+        display.print(f"[bold]全分区总览 ({total_groups} 个计算组)[/bold]")
+        display.print(
+            f"[dim]空节点 {total_free_nodes}/{total_nodes} | 空GPU {total_free_gpus}/{total_gpus} | GPU利用率 {total_gpu_util_ratio}[/dim]"
+        )
+
+        if RICH_TABLE_AVAILABLE and getattr(display, "console", None):
+            table = Table(
+                box=box.MINIMAL,
+                show_header=True,
+                header_style="bold",
+                expand=False,
+                padding=(0, 1),
+            )
+            table.add_column("排名", justify="right", style="dim")
+            table.add_column("分区", style="cyan", overflow="fold")
+            table.add_column("计算组", style="white", overflow="fold")
+            table.add_column("空节点", justify="right")
             if args.low_priority:
-                display.print(f"{'  计算组':<27} {'空节点':>6} {'低优空余':>8} {'总节点':>6} {'空GPU':>8} {'GPU类型':<10}")
-                display.print("  " + "-" * 75)
-            else:
-                display.print(f"{'  计算组':<27} {'空节点':>6} {'总节点':>6} {'空GPU':>8} {'GPU类型':<10}")
-                display.print("  " + "-" * 65)
-            
-            for r in results:
-                name_display = r['name'][:23] if len(r['name']) > 23 else r['name']
-                free_gpu_str = f"{r.get('total_free_gpus', 0)}/{r.get('total_gpus', 0)}"
-                
-                if args.low_priority:
-                    low_priority_free = r.get('low_priority_free_nodes', 0)
-                    display.print(f"  {name_display:<25} {r['free_nodes']:>6} {low_priority_free:>8} {r['total_nodes']:>6} {free_gpu_str:>8} {r['gpu_type']:<10}")
+                table.add_column("低优空余", justify="right")
+                table.add_column("可用节点", justify="right")
+            table.add_column("总节点", justify="right", style="dim")
+            table.add_column("空GPU", justify="right")
+            table.add_column("GPU利用率", justify="right")
+            table.add_column("GPU类型", style="magenta", no_wrap=True)
+
+            section_break_set = set(section_break_after_rows)
+            for idx, r in enumerate(grouped_results, 1):
+                free_nodes = r.get("free_nodes", 0)
+                low_priority_free = r.get("low_priority_free_nodes", 0)
+                total_available = free_nodes + low_priority_free
+                total_gpu = r.get("total_gpus", 0)
+                total_free_gpu = r.get("total_free_gpus", 0)
+
+                free_nodes_text = f"[green]{free_nodes}[/green]" if free_nodes > 0 else "[dim]0[/dim]"
+                low_priority_text = (
+                    f"[yellow]{low_priority_free}[/yellow]"
+                    if low_priority_free > 0
+                    else "[dim]0[/dim]"
+                )
+                total_available_text = (
+                    f"[green]{total_available}[/green]"
+                    if total_available > 0
+                    else "[dim]0[/dim]"
+                )
+
+                used_gpu = max(0, total_gpu - total_free_gpu)
+                gpu_util_text = _format_percent(used_gpu, total_gpu)
+                if total_gpu > 0:
+                    gpu_util_ratio = used_gpu / total_gpu
+                    if gpu_util_ratio >= 0.8:
+                        gpu_util_text = f"[green]{gpu_util_text}[/green]"
+                    elif gpu_util_ratio >= 0.4:
+                        gpu_util_text = f"[yellow]{gpu_util_text}[/yellow]"
+                    else:
+                        gpu_util_text = f"[red]{gpu_util_text}[/red]"
                 else:
-                    display.print(f"  {name_display:<25} {r['free_nodes']:>6} {r['total_nodes']:>6} {free_gpu_str:>8} {r['gpu_type']:<10}")
-                
-                # 显示空闲 GPU 分布（-v 模式）
-                if args.verbose:
-                    dist = r.get('gpu_free_distribution', {})
-                    if dist:
-                        dist_parts = []
-                        for gpu_count in sorted(dist.keys(), reverse=True):
-                            node_count = dist[gpu_count]
-                            dist_parts.append(f"空{gpu_count}卡×{node_count}")
-                        display.print(f"    [dim]{', '.join(dist_parts)}[/dim]")
-                    if r.get('free_node_list'):
-                        node_names = [n['name'] for n in r['free_node_list']]
-                        display.print(f"    [dim]全空节点: {', '.join(node_names)}[/dim]")
-                    if args.low_priority and r.get('low_priority_free_node_list'):
-                        lp_node_names = [n['name'] for n in r['low_priority_free_node_list']]
-                        display.print(f"    [dim]低优空余: {', '.join(lp_node_names)}[/dim]")
+                    gpu_util_text = "[dim]-[/dim]"
+
+                row = [
+                    str(idx),
+                    r.get("workspace_name", ""),
+                    r.get("name", ""),
+                    free_nodes_text,
+                ]
+                if args.low_priority:
+                    row.extend([low_priority_text, total_available_text])
+                row.extend(
+                    [
+                        str(r.get("total_nodes", 0)),
+                        f"{total_free_gpu}/{total_gpu}",
+                        gpu_util_text,
+                        r.get("gpu_type", "") or "-",
+                    ]
+                )
+                table.add_row(*row, end_section=((idx - 1) in section_break_set))
+
+            display.console.print(table)
+        else:
+            table_rows = []
+            for idx, r in enumerate(grouped_results, 1):
+                total_gpu = r.get("total_gpus", 0)
+                total_free_gpu = r.get("total_free_gpus", 0)
+                row = [
+                    idx,
+                    r.get("workspace_name", ""),
+                    r.get("name", ""),
+                    r.get("free_nodes", 0),
+                ]
+                if args.low_priority:
+                    low_priority_free = r.get("low_priority_free_nodes", 0)
+                    row.extend([low_priority_free, r.get("free_nodes", 0) + low_priority_free])
+                row.extend(
+                    [
+                        r.get("total_nodes", 0),
+                        f"{total_free_gpu}/{total_gpu}",
+                        _format_percent(max(0, total_gpu - total_free_gpu), total_gpu),
+                        r.get("gpu_type", "") or "-",
+                    ]
+                )
+                table_rows.append(row)
+
+            headers = ["排名", "分区", "计算组", "空节点"]
+            aligns = ["right", "left", "left", "right"]
+            max_widths = [4, 24, 30, 6]
+            if args.low_priority:
+                headers.extend(["低优空余", "可用节点"])
+                aligns.extend(["right", "right"])
+                max_widths.extend([8, 8])
+            headers.extend(["总节点", "空GPU", "GPU利用率", "GPU类型"])
+            aligns.extend(["right", "right", "right", "left"])
+            max_widths.extend([6, 12, 9, 10])
+
+            table_lines = _render_plain_table(
+                headers=headers,
+                rows=table_rows,
+                aligns=aligns,
+                max_widths=max_widths,
+                section_break_after_rows=section_break_after_rows,
+            )
+            for line in table_lines:
+                display.print(line)
+
+        # 显示空闲 GPU 分布（-v 模式）
+        if args.verbose:
             display.print("")
+            display.print("[bold]详细分布[/bold]")
+            has_detail = False
+            for r in grouped_results:
+                prefix = f"[{r.get('workspace_name', '')}] {r.get('name', '')}"
+                dist = r.get("gpu_free_distribution", {})
+                if dist:
+                    dist_parts = []
+                    for gpu_count in sorted(dist.keys(), reverse=True):
+                        node_count = dist[gpu_count]
+                        dist_parts.append(f"空{gpu_count}卡×{node_count}")
+                    display.print(f"  [dim]{prefix}: {', '.join(dist_parts)}[/dim]")
+                    has_detail = True
+                if r.get("free_node_list"):
+                    node_names = [n["name"] for n in r["free_node_list"]]
+                    display.print(f"  [dim]{prefix} 全空节点: {', '.join(node_names)}[/dim]")
+                    has_detail = True
+                if args.low_priority and r.get("low_priority_free_node_list"):
+                    lp_node_names = [n["name"] for n in r["low_priority_free_node_list"]]
+                    display.print(f"  [dim]{prefix} 低优空余: {', '.join(lp_node_names)}[/dim]")
+                    has_detail = True
+            if not has_detail:
+                display.print("  [dim]暂无可展示的详细分布[/dim]")
+        display.print("")
         
         # 导出格式
         if args.export:
