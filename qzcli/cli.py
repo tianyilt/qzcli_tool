@@ -363,9 +363,24 @@ def cmd_status(args):
     
     job_id = args.job_id
     
-    # 从 API 获取最新状态
+    # 优先 token 认证，fallback 到 cookie
+    api_data = None
     try:
         api_data = api.get_job_detail(job_id)
+    except QzAPIError:
+        # Token 失败，尝试 cookie 模式
+        cookie_data = get_cookie()
+        if cookie_data:
+            try:
+                api_data = api.get_job_detail_with_cookie(job_id, cookie_data["cookie"])
+            except QzAPIError as e2:
+                display.print_error(f"查询失败: {e2}")
+                return 1
+        else:
+            display.print_error("查询失败: 未配置认证信息，请运行 qzcli login 获取 cookie")
+            return 1
+    
+    if api_data is not None:
         job = store.update_from_api(job_id, api_data)
         display.print_job_detail(job, api_data)
         
@@ -374,9 +389,8 @@ def cmd_status(args):
             print(json.dumps(api_data, indent=2, ensure_ascii=False))
         
         return 0
-    except QzAPIError as e:
-        display.print_error(f"查询失败: {e}")
-        return 1
+    
+    return 1
 
 
 def cmd_stop(args):

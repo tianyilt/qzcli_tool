@@ -112,6 +112,42 @@ class QzAPI:
         """查询任务详情"""
         result = self._request("/openapi/v1/train_job/detail", {"job_id": job_id})
         return result.get("data", {})
+
+    def get_job_detail_with_cookie(self, job_id: str, cookie: str) -> Dict[str, Any]:
+        """使用 cookie 查询任务详情（内部 API）"""
+        url = f"{self.base_url}/api/v1/train_job/detail"
+
+        headers = {
+            "accept": "application/json, text/plain, */*",
+            "content-type": "application/json",
+            "cookie": cookie,
+            "origin": "https://qz.sii.edu.cn",
+            "referer": "https://qz.sii.edu.cn/",
+            "user-agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/144.0.0.0 Safari/537.36",
+        }
+
+        response = requests.post(
+            url,
+            json={"job_id": job_id},
+            headers=headers,
+            timeout=60,
+        )
+
+        if response.status_code == 401:
+            raise QzAPIError("Cookie 已过期或无效，请重新获取", 401)
+        if response.status_code != 200:
+            raise QzAPIError(f"请求失败: HTTP {response.status_code}", response.status_code)
+
+        try:
+            result = response.json()
+        except Exception:
+            raise QzAPIError("响应不是有效的 JSON")
+
+        if result.get("code") != 0:
+            raise QzAPIError(f"API 请求失败: {result.get('message', '未知错误')}",
+                             result.get("code"))
+
+        return result.get("data", {})
     
     def get_jobs_detail(self, job_ids: List[str], max_workers: int = 5) -> Dict[str, Dict[str, Any]]:
         """批量查询任务详情（并发）"""
