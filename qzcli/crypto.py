@@ -17,6 +17,10 @@ class CustomRSA:
         self.modulus = hex2int(modulus_hex)
         self.exponent = hex2int(exponent_hex)
         self.chunk_size = 2 * self._bi_high_index(self.modulus)
+        # Match the browser RSA implementation, which renders each 16-bit digit
+        # as a 4-character hex chunk and preserves leading zeros within the
+        # highest non-zero digit.
+        self.ciphertext_hex_length = 4 * (self._bi_high_index(self.modulus) + 1)
 
     def _bi_high_index(self, n):
         if n == 0:
@@ -55,7 +59,7 @@ class CustomRSA:
         for i in range(0, len(byte_array), self.chunk_size):
             block = self._encode_block(byte_array, i, self.chunk_size)
             encrypted = self._pow_mod(block, self.exponent, self.modulus)
-            hex_str = int2hex(encrypted)
+            hex_str = int2hex(encrypted, self.ciphertext_hex_length)
             result_parts.append(hex_str)
 
         return ' '.join(result_parts)
