@@ -12,7 +12,7 @@ from typing import Optional, List, Sequence
 
 from . import __version__
 from .config import (
-    init_config, get_credentials, load_config, CONFIG_DIR, 
+    init_config, get_credentials, load_config, save_config, CONFIG_DIR,
     save_cookie, get_cookie, clear_cookie,
     save_resources, get_workspace_resources, load_all_resources,
     set_workspace_name, find_workspace_by_name, find_resource_by_name,
@@ -221,30 +221,74 @@ def cmd_list_cookie(args):
         workspace_ids = [(default_ws, ws_name)]
     
     all_jobs = []
-    
+    only_interactive = getattr(args, 'only_interactive', False)
+    include_interactive = getattr(args, 'include_interactive', False) or only_interactive
+    all_users = getattr(args, 'all_users', False)
+
+    # 获取当前用户 ID（用于开发机过滤）
+    current_user_id = None
+    if include_interactive and not all_users:
+        config = load_config()
+        current_user_id = config.get("user_id", "")
+        if not current_user_id:
+            # 首次：从 train_job/list 获取用户 ID 并缓存
+            try:
+                probe = api.list_jobs_with_cookie(workspace_ids[0][0], cookie, page_size=1)
+                probe_jobs = probe.get("jobs", [])
+                if probe_jobs:
+                    created_by = probe_jobs[0].get("created_by") or {}
+                    current_user_id = created_by.get("id", "")
+                    if current_user_id:
+                        config["user_id"] = current_user_id
+                        save_config(config)
+            except QzAPIError:
+                pass
+
     for workspace_id, ws_name in workspace_ids:
         try:
             if len(workspace_ids) > 1:
                 display.print(f"[dim]正在获取 {ws_name or workspace_id} 的任务...[/dim]")
             else:
                 display.print(f"[dim]正在从 API 获取任务列表...[/dim]")
-            
-            result = api.list_jobs_with_cookie(
-                workspace_id, 
-                cookie, 
-                page_size=args.limit * 2 if args.running else args.limit
-            )
-            
-            jobs_data = result.get("jobs", [])
-            
-            # 转换为 JobRecord 格式
-            for job_data in jobs_data:
-                job = JobRecord.from_api_response(job_data, source="api_cookie")
-                # 添加工作空间名称
-                if ws_name:
-                    job.metadata["workspace_name"] = ws_name
-                all_jobs.append(job)
-                
+
+            # 获取训练任务（除非 --only-interactive）
+            if not only_interactive:
+                result = api.list_jobs_with_cookie(
+                    workspace_id,
+                    cookie,
+                    page_size=args.limit * 2 if args.running else args.limit
+                )
+
+                jobs_data = result.get("jobs", [])
+
+                # 转换为 JobRecord 格式
+                for job_data in jobs_data:
+                    job = JobRecord.from_api_response(job_data, source="api_cookie")
+                    # 添加工作空间名称
+                    if ws_name:
+                        job.metadata["workspace_name"] = ws_name
+                    all_jobs.append(job)
+
+            # 获取交互式建模实例（开发机）
+            if include_interactive:
+                try:
+                    # 通过 notebook/list API 过滤
+                    user_ids = [current_user_id] if current_user_id and not all_users else []
+                    status_filter = ["RUNNING"] if args.running else []
+                    nb_result = api.list_notebooks_with_cookie(
+                        workspace_id, cookie,
+                        page_size=args.limit,
+                        user_ids=user_ids,
+                        status=status_filter,
+                    )
+                    for nb_data in nb_result.get("list", []):
+                        job = JobRecord.from_notebook_response(nb_data, workspace_id=workspace_id, workspace_name=ws_name)
+                        all_jobs.append(job)
+                except QzAPIError as e:
+                    if only_interactive:
+                        raise
+                    display.print_warning(f"获取 {ws_name or workspace_id} 的开发机列表失败: {e}")
+
         except QzAPIError as e:
             if "401" in str(e) or "过期" in str(e):
                 display.print_error("Cookie 已过期，请重新设置: qzcli cookie -f <cookie_file>")
@@ -2164,6 +2208,258 @@ def cmd_batch(args):
     return 0
 
 
+def _find_notebook_jupyter_info(notebook_name, display):
+    """
+    根据开发机名称，查找 notebook_id，通过平台 API 获取 Jupyter 连接信息。
+
+    流程：notebook/list → notebook_id → /api/v1/notebook/lab/{id} 301 → Jupyter URL with token
+
+    Returns: dict with {base_url, token, notebook_id} or None
+    """
+    import re
+    import requests as _requests
+
+    cookie_data = get_cookie()
+    if not cookie_data or not cookie_data.get("cookie"):
+        display.print_error("未登录，请先 qzcli login")
+        return None
+
+    cookie = cookie_data["cookie"]
+    api = get_api()
+    config = load_config()
+    user_id = config.get("user_id", "")
+
+    # 1. 从 API 查找运行中的开发机
+    all_resources = load_all_resources()
+    if not all_resources:
+        display.print_error("没有已缓存的工作空间，请先 qzcli res -u")
+        return None
+
+    notebook_id = None
+    for ws_id, ws_data in all_resources.items():
+        try:
+            user_ids = [user_id] if user_id else []
+            nb_result = api.list_notebooks_with_cookie(
+                ws_id, cookie, page_size=50,
+                user_ids=user_ids, status=["RUNNING"],
+            )
+            for nb in nb_result.get("list", []):
+                if nb.get("name") == notebook_name:
+                    notebook_id = nb.get("notebook_id")
+                    break
+        except QzAPIError:
+            continue
+        if notebook_id:
+            break
+
+    if not notebook_id:
+        display.print_error(f"未找到名为 '{notebook_name}' 的运行中开发机")
+        return None
+
+    display.print(f"[dim]找到开发机: {notebook_name} (notebook_id: {notebook_id[:8]}...)[/dim]")
+
+    # 2. 通过 /api/v1/notebook/lab/{notebook_id} 获取 Jupyter URL（含 token）
+    try:
+        resp = _requests.get(
+            f"https://qz.sii.edu.cn/api/v1/notebook/lab/{notebook_id}",
+            headers={"cookie": cookie, "user-agent": "Mozilla/5.0", "accept": "text/html"},
+            allow_redirects=False,
+            timeout=15,
+        )
+        if resp.status_code in (301, 302, 303, 307):
+            jupyter_url = resp.headers.get("Location", "")
+            # URL 格式: https://{domain}/{ws}/{proj}/{user}/jupyter/{nb_id}/{token}/lab?token={token}
+            match = re.search(
+                r'(https://[^/]+/[^/]+/[^/]+/[^/]+/jupyter/[^/]+/([^/]+))/lab',
+                jupyter_url
+            )
+            if match:
+                base_url = match.group(1)
+                token = match.group(2)
+                display.print(f"[dim]已获取 Jupyter 连接信息[/dim]")
+                return {
+                    "base_url": base_url,
+                    "token": token,
+                    "notebook_id": notebook_id,
+                }
+
+        if resp.status_code == 401 or resp.status_code == 302 and "keycloak" in resp.headers.get("Location", ""):
+            display.print_error("Cookie 已过期，请重新登录: qzcli login")
+            return None
+
+        display.print_error(f"获取 Jupyter URL 失败: HTTP {resp.status_code}")
+        return None
+
+    except Exception as e:
+        display.print_error(f"请求失败: {e}")
+        return None
+
+
+def _exec_via_jupyter(jupyter_info, cmd_str, display, timeout=120):
+    """
+    通过 Jupyter Contents API + Terminal 稳健执行命令。
+
+    流程：
+    1. Terminal 发送脚本命令：在 /tmp 执行，完成后拷贝结果到 Contents API 可读目录
+    2. Contents API 轮询读取输出文件
+    3. 清理临时文件
+
+    命令执行与网络连接解耦：即使 WebSocket 断连，命令仍在服务端完整运行。
+
+    Returns: (exit_code, output_str)
+    """
+    import json as _json
+    import time as _time
+
+    try:
+        import websocket
+    except ImportError:
+        display.print_error("需要 websocket-client: pip install websocket-client")
+        return 1, ""
+
+    import requests as _requests
+
+    base_http = jupyter_info["base_url"]
+    base_ws = base_http.replace("https://", "wss://")
+    token = jupyter_info["token"]
+    headers = {"authorization": f"token {token}", "content-type": "application/json"}
+
+    job_id = f"qzcli_{int(_time.time())}"
+    tmp_dir = "/tmp/.qzcli"
+    # Contents API 通过 symlink 读取 /tmp/.qzcli
+    api_dir = "_qzcli"
+    api_out = f"{api_dir}/{job_id}_out"
+    api_exit = f"{api_dir}/{job_id}_exit"
+
+    def cleanup():
+        # Contents API 删除会同时删掉 /tmp 里的文件（因为 symlink）
+        for fname in [api_out, api_exit]:
+            try:
+                _requests.delete(f"{base_http}/api/contents/{fname}", headers=headers, timeout=5)
+            except Exception:
+                pass
+
+    # 1. 确保 Contents API 中转目录存在
+    try:
+        _requests.put(
+            f"{base_http}/api/contents/{api_dir}",
+            headers=headers,
+            json={"type": "directory"},
+            timeout=10,
+        )
+    except Exception:
+        pass
+
+    # 2. 通过 Terminal 发送一条复合命令（fire-and-forget）
+    #    输出写到 /tmp/.qzcli/，通过 symlink 让 Contents API 可读
+    shell_cmd = (
+        f'mkdir -p {tmp_dir} && '
+        f'{{ [ -L "$PWD/{api_dir}" ] || {{ rm -rf "$PWD/{api_dir}" && ln -sf {tmp_dir} "$PWD/{api_dir}"; }}; }} && '
+        f'( {cmd_str} ) > {tmp_dir}/{job_id}_out 2>&1; '
+        f'echo $? > {tmp_dir}/{job_id}_exit'
+    )
+
+    launched = False
+    for attempt in range(3):
+        try:
+            resp_t = _requests.get(f"{base_http}/api/terminals", headers=headers, timeout=10)
+            terms = resp_t.json() if resp_t.status_code == 200 else []
+            if terms:
+                term_name = terms[0]["name"]
+            else:
+                resp_t = _requests.post(f"{base_http}/api/terminals", headers=headers, timeout=10)
+                term_name = resp_t.json()["name"]
+
+            ws = websocket.create_connection(
+                f"{base_ws}/terminals/websocket/{term_name}?token={token}", timeout=10,
+            )
+            _time.sleep(0.3)
+            while True:
+                try:
+                    ws.settimeout(0.3)
+                    ws.recv()
+                except:
+                    break
+
+            ws.send(_json.dumps(["stdin", shell_cmd + "\r"]))
+            _time.sleep(0.5)
+            ws.close()
+            launched = True
+            break
+        except Exception as e:
+            if attempt < 2:
+                display.print_warning(f"连接失败，重试中... ({attempt + 1}/3)")
+                _time.sleep(2)
+            else:
+                display.print_error(f"启动命令失败: {e}")
+                return 1, ""
+
+    if not launched:
+        return 1, ""
+
+    # 3. 轮询 Contents API 读取输出
+    deadline = _time.time() + timeout
+    exit_code = 1
+    output = ""
+    poll_interval = 1
+
+    while _time.time() < deadline:
+        _time.sleep(poll_interval)
+        try:
+            resp_exit = _requests.get(
+                f"{base_http}/api/contents/{api_exit}",
+                headers=headers, timeout=10,
+            )
+            if resp_exit.status_code == 200:
+                exit_str = resp_exit.json().get("content", "").strip()
+                exit_code = int(exit_str) if exit_str.isdigit() else 1
+
+                resp_out = _requests.get(
+                    f"{base_http}/api/contents/{api_out}",
+                    headers=headers, timeout=10,
+                )
+                if resp_out.status_code == 200:
+                    output = resp_out.json().get("content", "").rstrip()
+
+                cleanup()
+                return exit_code, output
+        except Exception:
+            pass
+
+        poll_interval = min(poll_interval * 1.5, 5)
+
+    cleanup()
+    display.print_warning("命令执行超时，输出可能不完整")
+    return 124, output
+
+
+def cmd_exec(args):
+    """在开发机上执行命令（通过 Jupyter terminal API）"""
+    display = get_display()
+    host = args.host
+    cmd_parts = args.remote_cmd
+
+    if not cmd_parts:
+        display.print_error("请指定要执行的命令")
+        display.print("[dim]用法: qzcli exec <host> <command>[/dim]")
+        display.print("[dim]示例: qzcli exec blender-rl nvidia-smi[/dim]")
+        return 1
+
+    cmd_str = " ".join(cmd_parts)
+
+    # 查找 Jupyter 连接信息
+    jupyter_info = _find_notebook_jupyter_info(host, display)
+    if jupyter_info is None:
+        return 1
+
+    display.print(f"[dim]在 {host} 上执行: {cmd_str}[/dim]")
+
+    exit_code, output = _exec_via_jupyter(jupyter_info, cmd_str, display)
+    if output:
+        print(output)
+    return exit_code
+
+
 def cmd_login(args):
     """通过 CAS 登录获取 cookie"""
     import getpass
@@ -2260,6 +2556,10 @@ def main():
     list_parser.add_argument("--cookie", "-c", action="store_true", help="使用 cookie 从 API 获取任务（无需本地 store）")
     list_parser.add_argument("--workspace", "-w", help="工作空间（名称或 ID，cookie 模式）")
     list_parser.add_argument("--all-ws", action="store_true", help="查询所有已缓存的工作空间（cookie 模式）")
+    # 交互式建模（开发机）
+    list_parser.add_argument("--include-interactive", "-I", action="store_true", help="同时显示交互式建模实例（开发机）")
+    list_parser.add_argument("--only-interactive", "-i", action="store_true", help="只显示交互式建模实例（开发机）")
+    list_parser.add_argument("--all-users", action="store_true", help="显示所有用户的开发机（默认只显示自己的）")
     
     # status 命令
     status_parser = subparsers.add_parser("status", aliases=["st"], help="查看任务状态")
@@ -2316,6 +2616,11 @@ def main():
     login_parser.add_argument("--password-stdin", action="store_true", help="从 stdin 读取密码（适合脚本: echo 'pass' | qzcli login -u user --password-stdin）")
     login_parser.add_argument("--workspace", "-w", help="默认工作空间 ID")
     
+    # exec 命令
+    exec_parser = subparsers.add_parser("exec", help="在开发机上执行命令（通过 Jupyter API，无需 SSH）")
+    exec_parser.add_argument("host", help="开发机名称（如 blender-rl、rtx-gpu8）")
+    exec_parser.add_argument("remote_cmd", nargs=argparse.REMAINDER, help="要执行的命令")
+
     # workspace 命令
     workspace_parser = subparsers.add_parser("workspace", aliases=["ws"], help="查看工作空间内所有运行任务")
     workspace_parser.add_argument("--workspace", "-w", help="工作空间 ID")
@@ -2397,6 +2702,7 @@ def main():
         "rm": cmd_remove,
         "clear": cmd_clear,
         "cookie": cmd_cookie,
+        "exec": cmd_exec,
         "login": cmd_login,
         "workspace": cmd_workspace,
         "ws": cmd_workspace,

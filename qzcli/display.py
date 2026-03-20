@@ -261,20 +261,55 @@ class Display:
         
         for idx, job in enumerate(jobs, 1):
             style, icon, status_name = get_status_display(job.status)
-            
-            # 构建 GPU 和计算组信息行
+            is_interactive = getattr(job, 'task_type', '') == 'interactive_modeling'
+
+            # 构建资源信息行
             gpu_info_parts = []
-            if job.gpu_count and job.gpu_type:
-                gpu_info_parts.append(f"{job.gpu_count}×{job.gpu_type}")
-            elif job.gpu_count:
-                gpu_info_parts.append(f"{job.gpu_count} GPU")
-            # 显示节点数（大于1时显示）
-            if job.instance_count and job.instance_count > 1:
-                gpu_info_parts.append(f"{job.instance_count}节点")
-            if job.compute_group_name:
-                gpu_info_parts.append(job.compute_group_name)
+            if is_interactive:
+                # 交互式建模：显示 GPU数×类型 + CPU + 内存
+                res_parts = []
+                if job.gpu_count:
+                    res_parts.append(f"{job.gpu_count}GPU")
+                cpu_count = getattr(job, 'cpu_count', 0)
+                memory_gb = getattr(job, 'memory_gb', 0)
+                if cpu_count:
+                    res_parts.append(f"{cpu_count}核CPU")
+                if memory_gb:
+                    res_parts.append(f"{memory_gb}GB内存")
+                if res_parts:
+                    gpu_info_parts.append(" ".join(res_parts))
+                node_name = getattr(job, 'node_name', '')
+                if node_name:
+                    gpu_info_parts.append(f"节点: {node_name}")
+            else:
+                if job.gpu_count and job.gpu_type:
+                    gpu_info_parts.append(f"{job.gpu_count}×{job.gpu_type}")
+                elif job.gpu_count:
+                    gpu_info_parts.append(f"{job.gpu_count} GPU")
+                # 显示节点数（大于1时显示）
+                if job.instance_count and job.instance_count > 1:
+                    gpu_info_parts.append(f"{job.instance_count}节点")
+                if job.compute_group_name:
+                    gpu_info_parts.append(job.compute_group_name)
             gpu_info_line = " | ".join(gpu_info_parts) if gpu_info_parts else ""
-            
+
+            # 交互式建模额外信息：用户 + 项目
+            extra_line = ""
+            if is_interactive:
+                extra_parts = []
+                user_name = getattr(job, 'user_name', '')
+                if user_name:
+                    extra_parts.append(user_name)
+                if job.project_name:
+                    extra_parts.append(job.project_name)
+                if job.priority_level and job.priority_level != "0":
+                    extra_parts.append(f"优先级{job.priority_level}")
+                if extra_parts:
+                    extra_line = " | ".join(extra_parts)
+
+            # 类型标签
+            type_tag = "[开发机] " if is_interactive else ""
+
             if RICH_AVAILABLE:
                 # 第一行：序号 + 状态 + 时间信息
                 self.console.print(
@@ -282,19 +317,24 @@ class Display:
                     f"{format_time_ago(job.created_at)} | {format_duration(job.running_time_ms)}"
                 )
                 # 第二行：任务名称
-                self.console.print(f"    [white]{job.name}[/white]")
+                self.console.print(f"    [white]{type_tag}{job.name}[/white]")
                 # 第三行：GPU 和计算组信息
                 if gpu_info_line:
                     self.console.print(f"    [dim]{gpu_info_line}[/dim]")
-                # 第四行：完整 URL（直接 print 避免 rich 换行）
+                # 第四行：用户/项目信息（交互式建模）
+                if extra_line:
+                    self.console.print(f"    [dim]{extra_line}[/dim]")
+                # URL
                 if job.url:
                     print(f"    {job.url}")
                 self.console.print("")
             else:
                 print(f"[{idx}] {icon} {status_name} | {format_time_ago(job.created_at)} | {format_duration(job.running_time_ms)}")
-                print(f"    {job.name}")
+                print(f"    {type_tag}{job.name}")
                 if gpu_info_line:
                     print(f"    {gpu_info_line}")
+                if extra_line:
+                    print(f"    {extra_line}")
                 if job.url:
                     print(f"    {job.url}")
                 print("")

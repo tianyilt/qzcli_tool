@@ -38,6 +38,13 @@ class JobRecord:
     compute_group_name: str = ""  # 如 "H200-3号机房-2"
     gpu_type: str = ""  # 如 "H200"
     project_name: str = ""  # 如 "CI-扩散音视频生成"
+
+    # 交互式建模额外信息
+    user_name: str = ""  # 创建者姓名
+    cpu_count: int = 0  # CPU 核数
+    memory_gb: int = 0  # 内存 GB
+    node_name: str = ""  # 所在节点名称
+    task_type: str = ""  # 任务类型：distributed_training, interactive_modeling 等
     
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)
@@ -107,6 +114,200 @@ class JobRecord:
             gpu_type=gpu_type,
             project_name=project_name,
         )
+
+    @classmethod
+    def from_notebook_response(cls, data: Dict[str, Any], workspace_id: str = "", workspace_name: str = "") -> "JobRecord":
+        """从 notebook/list API 响应创建记录（交互式建模/开发机）"""
+        notebook_id = data.get("notebook_id", "")
+        name = data.get("name", "")
+        status_raw = data.get("status", "unknown")
+
+        # 转换状态
+        status_map = {
+            "RUNNING": "job_running",
+            "STOPPED": "job_stopped",
+            "SUCCEEDED": "job_succeeded",
+            "FAILED": "job_failed",
+            "PENDING": "job_pending",
+            "QUEUED": "job_queued",
+            "STOPPING": "job_stopped",
+        }
+        status = status_map.get(status_raw, status_raw.lower())
+
+        # 资源信息：优先从 quota 读取（运行中有值），否则从 start_config
+        quota = data.get("quota") or {}
+        start_config = data.get("start_config") or {}
+        gpu_count = quota.get("gpu_count") or start_config.get("gpu_count", 0)
+        cpu_count = quota.get("cpu_count") or start_config.get("cpu_count", 0)
+        memory_gb = quota.get("memory_size") or start_config.get("memory_size", 0)
+        gpu_ram = quota.get("gpu_ram", 0)
+
+        # 计算组
+        cg = data.get("logic_compute_group") or {}
+        compute_group_name = cg.get("name", "")
+
+        # 节点和 SSH 信息
+        extra = data.get("extra_info") or {}
+        node_name = extra.get("NodeName", "")
+        ssh_domain = extra.get("SshDomain", "")
+
+        # 创建者
+        creator = data.get("creator") or {}
+        user_name = creator.get("name", "")
+
+        # 项目
+        project = data.get("project") or {}
+        project_name = project.get("name", "")
+
+        # 优先级
+        queue = data.get("queue") or {}
+        priority = queue.get("priority", "")
+
+        # 时间
+        created_at_ms = data.get("created_at", "")
+        created_at = ""
+        if created_at_ms:
+            try:
+                created_at = datetime.fromtimestamp(int(created_at_ms) / 1000).isoformat()
+            except (ValueError, TypeError):
+                pass
+
+        # 运行时间（live_time 单位是秒）
+        live_time = data.get("live_time", "")
+        running_time_ms = ""
+        if live_time:
+            try:
+                running_time_ms = str(int(live_time) * 1000)
+            except (ValueError, TypeError):
+                pass
+
+        # URL
+        url = ""
+        if notebook_id and workspace_id:
+            url = f"https://qz.sii.edu.cn/jobs/interactiveModelingDetail/{notebook_id}?spaceId={workspace_id}"
+
+        # GPU 类型描述
+        gpu_type = ""
+        if gpu_count and gpu_ram:
+            gpu_type = f"GPU({gpu_ram}GB)"
+
+        record = cls(
+            job_id=notebook_id,
+            name=name,
+            status=status,
+            workspace_id=workspace_id,
+            project_id=project.get("id", ""),
+            created_at=created_at,
+            updated_at=datetime.now().isoformat(),
+            source="notebook",
+            url=url,
+            running_time_ms=running_time_ms,
+            priority_level=str(priority) if priority else "",
+            gpu_count=gpu_count,
+            instance_count=1,
+            compute_group_name=compute_group_name,
+            gpu_type=gpu_type,
+            project_name=project_name,
+            user_name=user_name,
+            cpu_count=cpu_count,
+            memory_gb=memory_gb,
+            node_name=node_name,
+            task_type="interactive_modeling",
+        )
+        if workspace_name:
+            record.metadata["workspace_name"] = workspace_name
+        if ssh_domain:
+            record.metadata["ssh_domain"] = ssh_domain
+        return record
+
+    @classmethod
+    def from_task_dimension(cls, data: Dict[str, Any], workspace_id: str = "", workspace_name: str = "") -> "JobRecord":
+        """从 list_task_dimension API 响应创建记录（用于交互式建模等）"""
+        task_id = data.get("id", "")
+        task_name = data.get("name", "")
+        task_type = data.get("type", "")
+        status_raw = data.get("status", "unknown")
+
+        # 转换状态格式：RUNNING -> job_running
+        status_map = {
+            "RUNNING": "job_running",
+            "STOPPED": "job_stopped",
+            "SUCCEEDED": "job_succeeded",
+            "FAILED": "job_failed",
+            "PENDING": "job_pending",
+            "QUEUED": "job_queued",
+        }
+        status = status_map.get(status_raw, status_raw.lower())
+
+        # 解析资源信息
+        gpu_info = data.get("gpu", {})
+        cpu_info = data.get("cpu", {})
+        mem_info = data.get("memory", {})
+        gpu_count = gpu_info.get("total", 0)
+        cpu_count = cpu_info.get("total", 0)
+        memory_gb = mem_info.get("total", 0)
+
+        # 节点信息
+        nodes_occupied = data.get("nodes_occupied", {})
+        nodes = nodes_occupied.get("nodes", [])
+        node_name = ", ".join(nodes) if nodes else ""
+
+        # 用户和项目
+        user_info = data.get("user", {})
+        user_name = user_info.get("name", "")
+        project_info = data.get("project", {})
+        project_name = project_info.get("name", "")
+
+        # 优先级
+        priority = data.get("priority", 0)
+
+        # 运行时间
+        running_time_ms = data.get("running_time_ms", "")
+
+        # 创建时间（格式如 "2026-03-19 13:36:47 +0800 CST"）
+        created_at_raw = data.get("created_at", "")
+        created_at = ""
+        if created_at_raw:
+            try:
+                # 去掉末尾的 CST 等时区缩写
+                parts = created_at_raw.rsplit(" ", 1)
+                if len(parts) == 2 and not parts[1][0].isdigit():
+                    created_at_raw = parts[0]
+                from datetime import datetime as dt
+                parsed = dt.strptime(created_at_raw, "%Y-%m-%d %H:%M:%S %z")
+                created_at = parsed.isoformat()
+            except (ValueError, TypeError):
+                created_at = created_at_raw
+
+        # 构建 URL
+        url = ""
+        if task_id and workspace_id:
+            url = f"https://qz.sii.edu.cn/jobs/interactiveModelingDetail/{task_id}?spaceId={workspace_id}"
+
+        record = cls(
+            job_id=task_id,
+            name=task_name,
+            status=status,
+            workspace_id=workspace_id,
+            project_id=project_info.get("id", ""),
+            created_at=created_at,
+            updated_at=datetime.now().isoformat(),
+            source="task_dimension",
+            url=url,
+            running_time_ms=str(running_time_ms),
+            priority_level=str(priority),
+            gpu_count=gpu_count,
+            instance_count=nodes_occupied.get("count", 1),
+            project_name=project_name,
+            user_name=user_name,
+            cpu_count=cpu_count,
+            memory_gb=memory_gb,
+            node_name=node_name,
+            task_type=task_type,
+        )
+        if workspace_name:
+            record.metadata["workspace_name"] = workspace_name
+        return record
 
 
 class JobStore:
