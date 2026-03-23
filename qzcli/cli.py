@@ -1454,6 +1454,47 @@ def cmd_avail(args):
                     display.print(f'WORKSPACE_ID="{r["workspace_id"]}"')
                     display.print(f'LOGIC_COMPUTE_GROUP_ID="{r["id"]}"')
     
+    # HPC 节点 CPU/内存利用率汇总
+    hpc_any = False
+    lcg_filter = group_filter if group_filter and group_filter.startswith("lcg-") else None
+    for workspace_id in workspace_ids:
+        cached = get_workspace_resources(workspace_id)
+        ws_label = cached.get("name", workspace_id) if cached else workspace_id
+        try:
+            hpc_nodes = []
+            page_num = 1
+            page_size = 200
+            while True:
+                data = api.list_node_dimension(
+                    workspace_id, cookie,
+                    logic_compute_group_id=lcg_filter,
+                    page_num=page_num,
+                    page_size=page_size,
+                )
+                batch = data.get("node_dimensions", [])
+                hpc_nodes.extend(b for b in batch if b.get("node_type") == "hpc")
+                if len(batch) < page_size:
+                    break
+                page_num += 1
+            if not hpc_nodes:
+                continue
+            if not hpc_any:
+                display.print(f"\n[bold]HPC 节点 CPU/内存利用率[/bold]")
+                hpc_any = True
+            total_hpc = len(hpc_nodes)
+            cpu_rates = [n.get("cpu", {}).get("usage_rate", 0) for n in hpc_nodes]
+            mem_rates = [n.get("memory", {}).get("usage_rate", 0) for n in hpc_nodes]
+            avg_cpu = sum(cpu_rates) / total_hpc * 100
+            avg_mem = sum(mem_rates) / total_hpc * 100
+            busy = sum(1 for r in cpu_rates if r > 0.05)
+            display.print(
+                f"  {ws_label}: 节点 {total_hpc} | 忙碌 {busy} "
+                f"| 平均CPU [cyan]{avg_cpu:.1f}%[/cyan] "
+                f"| 平均MEM [cyan]{avg_mem:.1f}%[/cyan]"
+            )
+        except Exception:
+            pass
+
     return 0
 
 
