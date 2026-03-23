@@ -2135,6 +2135,101 @@ def cmd_hpc(args):
     return 0
 
 
+def cmd_hpc_usage(args):
+    """查看 HPC 任务 CPU/内存利用率（基于节点维度统计）"""
+    display = get_display()
+    api = get_api()
+
+    cookie_data = get_cookie()
+    if not cookie_data or not cookie_data.get("cookie"):
+        display.print_error("未设置 cookie，请先运行: qzcli login")
+        return 1
+    cookie = cookie_data["cookie"]
+
+    workspace_input = args.workspace
+    if not workspace_input:
+        all_resources = load_all_resources()
+        if not all_resources:
+            display.print_error("没有已缓存的工作空间，请先运行: qzcli res -u")
+            return 1
+        workspace_ids = [(ws_id, data.get("name", "")) for ws_id, data in all_resources.items()]
+    elif workspace_input.startswith("ws-"):
+        ws_resources = get_workspace_resources(workspace_input)
+        workspace_ids = [(workspace_input, ws_resources.get("name", "") if ws_resources else "")]
+    else:
+        wid = find_workspace_by_name(workspace_input)
+        if not wid:
+            display.print_error(f"未找到名称为 '{workspace_input}' 的工作空间")
+            return 1
+        ws_resources = get_workspace_resources(wid)
+        workspace_ids = [(wid, ws_resources.get("name", wid) if ws_resources else wid)]
+
+    lcg_id = args.compute_group or ""
+
+    for workspace_id, ws_name in workspace_ids:
+        display.print(f"[dim]正在查询 {ws_name or workspace_id} 的 HPC 节点利用率...[/dim]")
+        try:
+            # 分页获取所有节点
+            nodes = []
+            page_num = 1
+            page_size = 200
+            while True:
+                data = api.list_node_dimension(
+                    workspace_id, cookie,
+                    logic_compute_group_id=lcg_id or None,
+                    page_num=page_num,
+                    page_size=page_size,
+                )
+                batch = data.get("node_dimensions", [])
+                total = data.get("total", 0)
+                nodes.extend(batch)
+                if len(nodes) >= total or len(batch) < page_size:
+                    break
+                page_num += 1
+
+            # 只保留 HPC 节点
+            hpc_nodes = [n for n in nodes if n.get("node_type", "") == "hpc"]
+            if not hpc_nodes:
+                display.print(f"  [dim]{ws_name or workspace_id}: 无 HPC 节点[/dim]")
+                continue
+
+            total_nodes = len(hpc_nodes)
+            cpu_rates = [n.get("cpu", {}).get("usage_rate", 0) for n in hpc_nodes]
+            mem_rates = [n.get("memory", {}).get("usage_rate", 0) for n in hpc_nodes]
+            avg_cpu = sum(cpu_rates) / total_nodes * 100
+            avg_mem = sum(mem_rates) / total_nodes * 100
+            busy_nodes = sum(1 for r in cpu_rates if r > 0.05)
+
+            display.print(f"\n[bold]{ws_name or workspace_id}[/bold]")
+            display.print(f"  HPC 节点总数: {total_nodes}  忙碌节点 (CPU>5%): {busy_nodes}")
+            display.print(f"  平均 CPU 利用率: [cyan]{avg_cpu:.1f}%[/cyan]")
+            display.print(f"  平均内存利用率: [cyan]{avg_mem:.1f}%[/cyan]")
+
+            if args.verbose:
+                display.print(f"\n  {'节点名称':<20} {'CPU%':>7} {'MEM%':>7} {'CPU用/总':>12} {'MEM用/总(GiB)':>16}")
+                display.print("  " + "-" * 65)
+                sort_key = lambda n: -n.get("cpu", {}).get("usage_rate", 0)
+                for node in sorted(hpc_nodes, key=sort_key)[:args.top]:
+                    name = node.get("name", "")
+                    cpu = node.get("cpu", {})
+                    mem = node.get("memory", {})
+                    cpu_pct = cpu.get("usage_rate", 0) * 100
+                    mem_pct = mem.get("usage_rate", 0) * 100
+                    cpu_used = cpu.get("used", 0)
+                    cpu_total = cpu.get("total", 0)
+                    mem_used = mem.get("used", 0)
+                    mem_total = mem.get("total", 0)
+                    display.print(f"  {name:<20} {cpu_pct:>6.1f}% {mem_pct:>6.1f}% {cpu_used:>5}/{cpu_total:<5} {mem_used:>7.1f}/{mem_total:<7.1f}")
+
+        except QzAPIError as e:
+            if "401" in str(e) or "过期" in str(e):
+                display.print_error("Cookie 已过期，请重新设置: qzcli login")
+                return 1
+            display.print_warning(f"查询 {ws_name or workspace_id} 失败: {e}")
+
+    return 0
+
+
 def cmd_batch(args):
     """批量提交任务"""
     import json as json_mod
@@ -2486,6 +2581,12 @@ def main():
     hpc_parser.add_argument("--no-track", action="store_true", help="不追踪任务")
     hpc_parser.add_argument("--json", dest="output_json", action="store_true", help="JSON 输出")
 
+    hpc_usage_parser = subparsers.add_parser("hpc-usage", help="查看 HPC 节点 CPU/内存利用率")
+    hpc_usage_parser.add_argument("--workspace", "-w", help="工作空间 ID 或名称（默认查询所有已缓存工作空间）")
+    hpc_usage_parser.add_argument("--compute-group", dest="compute_group", default="", help="计算组 ID（lcg-...），省略则查所有 HPC 节点")
+    hpc_usage_parser.add_argument("--verbose", "-v", action="store_true", help="显示每个节点的详细利用率")
+    hpc_usage_parser.add_argument("--top", type=int, default=30, help="详细模式下显示前 N 个节点（默认 30）")
+
     batch_parser = subparsers.add_parser("batch", help="从 JSON 配置文件批量提交任务")
     batch_parser.add_argument("config", help="批量配置文件路径（JSON 格式）")
     batch_parser.add_argument("--dry-run", action="store_true", help="只预览不提交")
@@ -2527,6 +2628,7 @@ def main():
         "create": cmd_create,
         "create-job": cmd_create,
         "hpc": cmd_hpc,
+        "hpc-usage": cmd_hpc_usage,
         "batch": cmd_batch,
     }
     

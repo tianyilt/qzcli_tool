@@ -1271,6 +1271,99 @@ def qz_create_hpc_job(
     )
 
 
+@server.tool()
+def qz_get_hpc_usage(
+    workspace: str = "",
+    compute_group: str = "",
+    verbose: bool = False,
+    top: int = 30,
+) -> dict[str, Any]:
+    """
+    查看 HPC 节点的 CPU/内存利用率。
+
+    通过 /api/v1/cluster_metric/list_node_dimension 接口获取各 HPC 节点实时
+    CPU 和内存使用率，并按工作空间汇总统计。
+
+    Args:
+        workspace: 工作空间 ID 或名称，空字符串表示查询所有已缓存工作空间
+        compute_group: 计算组 ID（lcg-...），空字符串表示查所有 HPC 节点
+        verbose: 是否返回每个节点的详细数据（默认 False）
+        top: verbose=True 时返回 CPU 利用率最高的前 N 个节点（默认 30）
+    """
+    cookie, warnings = _require_cookie()
+    workspace_refs = _resolve_workspace_refs(workspace or None, all_workspaces=not bool(workspace))
+    api = get_api()
+    all_stats = []
+
+    for workspace_ref in workspace_refs:
+        workspace_id = workspace_ref["id"]
+        workspace_name = workspace_ref.get("name", "")
+        try:
+            nodes: list[dict] = []
+            page_num = 1
+            page_size = 200
+            while True:
+                data = api.list_node_dimension(
+                    workspace_id, cookie,
+                    logic_compute_group_id=compute_group or None,
+                    page_num=page_num,
+                    page_size=page_size,
+                )
+                batch = data.get("node_dimensions", [])
+                total = data.get("total", 0)
+                nodes.extend(batch)
+                if len(nodes) >= total or len(batch) < page_size:
+                    break
+                page_num += 1
+
+            hpc_nodes = [n for n in nodes if n.get("node_type", "") == "hpc"]
+            if not hpc_nodes:
+                continue
+
+            cpu_rates = [n.get("cpu", {}).get("usage_rate", 0) for n in hpc_nodes]
+            mem_rates = [n.get("memory", {}).get("usage_rate", 0) for n in hpc_nodes]
+            total_nodes = len(hpc_nodes)
+            avg_cpu = sum(cpu_rates) / total_nodes if total_nodes else 0
+            avg_mem = sum(mem_rates) / total_nodes if total_nodes else 0
+            busy_nodes = sum(1 for r in cpu_rates if r > 0.05)
+
+            stat: dict[str, Any] = {
+                "workspace_id": workspace_id,
+                "workspace_name": workspace_name,
+                "total_hpc_nodes": total_nodes,
+                "busy_nodes": busy_nodes,
+                "avg_cpu_usage_pct": round(avg_cpu * 100, 2),
+                "avg_mem_usage_pct": round(avg_mem * 100, 2),
+            }
+
+            if verbose:
+                sorted_nodes = sorted(hpc_nodes, key=lambda n: -n.get("cpu", {}).get("usage_rate", 0))
+                stat["nodes"] = [
+                    {
+                        "name": n.get("name", ""),
+                        "cpu_usage_pct": round(n.get("cpu", {}).get("usage_rate", 0) * 100, 2),
+                        "mem_usage_pct": round(n.get("memory", {}).get("usage_rate", 0) * 100, 2),
+                        "cpu_used": n.get("cpu", {}).get("used", 0),
+                        "cpu_total": n.get("cpu", {}).get("total", 0),
+                        "mem_used_gib": round(n.get("memory", {}).get("used", 0), 2),
+                        "mem_total_gib": round(n.get("memory", {}).get("total", 0), 2),
+                    }
+                    for n in sorted_nodes[:top]
+                ]
+
+            all_stats.append(stat)
+        except Exception as exc:
+            warnings.append(f"{workspace_name or workspace_id}: {exc}")
+
+    return _result(
+        {
+            "workspace_count": len(all_stats),
+            "workspaces": all_stats,
+        },
+        warnings=warnings,
+    )
+
+
 def main() -> None:
     server.run(transport="stdio")
 
