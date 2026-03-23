@@ -258,7 +258,8 @@ qzcli ls --no-refresh       # 不刷新状态
 
 | 命令 | 别名 | 说明 |
 |------|------|------|
-| `create` | `create-job` | 创建并提交任务 |
+| `create` | `create-job` | 创建并提交 GPU 分布式训练任务 |
+| `hpc` | | 提交 HPC/CPU 任务（Slurm，需 cookie 认证） |
 | `batch` | | 从 JSON 配置文件批量提交任务 |
 
 ```bash
@@ -309,6 +310,46 @@ qzcli create --name test --command "echo hi" --workspace "分布式训练" --jso
 | `--json` | | | JSON 输出 |
 
 > **提示**: `--project`、`--compute-group`、`--spec` 省略时会自动从 `qzcli res` 缓存中选取第一个。首次使用前请先运行 `qzcli res -u` 发现资源。
+
+### 提交 HPC/CPU 任务
+
+> HPC 任务使用 Slurm 调度，通过 `/api/v1/hpc_jobs` 接口提交，需要 cookie 认证（先运行 `qzcli login`）。
+
+```bash
+qzcli hpc \
+  --name "bulk-NH3-check-outcar" \
+  --workspace ws-6e6ba362-e98e-45b2-9c5a-311998e93d65 \
+  --compute-group lcg-cb2de75c-40ac-4de1-bbb3-11e62b32f424 \
+  --predef-quota-id d4ae9e69-cec3-4dce-85d6-364ac0ec12b3 \
+  --cpu 55 \
+  --mem-gi 300 \
+  --instances 30 \
+  --cpus-per-task 55 \
+  --image docker.sii.shaipower.online/inspire-studio/vasp_lmp-wyh:1203 \
+  --entrypoint "cd /path/to/dir && bash run.sh"
+```
+
+**参数说明:**
+
+| 参数 | 默认值 | 说明 |
+|------|--------|------|
+| `--name` | (必填) | 任务名称 |
+| `--workspace` | (必填) | 工作空间 ID 或名称 |
+| `--compute-group` | (必填) | 计算组 ID（lcg-...） |
+| `--predef-quota-id` | (必填) | 预定义配额 ID（资源规格 UUID） |
+| `--cpu` | (必填) | 每节点 CPU 核心数 |
+| `--mem-gi` | (必填) | 每节点内存 GiB |
+| `--image` | (必填) | 容器镜像地址 |
+| `--entrypoint` | (必填) | 运行命令（shell 字符串） |
+| `--project` | 自动选择 | 项目 ID 或名称 |
+| `--instances` | 1 | 节点数 |
+| `--cpus-per-task` | 1 | 每任务 CPU 数 |
+| `--memory-per-cpu` | `5G` | 每 CPU 内存 |
+| `--image-type` | `SOURCE_PRIVATE` | 镜像类型 |
+| `--no-track` | | 不追踪任务 |
+| `--json` | | JSON 输出 |
+
+> **注意**: HPC 任务在启智平台的「高性能计算任务」页面查看，URL 为 `https://qz.sii.edu.cn/jobs/hpc?spaceId=<workspace_id>`，与 GPU 分布式训练任务页面不同。
 
 ### 批量提交任务
 
@@ -443,7 +484,8 @@ export QZCLI_API_URL="https://qz.sii.edu.cn"
 
 - **日常使用**: `qzcli login && qzcli avail` 一键登录并查看资源
 - **提交前**: `qzcli avail -n 4 -e` 找合适的计算组并导出配置
-- **提交任务**: `qzcli create -n "job" -c "bash run.sh" -w "分布式训练" --instances 4`
+- **提交 GPU 任务**: `qzcli create -n "job" -c "bash run.sh" -w "分布式训练" --instances 4`
+- **提交 HPC 任务**: `qzcli login && qzcli hpc --name "job" --workspace ws-xxx --compute-group lcg-xxx --predef-quota-id uuid --cpu 55 --mem-gi 300 --instances 30 --image img --entrypoint "bash run.sh"`
 - **批量提交**: `qzcli batch config.json` 从配置文件批量提交
 - **监控任务**: `qzcli ls -c --all-ws -r` 查看所有工作空间运行中的任务
 - **详细信息**: `qzcli ws` 查看 GPU/CPU/内存使用率
