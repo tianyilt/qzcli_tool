@@ -1812,6 +1812,21 @@ def cmd_workspace(args):
             display.print_error(f"获取工作空间列表失败: {e}")
         return 1
     
+    # 弃用选项提示
+    deprecated_used = []
+    if getattr(args, "project", None) is not None:
+        deprecated_used.append("--project/-p")
+    if getattr(args, "all", False):
+        deprecated_used.append("--all/-a")
+    if getattr(args, "page", 1) != 1:
+        deprecated_used.append("--page")
+    if getattr(args, "size", 100) != 100:
+        deprecated_used.append("--size")
+    if getattr(args, "sync", False):
+        deprecated_used.append("--sync/-s")
+    if deprecated_used:
+        display.print(f"[yellow]警告: {', '.join(deprecated_used)} 已弃用（上游 API 不再支持），将被忽略[/yellow]")
+
     try:
         display.print("[dim]正在获取工作空间任务概览...[/dim]")
         data = api.list_workspace_tasks(workspace_id, cookie)
@@ -2827,6 +2842,12 @@ def main():
     # workspace 命令
     workspace_parser = subparsers.add_parser("workspace", aliases=["ws"], help="查看工作空间任务概览")
     workspace_parser.add_argument("--workspace", "-w", help="工作空间 ID")
+    # 以下选项已弃用（上游 API 不再支持），保留以兼容现有脚本
+    workspace_parser.add_argument("--project", "-p", default=None, help=argparse.SUPPRESS)
+    workspace_parser.add_argument("--all", "-a", action="store_true", help=argparse.SUPPRESS)
+    workspace_parser.add_argument("--page", type=int, default=1, help=argparse.SUPPRESS)
+    workspace_parser.add_argument("--size", type=int, default=100, help=argparse.SUPPRESS)
+    workspace_parser.add_argument("--sync", "-s", action="store_true", help=argparse.SUPPRESS)
     
     # workspaces 命令 - 从历史任务提取资源配置
     workspaces_parser = subparsers.add_parser("workspaces", aliases=["lsws", "res", "resources"], help="从历史任务提取资源配置（项目、计算组、规格）")
