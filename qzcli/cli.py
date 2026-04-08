@@ -33,7 +33,7 @@ from .config import (
     update_workspace_compute_groups,
     update_workspace_projects,
 )
-from .display import format_duration, get_display
+from .display import get_display
 from .store import JobRecord, get_store
 
 try:
@@ -1909,7 +1909,7 @@ def cmd_usage(args):
 
 
 def cmd_workspace(args):
-    """查看工作空间内所有运行任务"""
+    """查看工作空间任务概览"""
     display = get_display()
     api = get_api()
 
@@ -1945,106 +1945,84 @@ def cmd_workspace(args):
             display.print_error(f"获取工作空间列表失败: {e}")
         return 1
 
-    # 项目过滤
-    project_filter = None if args.all else args.project
+    # 弃用选项提示
+    deprecated_used = []
+    if getattr(args, "project", None) is not None:
+        deprecated_used.append("--project/-p")
+    if getattr(args, "all", False):
+        deprecated_used.append("--all/-a")
+    if getattr(args, "page", 1) != 1:
+        deprecated_used.append("--page")
+    if getattr(args, "size", 100) != 100:
+        deprecated_used.append("--size")
+    if getattr(args, "sync", False):
+        deprecated_used.append("--sync/-s")
+    if deprecated_used:
+        display.print(
+            f"[yellow]警告: {', '.join(deprecated_used)} 已弃用（上游 API 不再支持），将被忽略[/yellow]"
+        )
 
     try:
-        display.print("[dim]正在获取工作空间任务...[/dim]")
-        result = api.list_workspace_tasks(
-            workspace_id,
-            cookie,
-            page_num=args.page,
-            page_size=args.size,
-            project_filter=project_filter,
-        )
+        display.print("[dim]正在获取工作空间任务概览...[/dim]")
+        data = api.list_workspace_tasks(workspace_id, cookie)
 
-        tasks = result.get("task_dimensions", [])
-        total = result.get("total", 0)
+        task_groups = data.get("task_groups", [])
 
-        if not tasks:
-            if project_filter:
-                display.print(f"[dim]项目 '{project_filter}' 暂无运行中的任务[/dim]")
-            else:
-                display.print("工作空间内暂无运行中的任务")
+        if not task_groups:
+            display.print("工作空间内暂无任务数据")
             return 0
 
-        # 统计 GPU 使用
-        total_gpu = sum(t.get("gpu", {}).get("total", 0) for t in tasks)
-        avg_gpu_usage = (
-            sum(t.get("gpu", {}).get("usage_rate", 0) for t in tasks) / len(tasks) * 100
-            if tasks
-            else 0
+        # 任务类型中文映射
+        type_names = {
+            "distributed_training": "分布式训练",
+            "interactive_modeling": "交互式开发",
+            "hpc_job": "HPC 作业",
+            "inference_serving_customize": "推理服务(自定义)",
+            "inference_serving_dynamic": "推理服务(动态)",
+            "ray_job": "Ray 作业",
+            "sandbox": "沙盒",
+        }
+
+        # 状态颜色/图标
+        status_style = {
+            "RUNNING": ("[cyan]", "●"),
+            "PENDING": ("[yellow]", "◌"),
+            "CREATING": ("[yellow]", "◌"),
+            "DEPLOYING": ("[yellow]", "◌"),
+            "SUCCEEDED": ("[green]", "✓"),
+            "STOPPED": ("[dim]", "■"),
+            "FAILED": ("[red]", "✗"),
+        }
+
+        grand_total = sum(g.get("task_total", 0) for g in task_groups)
+        display.print(
+            f"\n[bold]工作空间任务概览[/bold] (最近 24h, 共 {grand_total} 个任务)\n"
         )
 
-        title = "工作空间任务概览"
-        if project_filter:
-            title += f" [{project_filter}]"
-        title += f" (显示 {len(tasks)}/{total} 个, {total_gpu} GPU, 平均利用率 {avg_gpu_usage:.1f}%)"
+        for group in task_groups:
+            task_type = group.get("task_type", "unknown")
+            task_total = group.get("task_total", 0)
+            entries = group.get("task_status_count_entries", [])
+            type_label = type_names.get(task_type, task_type)
 
-        display.print(f"\n[bold]{title}[/bold]\n")
+            if task_total == 0 and not entries:
+                continue
 
-        # 同步到本地任务列表
-        synced_count = 0
-        if args.sync:
-            store = get_store()
-            for task in tasks:
-                job_id = task.get("id", "")
-                if job_id and not store.get(job_id):
-                    # 创建简化的 JobRecord
-                    from .store import JobRecord
+            display.print(f"  [bold]{type_label}[/bold]  ({task_total} 个)")
 
-                    job = JobRecord(
-                        job_id=job_id,
-                        name=task.get("name", ""),
-                        status=task.get("status", "UNKNOWN").lower(),
-                        source="workspace_sync",
-                        workspace_id=workspace_id,
-                        project_name=task.get("project", {}).get("name", ""),
-                    )
-                    store.add(job)
-                    synced_count += 1
-            if synced_count > 0:
-                display.print_success(f"已同步 {synced_count} 个新任务到本地")
-
-        for idx, task in enumerate(tasks, 1):
-            name = task.get("name", "")
-            status = task.get("status", "UNKNOWN")
-            gpu_total = task.get("gpu", {}).get("total", 0)
-            gpu_usage = task.get("gpu", {}).get("usage_rate", 0) * 100
-            cpu_usage = task.get("cpu", {}).get("usage_rate", 0) * 100
-            mem_usage = task.get("memory", {}).get("usage_rate", 0) * 100
-            nodes_info = task.get("nodes_occupied", {})
-            nodes_count = nodes_info.get("count", 0)
-            nodes_list = nodes_info.get("nodes", [])
-            user_name = task.get("user", {}).get("name", "")
-            project_name = task.get("project", {}).get("name", "")
-            running_time = format_duration(task.get("running_time_ms", ""))
-            job_id = task.get("id", "")
-
-            # 状态颜色
-            if status == "RUNNING":
-                status_icon = "[cyan]●[/cyan]"
-            elif status == "QUEUING":
-                status_icon = "[yellow]◌[/yellow]"
+            if entries:
+                parts = []
+                for entry in sorted(
+                    entries, key=lambda e: e.get("count", 0), reverse=True
+                ):
+                    status = entry.get("status", "UNKNOWN")
+                    count = entry.get("count", 0)
+                    color, icon = status_style.get(status, ("[dim]", "?"))
+                    close_tag = color.replace("[", "[/")
+                    parts.append(f"{color}{icon} {status} {count}{close_tag}")
+                display.print(f"    {' | '.join(parts)}")
             else:
-                status_icon = "[dim]?[/dim]"
-
-            # GPU 使用率颜色
-            if gpu_usage >= 80:
-                gpu_color = "green"
-            elif gpu_usage >= 50:
-                gpu_color = "yellow"
-            else:
-                gpu_color = "red"
-
-            display.print(f"[bold][{idx:2d}][/bold] {status_icon} {name}")
-            display.print(
-                f"     [{gpu_color}]{gpu_total} GPU ({gpu_usage:.0f}%)[/{gpu_color}] | CPU {cpu_usage:.0f}% | MEM {mem_usage:.0f}% | {running_time} | {user_name}"
-            )
-            display.print(
-                f"     [dim]{project_name} | {nodes_count} 节点: {', '.join(nodes_list[:3])}{'...' if len(nodes_list) > 3 else ''}[/dim]"
-            )
-            display.print(f"     [dim]{job_id}[/dim]")
+                display.print("    [dim]无任务[/dim]")
             display.print("")
 
         return 0
@@ -6394,21 +6372,22 @@ def main():
 
     # workspace 命令
     workspace_parser = subparsers.add_parser(
-        "workspace", aliases=["ws"], help="查看工作空间内所有运行任务"
+        "workspace", aliases=["ws"], help="查看工作空间任务概览"
     )
     workspace_parser.add_argument("--workspace", "-w", help="工作空间 ID")
+    # 以下选项已弃用（上游 API 不再支持），保留以兼容现有脚本
     workspace_parser.add_argument(
-        "--project", "-p", default="扩散", help="按项目名称过滤（默认: 扩散）"
+        "--project", "-p", default=None, help=argparse.SUPPRESS
     )
     workspace_parser.add_argument(
-        "--all", "-a", action="store_true", help="显示所有项目（不过滤）"
+        "--all", "-a", action="store_true", help=argparse.SUPPRESS
     )
-    workspace_parser.add_argument("--page", type=int, default=1, help="页码")
+    workspace_parser.add_argument("--page", type=int, default=1, help=argparse.SUPPRESS)
     workspace_parser.add_argument(
-        "--size", type=int, default=100, help="每页数量（默认 100）"
+        "--size", type=int, default=100, help=argparse.SUPPRESS
     )
     workspace_parser.add_argument(
-        "--sync", "-s", action="store_true", help="同步到本地任务列表"
+        "--sync", "-s", action="store_true", help=argparse.SUPPRESS
     )
 
     # workspaces 命令 - 从历史任务提取资源配置
