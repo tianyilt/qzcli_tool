@@ -5,8 +5,9 @@
 ## 特性
 
 - **一键登录**: `qzcli login` 通过 CAS 认证自动获取 cookie，无需手动复制
-- **资源发现**: `qzcli res -u` 自动发现工作空间、计算组、规格等资源并本地缓存
-- **节点查询**: `qzcli avail` 查询各计算组空余节点，支持低优任务统计
+- **资源发现**: `qzcli res -u` 聚合历史任务、workspace 资源接口，自动发现工作空间、计算组、规格等资源并本地缓存
+- **节点查询**: `qzcli avail` 查询各计算组空余节点，支持低优任务统计和 cookie 失效自动刷新
+- **交互式提交**: `qzcli create -i` 提供层级式选择界面，缺少快照时按需预加载
 - **任务列表**: 美观的卡片式显示，完整 URL 方便点击
 - **状态监控**: watch 模式实时跟踪任务进度
 
@@ -28,7 +29,7 @@ qzcli login -u 用户名 -p 密码 && qzcli avail
 ## 安装依赖
 
 ```bash
-pip install rich requests mcp
+pip install rich requests prompt_toolkit mcp
 
 cd qzcli_tool
 pip install -e .
@@ -40,7 +41,7 @@ pip install -e .
 # 1. 登录（自动获取 cookie）
 qzcli login
 
-# 2. 更新资源缓存（首次使用必须执行，自动发现所有可访问的工作空间）
+# 2. 更新资源缓存（首次使用强烈建议执行，自动发现所有可访问的工作空间）
 qzcli res -u
 
 # 3. 查看空余节点
@@ -50,10 +51,22 @@ qzcli avail
 qzcli ls -c -r
 ```
 
+如果没有显式设置 `QZCLI_ENV_FILE`，`qzcli` 会默认尝试从 `~/.qzcli/.env` 读取 CAS 凭据；如果你的凭据文件在别处，先导出 `QZCLI_ENV_FILE=/path/to/.env`：
+
+```bash
+cat > ~/.qzcli/.env <<'EOF'
+QZCLI_USERNAME="your_username"
+QZCLI_PASSWORD='your_password'
+EOF
+
+qzcli login
+```
+
 > **重要**: 
-> - 首次使用必须执行 `qzcli res -u`，会自动发现并缓存所有你有权限访问的工作空间
+> - 首次使用建议执行 `qzcli res -u`，会发现并缓存所有你有权限访问的工作空间，非交互式 `create` / 按名称解析资源时会更稳定
 > - 如果遇到 `未找到名称为 'xxx' 的工作空间` 错误，说明缓存需要更新，请重新执行 `qzcli res -u`
 > - 新加入的工作空间/项目需要重新执行 `qzcli res -u` 来更新缓存
+> - `qzcli create -i` 在没有本地交互快照时会自动按需预加载，不要求你先手动执行 `qzcli avail`
 
 ## MCP Server
 
@@ -140,14 +153,14 @@ python -m pip install -e .
 qzcli login && qzcli avail
 
 # 输出示例：
-# CI-情景智能
+# 示例工作空间
 #   计算组                          空节点    总节点 GPU类型     
 #   -----------------------------------------------------
-#   OV3蒸馏训练组                       4      xxx 某gpu2      
-#   openveo训练组                     1     xxx 某gpu2      
+#   训练组-A                            4      xxx GPU-A      
+#   训练组-B                            1     xxx GPU-B      
 #   ...
-# 分布式
-#   某gpu2-2号机房                      1    xxx 某gpu2      
+# 训练任务
+#   计算组-C                            1    xxx GPU-C      
 ```
 
 ### 提交任务前
@@ -189,6 +202,9 @@ qzcli login
 # 带参数登录
 qzcli login -u 学工号 -p 密码
 
+# 脚本里从 stdin 读密码
+echo 'your_password' | qzcli login -u 学工号 --password-stdin
+
 # 查看当前 cookie
 qzcli cookie --show
 
@@ -225,6 +241,9 @@ qzcli avail --lp
 # 只查看 CI 工作空间
 qzcli avail -w CI
 
+# 只看某个计算组
+qzcli avail -w CI -g lcg-xxx
+
 # 显示空闲节点名称
 qzcli avail -w CI -v
 
@@ -234,6 +253,8 @@ qzcli avail -n 4
 # 导出为脚本可用格式
 qzcli avail -n 4 -e
 ```
+
+如果本地 cookie 已过期，但你已经通过 shell 环境变量、`QZCLI_ENV_FILE` 指向的 `.env`（默认 `~/.qzcli/.env`）或 `~/.qzcli/config.json` 保存了 CAS 凭据，`qzcli avail` 会自动刷新 cookie 后继续查询。
 
 ### 任务列表
 
@@ -263,13 +284,20 @@ qzcli ls --no-refresh       # 不刷新状态
 | `batch` | | 从 JSON 配置文件批量提交任务 |
 
 ```bash
+# 交互式提交：仅补齐未显式传入的参数
+qzcli create -i
+
+# 只针对某个 workspace 按需预加载交互快照
+qzcli create -i -w "我的工作空间"
+
 # 使用名称（从 qzcli res 缓存解析）
 qzcli create \
   --name "my-training-job" \
   --command "bash /path/to/script.sh" \
-  --workspace "分布式训练" \
-  --project "扩散" \
-  --compute-group "3号机房-2" \
+  --workspace "我的工作空间" \
+  --project "我的项目" \
+  --compute-group "我的计算组" \
+  --image registry.example.com/team/train-image:latest \
   --instances 4 \
   --priority 10
 
@@ -277,30 +305,33 @@ qzcli create \
 qzcli create \
   --name "my-training-job" \
   --command "bash /path/to/script.sh" \
-  --workspace ws-9dcc0e1f-80a4-4af2-bc2f-0e352e7b17e6 \
-  --project project-7e0957fb-eaa7-4ded-8dca-dd508b2ae01d \
-  --compute-group lcg-a91ad10b-415d-4abd-8170-828a2feae5d2 \
-  --spec b618f5cb-c119-4422-937e-f39131853076 \
+  --workspace ws-<workspace_id> \
+  --project project-<project_id> \
+  --compute-group lcg-<compute_group_id> \
+  --spec <spec_id> \
+  --image registry.example.com/team/train-image:latest \
   --instances 4
 
 # 预览 payload 不提交
-qzcli create --name test --command "echo hi" --workspace "分布式训练" --dry-run
+qzcli create --name test --command "echo hi" --workspace "我的工作空间" --image registry.example.com/team/train-image:latest --dry-run
 
 # JSON 输出（供脚本集成）
-qzcli create --name test --command "echo hi" --workspace "分布式训练" --json
+qzcli create --name test --command "echo hi" --workspace "我的工作空间" --image registry.example.com/team/train-image:latest --json
 ```
 
 **参数说明:**
 
 | 参数 | 短选项 | 默认值 | 说明 |
 |------|--------|--------|------|
+| `--interactive` | `-i` | | 进入交互式任务提交模式，仅提示缺失参数 |
 | `--name` | `-n` | (必填) | 任务名称 |
 | `--command` | `-c` | (必填) | 执行命令 |
 | `--workspace` | `-w` | | 工作空间 ID 或名称 |
 | `--project` | `-p` | (自动选择) | 项目 ID 或名称 |
 | `--compute-group` | `-g` | (自动选择) | 计算组 ID 或名称 |
 | `--spec` | `-s` | (自动选择) | 资源规格 ID |
-| `--image` | `-i` | `dhyu-wan-torch29:0.4` | Docker 镜像 |
+| `--image` | `-m` | `docker.sii.shaipower.online/inspire-studio/dhyu-wan-torch29:0.4` | Docker 镜像 |
+| `--image-type` | | `SOURCE_PRIVATE` | 镜像类型 |
 | `--instances` | | 1 | 实例数量 |
 | `--shm` | | 1200 | 共享内存 GiB |
 | `--priority` | | 10 | 优先级 1-10 |
@@ -309,7 +340,9 @@ qzcli create --name test --command "echo hi" --workspace "分布式训练" --jso
 | `--dry-run` | | | 只预览不提交 |
 | `--json` | | | JSON 输出 |
 
-> **提示**: `--project`、`--compute-group`、`--spec` 省略时会自动从 `qzcli res` 缓存中选取第一个。首次使用前请先运行 `qzcli res -u` 发现资源。
+兼容性说明：历史脚本中的 `qzcli create -i <image>` 仍可用，CLI 会自动按旧语义解析为 `--image`。
+
+> **提示**: `qzcli create -i` 在 TTY 终端下会先进入单实例全屏的层级式选择菜单，按 `workspace -> project -> compute_group -> spec` 的顺序逐级选择，`Enter/→` 进入下一层，`←` 返回上一层重新选择，界面会直接覆盖刷新而不是连续堆叠多个表格。`compute_group` 选项里会展示 `GPU类型 / 占用口径 / 规格状态 / 空节点 / 空GPU / GPU利用率`，其中 `共享池` 表示该数值来自底层物理 compute group 的共享资源池实时占用，`规格状态` 会标识该计算组的 spec 列表是否来自实时接口、缓存或异常分支。若某个计算组的实时 spec 查询失败，界面不会退出 TUI，而是在同一屏内给出告警，并支持 `m` 手动输入 spec ID、`r` 重试拉取、`←` 返回上一级更换计算组。完成资源选择后，再按原来的方式输入任务名称、执行命令、Docker 镜像等参数。若当前环境不是 TTY，或缺少 `prompt_toolkit`，CLI 会自动回退到原来的文本交互模式。若本地 cookie 已失效且已配置 CAS 账号密码，CLI 会自动刷新 cookie 后重试；若本地没有可复用的交互快照，`create -i` 会按需预加载当前可访问 workspace 的资源快照，并将结果保存到 `~/.qzcli/create_interactive_snapshot.json` 供后续复用。已经显式传入的参数会直接跳过。非交互模式下，`--project`、`--compute-group`、`--spec` 省略时仍会自动从 `qzcli res` 缓存中选取第一个。首次使用前建议先运行 `qzcli login && qzcli res -u`。
 
 ### 提交 HPC/CPU 任务
 
@@ -318,9 +351,9 @@ qzcli create --name test --command "echo hi" --workspace "分布式训练" --jso
 ```bash
 qzcli hpc \
   --name "bulk-NH3-check-outcar" \
-  --workspace ws-6e6ba362-e98e-45b2-9c5a-311998e93d65 \
-  --compute-group lcg-cb2de75c-40ac-4de1-bbb3-11e62b32f424 \
-  --predef-quota-id d4ae9e69-cec3-4dce-85d6-364ac0ec12b3 \
+  --workspace ws-<workspace_id> \
+  --compute-group lcg-<compute_group_id> \
+  --predef-quota-id <predef_quota_id> \
   --cpu 55 \
   --mem-gi 300 \
   --instances 30 \
@@ -369,10 +402,10 @@ qzcli batch batch_eval.json --continue-on-error
 ```json
 {
   "defaults": {
-    "workspace": "ws-9dcc0e1f-80a4-4af2-bc2f-0e352e7b17e6",
-    "project": "project-7e0957fb-eaa7-4ded-8dca-dd508b2ae01d",
-    "compute_group": "lcg-a91ad10b-415d-4abd-8170-828a2feae5d2",
-    "spec": "b618f5cb-c119-4422-937e-f39131853076",
+    "workspace": "ws-<workspace_id>",
+    "project": "project-<project_id>",
+    "compute_group": "lcg-<compute_group_id>",
+    "spec": "<spec_id>",
     "image": "docker.sii.shaipower.online/inspire-studio/dhyu-wan-torch29:0.4",
     "instances": 4,
     "shm": 1200,
@@ -429,7 +462,7 @@ qzcli ws
 qzcli ws -a
 
 # 过滤指定项目
-qzcli ws -p "长视频"
+qzcli ws -p "我的项目"
 ```
 
 ## 输出示例
@@ -471,6 +504,7 @@ CI-情景智能
 | `jobs.json` | 本地任务历史 |
 | `.cookie` | Cookie（login 命令自动管理） |
 | `resources.json` | 资源缓存（工作空间、计算组等） |
+| `create_interactive_snapshot.json` | `create -i` 的交互资源快照 |
 
 ## 环境变量
 
@@ -478,12 +512,20 @@ CI-情景智能
 export QZCLI_USERNAME="your_username"
 export QZCLI_PASSWORD="your_password"
 export QZCLI_API_URL="https://qz.sii.edu.cn"
+export QZCLI_ENV_FILE="/path/to/.env"   # 可选，自定义凭据文件位置
+```
+
+`qzcli login` / 自动刷新 cookie 会按下面的优先级读取凭据：
+
+```bash
+CLI 参数 > --password-stdin > shell 环境变量 > QZCLI_ENV_FILE 指向的 .env（默认 ~/.qzcli/.env） > ~/.qzcli/config.json > 交互输入
 ```
 
 ## 使用建议
 
 - **日常使用**: `qzcli login && qzcli avail` 一键登录并查看资源
 - **提交前**: `qzcli avail -n 4 -e` 找合适的计算组并导出配置
+- **交互式提交 GPU 任务**: `qzcli create -i`，如只关心单个 workspace 可加 `-w`
 - **提交 GPU 任务**: `qzcli create -n "job" -c "bash run.sh" -w "分布式训练" --instances 4`
 - **提交 HPC 任务**: `qzcli login && qzcli hpc --name "job" --workspace ws-xxx --compute-group lcg-xxx --predef-quota-id uuid --cpu 55 --mem-gi 300 --instances 30 --image img --entrypoint "bash run.sh"`
 - **批量提交**: `qzcli batch config.json` 从配置文件批量提交
