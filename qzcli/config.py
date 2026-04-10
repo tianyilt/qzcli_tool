@@ -13,7 +13,17 @@ DEFAULT_CONFIG = {
     "username": "",
     "password": "",
     "token_cache_enabled": True,
+    "proxy": "",
 }
+
+
+def get_proxy() -> str:
+    """获取 SOCKS5 代理地址，优先从配置文件读取，回退到环境变量。"""
+    cfg = load_config()
+    proxy = cfg.get("proxy", "")
+    if proxy:
+        return proxy
+    return os.environ.get("ALL_PROXY") or os.environ.get("HTTPS_PROXY", "")
 
 # 配置目录
 CONFIG_DIR = Path.home() / ".qzcli"

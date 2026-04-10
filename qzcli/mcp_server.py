@@ -15,6 +15,7 @@ from .config import (
     find_resource_by_name,
     find_workspace_by_name,
     get_cookie,
+    get_credentials,
     get_workspace_resources,
     list_cached_workspaces,
     save_cookie,
@@ -411,8 +412,14 @@ def _availability_result(
     }
 
 
-@server.tool(description="通过 CAS 登录启智平台并保存 cookie。")
-def qz_auth_login(username: str, password: str, workspace_id: str = "") -> dict[str, Any]:
+@server.tool(description="通过 CAS 登录启智平台并保存 cookie。未传参数时自动读取环境变量 QZCLI_USERNAME/QZCLI_PASSWORD 或 ~/.qzcli/config.json。")
+def qz_auth_login(username: str = "", password: str = "", workspace_id: str = "") -> dict[str, Any]:
+    if not username or not password:
+        cfg_user, cfg_pwd = get_credentials()
+        username = username or cfg_user
+        password = password or cfg_pwd
+    if not username or not password:
+        raise QzAPIError("未配置认证信息，请传入 username/password 或设置 QZCLI_USERNAME/QZCLI_PASSWORD 环境变量")
     api = get_api()
     cookie = api.login_with_cas(username, password)
     save_cookie(cookie, workspace_id)
@@ -1114,7 +1121,12 @@ def qz_create_job(
         ],
     }
 
-    result = api.create_job(payload)
+    # 优先使用 cookie 认证（内部 API），回退到 token 认证（openapi）
+    cookie_data = get_cookie()
+    if cookie_data and cookie_data.get("cookie"):
+        result = api.create_job_with_cookie(cookie_data["cookie"], payload)
+    else:
+        result = api.create_job(payload)
     job_id = result.get("job_id", "")
     resp_ws_id = result.get("workspace_id", workspace_id)
 

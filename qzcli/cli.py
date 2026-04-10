@@ -6119,7 +6119,7 @@ def cmd_login(args):
     api = get_api()
     stored_username, stored_password = get_credentials()
 
-    # 获取用户名
+    # fallback 顺序: CLI 参数 → 环境变量 QZCLI_USERNAME/QZCLI_PASSWORD → config.json → 交互式输入
     username = (args.username or stored_username or "").strip()
     if not username:
         try:
