@@ -2,10 +2,44 @@
 启智平台 API 客户端
 """
 
+import json as _json
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Any, Dict, List, Optional
 
 import requests
+
+
+def _get_pool_manager():
+    """Return a urllib3 PoolManager, using SOCKSProxyManager when proxy is configured."""
+    from .config import get_proxy
+    proxy = get_proxy()
+    if proxy and "socks" in proxy:
+        from urllib3.contrib.socks import SOCKSProxyManager
+        return SOCKSProxyManager(proxy.rstrip("/") + "/")
+    import urllib3
+    return urllib3.PoolManager()
+
+
+class _CurlResponse:
+    """Minimal response object mimicking requests.Response."""
+    def __init__(self, status_code: int, text: str, url: str = ""):
+        self.status_code = status_code
+        self.text = text
+        self.url = url
+    def json(self):
+        return _json.loads(self.text)
+
+
+def _curl_post(url: str, *, json: Any = None, headers: dict | None = None,
+               timeout: int = 60, **_kw) -> _CurlResponse:
+    """Drop-in replacement for requests.post using urllib3 SOCKSProxyManager."""
+    pm = _get_pool_manager()
+    body = _json.dumps(json).encode() if json is not None else None
+    hdrs = dict(headers) if headers else {}
+    if json is not None and "Content-Type" not in hdrs and "content-type" not in hdrs:
+        hdrs["Content-Type"] = "application/json"
+    resp = pm.request("POST", url, body=body, headers=hdrs, timeout=float(timeout), redirect=False)
+    return _CurlResponse(status_code=resp.status, text=resp.data.decode("utf-8", errors="replace"), url=url)
 
 from .config import (
     clear_token_cache,
@@ -58,7 +92,7 @@ class QzAPI:
             )
 
         url = f"{self.base_url}/auth/token"
-        response = requests.post(
+        response = _curl_post(
             url,
             json={"username": self._username, "password": self._password},
             headers={"Content-Type": "application/json"},
@@ -97,7 +131,7 @@ class QzAPI:
         token = self._get_token()
         url = f"{self.base_url}{endpoint}"
 
-        response = requests.post(
+        response = _curl_post(
             url,
             json=data,
             headers={
@@ -164,6 +198,28 @@ class QzAPI:
     def create_job(self, config: Dict[str, Any]) -> Dict[str, Any]:
         """创建任务"""
         result = self._request("/openapi/v1/train_job/create", config)
+        return result.get("data", result)
+
+    def create_job_with_cookie(self, cookie: str, config: Dict[str, Any]) -> Dict[str, Any]:
+        """使用 cookie 创建任务（内部 API）"""
+        url = f"{self.base_url}/api/v1/train_job/create"
+        workspace_id = config.get("workspace_id", "")
+        headers = {
+            "accept": "application/json, text/plain, */*",
+            "content-type": "application/json",
+            "cookie": cookie,
+            "origin": "https://qz.sii.edu.cn",
+            "referer": f"https://qz.sii.edu.cn/jobs/distributedTraining?spaceId={workspace_id}",
+            "user-agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/144.0.0.0 Safari/537.36",
+        }
+        response = _curl_post(url, json=config, headers=headers, timeout=60)
+        if response.status_code == 401:
+            raise QzAPIError("Cookie 已过期或无效，请重新获取", 401)
+        if response.status_code != 200:
+            raise QzAPIError(f"请求失败: HTTP {response.status_code}", response.status_code)
+        result = response.json()
+        if result.get("code") != 0:
+            raise QzAPIError(f"API 请求失败: {result.get('message', '未知错误')}", result.get("code"))
         return result.get("data", result)
 
     def create_hpc_job(
@@ -236,7 +292,7 @@ class QzAPI:
             "referer": f"https://qz.sii.edu.cn/jobs/hpc?spaceId={workspace_id}",
             "user-agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36",
         }
-        response = requests.post(url, json=payload, headers=headers, timeout=60)
+        response = _curl_post(url, json=payload, headers=headers, timeout=60)
         if response.status_code == 401:
             raise QzAPIError("Cookie 已过期或无效，请重新获取", 401)
         if response.status_code != 200:
@@ -300,7 +356,7 @@ class QzAPI:
             "sec-fetch-site": "same-origin",
             "user-agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/144.0.0.0 Safari/537.36",
         }
-        response = requests.post(url, json=payload, headers=headers, timeout=60)
+        response = _curl_post(url, json=payload, headers=headers, timeout=60)
         if response.status_code == 401:
             raise QzAPIError("Cookie 已过期或无效，请重新获取", 401)
         if response.status_code != 200:
@@ -367,7 +423,7 @@ class QzAPI:
             "user-agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/144.0.0.0 Safari/537.36",
         }
 
-        response = requests.post(
+        response = _curl_post(
             url,
             json=payload,
             headers=headers,
@@ -446,7 +502,7 @@ class QzAPI:
             "user-agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/144.0.0.0 Safari/537.36",
         }
 
-        response = requests.post(
+        response = _curl_post(
             url,
             json=payload,
             headers=headers,
@@ -527,7 +583,7 @@ class QzAPI:
             "user-agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/144.0.0.0 Safari/537.36",
         }
 
-        response = requests.post(url, json=payload, headers=headers, timeout=60)
+        response = _curl_post(url, json=payload, headers=headers, timeout=60)
 
         if response.status_code == 401:
             raise QzAPIError("Cookie 已过期或无效，请重新获取", 401)
@@ -707,7 +763,7 @@ class QzAPI:
             "user-agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/144.0.0.0 Safari/537.36",
         }
 
-        response = requests.post(
+        response = _curl_post(
             url,
             json=payload,
             headers=headers,
@@ -785,7 +841,7 @@ class QzAPI:
             "user-agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/144.0.0.0 Safari/537.36",
         }
 
-        response = requests.post(
+        response = _curl_post(
             url,
             json=payload,
             headers=headers,
@@ -845,7 +901,7 @@ class QzAPI:
             "user-agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/144.0.0.0 Safari/537.36",
         }
 
-        response = requests.post(
+        response = _curl_post(
             url,
             json=payload,
             headers=headers,
@@ -907,7 +963,7 @@ class QzAPI:
             "user-agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/144.0.0.0 Safari/537.36",
         }
 
-        response = requests.post(
+        response = _curl_post(
             url,
             json=payload,
             headers=headers,
@@ -977,6 +1033,15 @@ class QzAPI:
         from urllib.parse import urlparse
 
         session = requests.Session()
+
+        # 配置 SOCKS5 代理（WSL 等环境需要）
+        # trust_env=False 避免环境变量 HTTP_PROXY（http://）覆盖 SOCKS5 代理
+        from .config import get_proxy
+        proxy = get_proxy()
+        if proxy:
+            session.trust_env = False
+            proxy_url = proxy.replace("socks5h://", "socks5://")
+            session.proxies = {"http": proxy_url, "https": proxy_url}
 
         # 设置浏览器 User-Agent
         headers = {
