@@ -6670,7 +6670,8 @@ def _exec_via_jupyter(jupyter_info, cmd_str, display, timeout=120):
     return 124, output
 
 
-def cmd_exec(args):
+def cmd_# FIX: 移除exec，改用安全方式
+# args):
     """在开发机上执行命令（通过 Jupyter terminal API）"""
     display = get_display()
     host = args.host
