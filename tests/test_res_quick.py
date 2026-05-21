@@ -112,5 +112,25 @@ class QuickModeSkipsJobsWalk(unittest.TestCase):
         )
 
 
+class CliFlagWiring(unittest.TestCase):
+    """Smoke-check the CLI surface for the default-quick flip.
+
+    We don't extract a `build_parser()` factory in this PR, so we go
+    through the installed `qzcli` entry point via subprocess instead
+    of poking argparse internals.
+    """
+
+    def test_help_text_advertises_full_flag(self):
+        import subprocess
+
+        result = subprocess.run(
+            ["qzcli", "res", "--help"], capture_output=True, text=True, timeout=10
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("--full", result.stdout)
+        self.assertIn("--quick", result.stdout, "keep --quick for backward compat")
+        self.assertIn("已是默认行为", result.stdout)
+
+
 if __name__ == "__main__":
     unittest.main()
