@@ -14,7 +14,7 @@
 ## 特性
 
 - **一键登录**: `qzcli login` 通过 CAS 认证自动获取 cookie，无需手动复制
-- **资源发现**: `qzcli res -u` 聚合历史任务、workspace 资源接口，自动发现工作空间、计算组、规格等资源并本地缓存
+- **资源发现**: `qzcli res -u` 调 `cluster_info` / `task_dimension` 聚合工作空间、计算组、项目并本地缓存（默认 quick 模式秒级返回；需要更新 specs 时加 `--full` 走全量历史任务扫描）
 - **节点查询**: `qzcli avail` 查询各计算组空余节点，支持低优任务统计和 cookie 失效自动刷新
 - **交互式提交**: `qzcli create -i` 提供层级式选择界面，缺少快照时按需预加载
 - **任务列表**: 美观的卡片式显示，完整 URL 方便点击
@@ -51,6 +51,7 @@ pip install -e .
 qzcli login
 
 # 2. 更新资源缓存（首次使用强烈建议执行，自动发现所有可访问的工作空间）
+#    默认 quick 模式秒级返回；如需更新 specs（资源规格），加 --full 走全量历史任务扫描
 qzcli res -u
 
 # 3. 查看空余节点
@@ -232,10 +233,13 @@ qzcli cookie --clear
 # 列出已缓存的工作空间
 qzcli res --list
 
-# 更新所有工作空间的资源缓存
+# 更新所有工作空间的资源缓存（默认 quick：跳过历史任务，秒级；不刷新 specs）
 qzcli res -u
 
-# 更新指定工作空间
+# 完整刷新（包含 specs，扫描全部历史任务；大型共享空间可能耗时数十分钟）
+qzcli res -u --full
+
+# 更新指定工作空间（同样默认 quick，加 --full 走完整扫描）
 qzcli res -w 分布式 -u
 
 # 给工作空间设置别名

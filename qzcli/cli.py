@@ -984,21 +984,23 @@ def cmd_workspaces(args):
                         display.print(f"[dim]正在更新 {ws_name or ws_id}...[/dim]")
 
                     try:
+                        # 默认走 quick；显式 --full 才扫历史任务反推 specs
+                        use_full = bool(getattr(args, "full", False))
                         resources, jobs_count = _collect_workspace_resources_from_live_apis(
-                            api, ws_id, cookie, quick=args.quick
+                            api, ws_id, cookie, quick=not use_full
                         )
                         # 保存到本地缓存
                         save_resources(ws_id, resources, ws_name)
 
                         projects_count = len(resources.get("projects", []))
                         cg_count = len(resources.get("compute_groups", []))
-                        if args.quick:
+                        if use_full:
                             display.print(
-                                f"  ✓ {ws_name or ws_id}: {projects_count} 项目, {cg_count} 计算组 (quick: 跳过历史任务/specs)"
+                                f"  ✓ {ws_name or ws_id}: {projects_count} 项目, {cg_count} 计算组, {jobs_count} 历史任务"
                             )
                         else:
                             display.print(
-                                f"  ✓ {ws_name or ws_id}: {projects_count} 项目, {cg_count} 计算组, {jobs_count} 历史任务"
+                                f"  ✓ {ws_name or ws_id}: {projects_count} 项目, {cg_count} 计算组 (默认 quick: 跳过历史任务/specs，--full 强制扫描)"
                             )
                     except Exception as e:
                         display.print_warning(f"  ✗ {ws_name or ws_id}: {e}")
@@ -1076,13 +1078,14 @@ def cmd_workspaces(args):
         cookie = cookie_data["cookie"]
 
         try:
-            if getattr(args, "quick", False):
-                display.print("[dim]quick 模式：跳过历史任务，只走 cluster_info + task_dimension...[/dim]")
+            use_full = bool(getattr(args, "full", False))
+            if use_full:
+                display.print("[dim]--full 模式：扫描全部历史任务以反推 specs...[/dim]")
             else:
-                display.print("[dim]正在从历史任务中提取资源配置...[/dim]")
+                display.print("[dim]quick 默认模式：跳过历史任务，只走 cluster_info + task_dimension（--full 强制完整扫描）...[/dim]")
 
             resources, jobs_count = _collect_workspace_resources_from_live_apis(
-                api, workspace_id, cookie, quick=getattr(args, "quick", False)
+                api, workspace_id, cookie, quick=not use_full
             )
 
             # 保存到本地缓存
@@ -7051,11 +7054,17 @@ def main():
         "--list", "-l", action="store_true", help="列出所有已缓存的工作空间"
     )
     workspaces_parser.add_argument(
+        "--full",
+        "-F",
+        action="store_true",
+        help="完整刷新：扫描全部历史任务以反推 specs。在分布式训练空间等大型共享空间"
+        "上可能耗时数十分钟。仅在需要更新 specs 缓存时使用。",
+    )
+    workspaces_parser.add_argument(
         "--quick",
         "-q",
         action="store_true",
-        help="快速刷新：跳过历史任务翻页，只走 cluster_info + task_dimension。"
-        " 不发现 specs，但 compute_groups/projects 完整，秒级返回。",
+        help="（已是默认行为，保留 flag 仅做向后兼容；显式传 --full 走完整扫描。）",
     )
     workspaces_parser.add_argument("--name", help="设置工作空间名称（别名）")
 
