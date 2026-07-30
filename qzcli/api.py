@@ -231,51 +231,32 @@ _V2_FALLBACK_WARNED: set = set()
 # 刻意**不含** 401 —— 那由 `with_auth_retry` 重登处理。
 _V2_FALLBACK_STATUS = frozenset({404, 405, 501, 502, 503, 504})
 
-# 权限类业务错误：v2 通了、认证也过了，但这个账号/工作空间在 v2 侧没被授权。
-# 这类**必须回落 v1**，否则就是纯退化 —— 实测「拟人多模态大任务」工作空间在 v2 上
-# basic/node/jobs 三个接口全是 AccessForbidden，而 v1 完全正常；不回落的话该空间
-# 的 `qzcli list / avail / res` 会从"能用"变成"直接报错"。
-# 平台把 v2 权限补齐之前，这就是常态，不是偶发。
-_V2_FALLBACK_API_CODES = frozenset(
-    {"AccessForbidden", "Forbidden", "PermissionDenied", "NoPermission", "Unauthorized"}
-)
-
 
 def _v2_then_v1(name: str, v2_call, v1_call, *, logger=None):
-    """先打 v2，只在"v2 走不通"时回落 v1。
+    """先打 v2，只在"v2 这条路由不通"时回落 v1。
 
-    迁移期的核心保护：平台正在把 /api/v1 逐步下线（``/openapi/v1/specs/list``
-    已经 404），但也有 v2 反而更严的情况（部分工作空间 v2 权限还没开）。
-    两边都可能先坏，所以两条腿都留着。
+    迁移期的保护：平台正在把 /api/v1 逐步下线（``/openapi/v1/specs/list``
+    已经 404），所以两条腿都留着。
 
-    **回落的两类**：
+    **只有** ``_V2_FALLBACK_STATUS`` 里的状态码、或响应非 JSON（APISIX 把请求
+    302 到了 Keycloak）才回落。**一切业务错误都直接抛**，包括
+    ``AccessForbidden`` 和 ``InvalidParameter``。
 
-    1. 路由不通 —— ``_V2_FALLBACK_STATUS`` 里的状态码，或响应非 JSON
-       （APISIX 把请求 302 到了 Keycloak）
-    2. 权限没开 —— ``_V2_FALLBACK_API_CODES`` 里的 Error Code
-
-    **不回落的**：其他一切业务错误，尤其是 ``InvalidParameter`` ——
-    那是**我们自己请求写错了**，回落 v1 会让它一直不被发现。
-    这条线别顺手放开：权限问题回落是"平台还没准备好"，参数问题回落是"把 bug 藏起来"，
-    两件事性质完全不同。
+    权限类**刻意不回落**，别再加回去：唯一见过的 ``AccessForbidden`` 实例是
+    ``该空间已被禁用`` —— 那是 **v2 判断正确**，反倒是 v1 会给非成员返回一个
+    已禁用空间的陈旧集群结构。回落 v1 等于用错误答案盖掉正确答案。禁用空间的
+    正解是在 ``list_workspaces`` 源头按 ``usage_status`` 滤掉（已实现），
+    而不是在这里绕过。同理 ``InvalidParameter`` 是我们自己请求写错了，
+    回落只会让它一直不被发现。
     """
     try:
         return v2_call()
     except QzAPIError as exc:
-        is_perm = exc.api_code in _V2_FALLBACK_API_CODES
-        is_route = exc.code in _V2_FALLBACK_STATUS or "非 JSON" in str(exc)
-        if not (is_perm or is_route):
+        if not (exc.code in _V2_FALLBACK_STATUS or "非 JSON" in str(exc)):
             raise
         if name not in _V2_FALLBACK_WARNED:
             _V2_FALLBACK_WARNED.add(name)
-            if is_perm:
-                msg = (
-                    f"[qzcli] v2 接口 {name} 权限未开通（{exc.api_code}），本次已回落 v1。"
-                    f" 功能不受影响，但这是平台侧待授权项 —— v1 下线后该接口会不可用，"
-                    f"请找平台开通对应工作空间的 v2 权限。"
-                )
-            else:
-                msg = f"[qzcli] v2 接口 {name} 不可用（{exc}），本次回落 v1。"
+            msg = f"[qzcli] v2 接口 {name} 不可用（{exc}），本次回落 v1。"
             if logger:
                 logger(msg)
             else:
@@ -1892,17 +1873,38 @@ class QzAPI:
         items = data.get("items", [])
 
         # 从项目的 space_list 中提取工作空间（去重）
+        #
+        # 注意 project/list 会把**你不是成员的项目**也返回回来，其 space_list 里
+        # 可能挂着已被平台禁用的工作空间。这类空间在 v2 上一律
+        # `AccessForbidden: 该空间已被禁用`（v2 是对的），而 v1 反而会给非成员
+        # 返回陈旧的集群结构。
+        #
+        # `usage_status != 0` 就是禁用标记 —— 实测账号可见的 17 个空间里只有
+        # 一个是 1，正好是 v2 拒绝的那个。在源头滤掉，比在调用处到处 try/except
+        # 或者靠回落 v1 去"绕过"要干净得多。
         workspaces = {}
+        skipped_disabled = []
         for proj in items:
             space_list = proj.get("space_list", [])
             for space in space_list:
                 ws_id = space.get("id", "")
                 ws_name = space.get("name", "")
-                if ws_id and ws_id not in workspaces:
-                    workspaces[ws_id] = {
-                        "id": ws_id,
-                        "name": ws_name,
-                    }
+                if not ws_id or ws_id in workspaces:
+                    continue
+                if space.get("usage_status", 0):
+                    skipped_disabled.append(ws_name or ws_id)
+                    continue
+                workspaces[ws_id] = {
+                    "id": ws_id,
+                    "name": ws_name,
+                }
+
+        if skipped_disabled:
+            print(
+                f"[qzcli] 已跳过 {len(skipped_disabled)} 个被禁用的工作空间: "
+                f"{', '.join(skipped_disabled)}",
+                file=sys.stderr,
+            )
 
         return list(workspaces.values())
 

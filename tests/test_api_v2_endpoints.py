@@ -302,71 +302,38 @@ class V2FallbackToV1Tests(unittest.TestCase):
         self.assertTrue(calls[0].endswith("/api/v2/train"))
         self.assertTrue(calls[1].endswith("/api/v1/train_job/list"))
 
-    def _forbidden_then_v1(self, api_code="AccessForbidden"):
-        """v2 回权限错误、v1 正常 —— 真机上「拟人多模态大任务」空间就是这样。"""
+    def test_access_forbidden_does_not_fall_back(self):
+        """AccessForbidden **刻意不回落**，别再加回去。
+
+        唯一见过的实例是 `该空间已被禁用` —— v2 判断是对的，反倒是 v1 会给非成员
+        返回一个已禁用空间的陈旧集群结构。回落 v1 等于用错误答案盖掉正确答案。
+        禁用空间的正解是在 list_workspaces 源头按 usage_status 滤掉。
+        """
         calls = []
 
         def fake_post(url, **_):
             calls.append(url)
-            if "/api/v2/" in url:
-                return _Resp(
-                    200,
-                    {
-                        "ResponseMetadata": {
-                            "Error": {"Code": api_code, "Message": "Access denied"}
-                        }
-                    },
-                )
             return _Resp(
                 200,
                 {
-                    "code": 0,
-                    "data": {
-                        "clusters": [],
-                        "compute_groups": [{"id": "cg-1"}],
-                        "resource_types": [],
-                    },
+                    "ResponseMetadata": {
+                        "Error": {
+                            "Code": "AccessForbidden",
+                            "Message": "该空间已被禁用",
+                        }
+                    }
                 },
             )
 
-        return calls, fake_post
+        with mock.patch.object(api, "_curl_post", side_effect=fake_post):
+            with self.assertRaises(QzAPIError) as cm:
+                _client().get_cluster_basic_info("ws-1", "ck")
 
-    def test_permission_error_falls_back_to_v1(self):
-        """权限没开必须回落 —— 否则该工作空间从「能用」直接变「报错」，
-        是纯退化。实测有工作空间 v2 全 AccessForbidden 而 v1 完全正常。"""
-        calls, fake_post = self._forbidden_then_v1()
-        msgs = []
-
-        with mock.patch.object(
-            api, "_curl_post", side_effect=fake_post
-        ), mock.patch.object(api, "print", side_effect=lambda m, **_: msgs.append(m)):
-            out = _client().get_cluster_basic_info("ws-1", "ck")
-
-        self.assertEqual(out["compute_groups"], [{"id": "cg-1"}])
-        self.assertIn("/api/v2/", calls[0])
-        self.assertIn("/api/v1/", calls[1])
-
-    def test_permission_fallback_warns_loudly_once(self):
-        """回落了要说出来，且说明是平台侧待授权 —— 但每个端点只提示一次，
-        `avail` 会对十几个工作空间循环调同一端点。"""
-        msgs = []
-
-        def forbidden():
-            raise QzAPIError(
-                "API 请求失败: AccessForbidden: denied", api_code="AccessForbidden"
-            )
-
-        for _ in range(3):
-            out = api._v2_then_v1("t", forbidden, lambda: {"ok": 1}, logger=msgs.append)
-            self.assertEqual(out, {"ok": 1})  # 每次都回落成功，不是只有第一次
-
-        self.assertEqual(len(msgs), 1, f"提示重复了: {msgs}")
-        self.assertIn("权限未开通", msgs[0])
-        self.assertIn("平台侧待授权", msgs[0])
+        self.assertEqual(len(calls), 1)  # 没有第二次（v1）调用
+        self.assertIn("该空间已被禁用", str(cm.exception))
 
     def test_invalid_parameter_still_raises(self):
-        """参数错是**我们自己写错了**，回落 v1 会让它永远不被发现。
-        这条线不能和权限回落混为一谈。"""
+        """参数错是**我们自己写错了**，回落 v1 会让它永远不被发现。"""
         calls = []
 
         def fake_post(url, **_):
@@ -422,3 +389,46 @@ class V2FallbackToV1Tests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ListWorkspacesDisabledFilterTests(unittest.TestCase):
+    """已禁用的工作空间不该出现在列表里。
+
+    `project/list` 会把**你不是成员的项目**也返回，其 space_list 里可能挂着已被
+    平台禁用的空间。之前这类空间会混进 `list_workspaces`，然后每个 v2 调用都回
+    `AccessForbidden: 该空间已被禁用` —— 真机上账号可见的 17 个空间里正好有 1 个
+    是这样（usage_status=1，其余 16 个都是 0）。
+    """
+
+    def _list(self, spaces):
+        payload = {
+            "code": 0,
+            "data": {"items": [{"name": "p", "space_list": spaces}], "total": 1},
+        }
+        msgs = []
+        with mock.patch.object(
+            api, "_curl_post", return_value=_Resp(200, payload)
+        ), mock.patch.object(api, "print", side_effect=lambda m, **_: msgs.append(m)):
+            return _client().list_workspaces("ck"), msgs
+
+    def test_disabled_workspace_is_filtered_out(self):
+        out, _ = self._list(
+            [
+                {"id": "ws-ok", "name": "正常空间", "usage_status": 0},
+                {"id": "ws-off", "name": "已禁用空间", "usage_status": 1},
+            ]
+        )
+        self.assertEqual([w["id"] for w in out], ["ws-ok"])
+
+    def test_missing_usage_status_is_kept(self):
+        """字段缺失时按可用处理，别把正常空间误杀。"""
+        out, _ = self._list([{"id": "ws-a", "name": "无该字段"}])
+        self.assertEqual([w["id"] for w in out], ["ws-a"])
+
+    def test_skipped_workspaces_are_reported(self):
+        """静默丢掉会让人以为空间凭空消失，要说出来。"""
+        _, msgs = self._list(
+            [{"id": "ws-off", "name": "已禁用空间", "usage_status": 1}]
+        )
+        self.assertTrue(msgs, "跳过了却没有任何提示")
+        self.assertIn("已禁用空间", msgs[0])
