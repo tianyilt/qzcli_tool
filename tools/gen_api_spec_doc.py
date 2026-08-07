@@ -395,8 +395,9 @@ def render_markdown(
     md.append(
         '<callout emoji="⚠️" background-color="yellow">\n\n'
         "**另外两个已知缺口**（全量 grep 过所有 action schema）：\n\n"
-        "1. **没有 `ListWorkspaces`** —— workspace 枚举只能从 `project.ListProjects` 的 "
-        "`items[].space_list[]` 推导。\n\n"
+        "1. **没有 `ListWorkspaces`** —— workspace 枚举只能从 `project.GetProjectForPage` 的 "
+        "`items[].space_list[]` 推导。（上游 2026-08 放开了该 action 的普通用户权限，"
+        "此前它是 `AccessForbidden`，qzcli 只能走 v1；现已可用。）\n\n"
         "2. **没有任何 action 返回 `spec_id`** —— `spec_id` 在 v2 里只作为**请求**字段存在"
         "（`train.CreateJob.framework_config[]` / `hpc.CreateJob` / `inference-serving.CreateServing`）。"
         "`workspace.GetLogicComputeGroupNodeSpecs` 返回的 `node_specs[]` 只有硬件规格没有 id；"

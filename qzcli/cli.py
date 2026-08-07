@@ -7338,48 +7338,51 @@ def _resolve_notebook_id_by_name(target, cookie, display):
     return None
 
 
-def _get_jupyter_info(notebook_id, cookie, display):
-    """notebook_id → /api/v1/notebook/lab/<id> 301 → 抽 base_url + token。"""
-    import requests as _requests
+#: Jupyter 访问地址的形状：
+#: ``https://{domain}/{ws}/{proj}/{user}/jupyter/{nb_id}/{token}/lab?token={token}``
+#: v1 的 301 Location 和 v2 的 ``jupyter_url`` **是同一条 URL**（实测同 host、同路径、
+#: 同 token），所以两条路共用这一个正则。
+_JUPYTER_URL_RE = re.compile(
+    r"(https://[^/]+/[^/]+/[^/]+/[^/]+/jupyter/[^/]+/([^/]+))/lab"
+)
 
+
+def _get_jupyter_info(notebook_id, cookie, display):
+    """notebook_id → Jupyter ``base_url`` + ``token``。
+
+    数据源是 ``api.get_notebook_access_url``（v2 ``notebook GetNotebookAccessUrl``，
+    v2 不通时它自己回落 v1 的 301）。
+
+    **上游 2026-08 之前 v2 全域拿不到 Jupyter 地址**，这里只能直接打 v1 的
+    ``/api/v1/notebook/lab/{id}`` 读 301 响应头 —— 那是 qzcli 最后一个 v1 依赖。
+    现在下沉到 api 层了，这里只负责把 URL 解析成 exec 要的三个键。
+
+    返回 ``{base_url, token, notebook_id}``；下游 ``_exec_launch`` / ``_exec_poll`` /
+    MCP 的 exec 工具全靠这三个键，**形状不能变**。
+    """
     try:
-        resp = _requests.get(
-            f"https://qz.sii.edu.cn/api/v1/notebook/lab/{notebook_id}",
-            headers={
-                "cookie": cookie,
-                "user-agent": "Mozilla/5.0",
-                "accept": "text/html",
-            },
-            allow_redirects=False,
-            timeout=15,
-        )
+        urls = get_api().get_notebook_access_url(notebook_id, cookie)
+    except QzAPIError:
+        raise
     except Exception as e:
         display.print_error(f"请求失败: {e}")
         return None
 
-    if resp.status_code in (301, 302, 303, 307):
-        location = resp.headers.get("Location", "")
-        if "keycloak" in location:
-            raise QzAPIError("Cookie 已过期", 401)
-        # URL 格式: https://{domain}/{ws}/{proj}/{user}/jupyter/{nb_id}/{token}/lab?token={token}
-        match = re.search(
-            r"(https://[^/]+/[^/]+/[^/]+/[^/]+/jupyter/[^/]+/([^/]+))/lab",
-            location,
-        )
-        if match:
-            return {
-                "base_url": match.group(1),
-                "token": match.group(2),
-                "notebook_id": notebook_id,
-            }
-        display.print_error(f"解析 Jupyter URL 失败: {location[:200]}")
+    jupyter_url = (urls or {}).get("jupyter_url") or ""
+    if not jupyter_url:
+        display.print_error("平台没有返回 Jupyter 访问地址（开发机可能未在运行）")
         return None
 
-    if resp.status_code == 401:
-        raise QzAPIError("Cookie 已过期", 401)
+    match = _JUPYTER_URL_RE.search(jupyter_url)
+    if not match:
+        display.print_error(f"解析 Jupyter URL 失败: {jupyter_url[:200]}")
+        return None
 
-    display.print_error(f"获取 Jupyter URL 失败: HTTP {resp.status_code}")
-    return None
+    return {
+        "base_url": match.group(1),
+        "token": match.group(2),
+        "notebook_id": notebook_id,
+    }
 
 
 def _find_notebook_jupyter_info(target, display):

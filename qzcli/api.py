@@ -1669,6 +1669,79 @@ class QzAPI:
             "order_by": [{"field": "created_at", "order": "desc"}],
         }
 
+    def get_notebook_access_url(
+        self, notebook_id: str, cookie: str = ""
+    ) -> Dict[str, str]:
+        """开发机的 web 访问地址（Jupyter Lab / VS Code）。
+
+        v2 ``notebook GetNotebookAccessUrl``，v2 不通时回落 v1 的 301 跳转。
+
+        **上游 2026-08 才补上这个 action。** 在此之前 v2 全域拿不到 Jupyter 地址
+        （只有 ``extra_info.ProxyJump``），所以 ``qzcli exec`` 是最后一个 v1 依赖，
+        文档里一直记着「无任何 v2 对应」。
+
+        实测两边给的是**同一条 URL**（同 host、同路径、同 token），所以下游解析逻辑
+        不用动；v2 还多给一个 ``vscode_url``。
+
+        Returns:
+            ``{"jupyter_url": str, "vscode_url": str}``；拿不到时对应键为空串。
+        """
+
+        def _v2() -> Dict[str, str]:
+            r = self._request_v2(
+                "notebook",
+                "GetNotebookAccessUrl",
+                {"notebook_id": notebook_id},
+                cookie=cookie,
+                referer_path="/notebooks",
+            )
+            return {
+                "jupyter_url": (r or {}).get("jupyter_url") or "",
+                "vscode_url": (r or {}).get("vscode_url") or "",
+            }
+
+        def _v1() -> Dict[str, str]:
+            return {
+                "jupyter_url": self._notebook_lab_url_v1(notebook_id, cookie),
+                "vscode_url": "",
+            }
+
+        return _v2_then_v1("notebook/lab", _v2, _v1)
+
+    def _notebook_lab_url_v1(self, notebook_id: str, cookie: str = "") -> str:
+        """v1 兜底：``GET /api/v1/notebook/lab/{id}`` 的 301 ``Location``。
+
+        这个端点不返回 JSON —— 它靠重定向把带 token 的 Jupyter 地址放在响应头里，
+        所以不能走 ``_curl_post``，只能单独发一次不跟重定向的 GET。
+        """
+        import requests as _requests
+
+        if not cookie:
+            cookie = (get_cookie() or {}).get("cookie", "")
+        resp = _requests.get(
+            f"{self.base_url}/api/v1/notebook/lab/{notebook_id}",
+            headers={
+                "cookie": cookie,
+                "user-agent": "Mozilla/5.0",
+                "accept": "text/html",
+            },
+            allow_redirects=False,
+            timeout=15,
+            proxies=(
+                {"http": get_proxy(), "https": get_proxy()} if get_proxy() else None
+            ),
+        )
+        if resp.status_code in (301, 302, 303, 307):
+            location = resp.headers.get("Location", "")
+            if "keycloak" in location:
+                raise QzAPIError("Cookie 已过期", 401)
+            return location
+        if resp.status_code == 401:
+            raise QzAPIError("Cookie 已过期", 401)
+        raise QzAPIError(
+            f"获取 Jupyter URL 失败: HTTP {resp.status_code}", resp.status_code
+        )
+
     def list_notebooks_with_cookie(
         self,
         workspace_id: str,
