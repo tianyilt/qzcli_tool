@@ -74,6 +74,23 @@ git diff --check
 - 修改认证、任务提交、资源查询等共享路径时补测试。
 - 避免把真实 cookie、用户名、workspace UUID、内部项目名、完整日志贴进仓库；必要时请脱敏。
 
+### 凭据（真踩过，别重蹈）
+
+**从真机响应里粘贴样例时，凭据会跟着一起进来，而写的当下一点都不觉得是在写凭据。**
+
+实际发生过：把开发机的 Jupyter 访问 URL 抄进测试 fixture —— 而 **Jupyter 的 token
+就写在那条 URL 里**，等于把该开发机的门钥匙提交进了仓库（拿到它就能在上面执行任意
+命令）。被 GitGuardian 拦下。
+
+规矩：
+
+- 测试 fixture 的值**必须是编造的**，形状照真实的即可。用 `fake` /
+  `example.invalid` 这类一眼可辨的词，别用真值改两个字符
+- 提交前跑 `python3 -m unittest tests.test_no_secrets_in_repo`（它也在全量测试里）
+- **万一提交了：不要只删掉再提交一次** —— 历史里还在。要 `--amend` 或 rebase
+  重写那个提交，`--force-with-lease` 覆盖，然后**轮换该凭据**
+- 凭据同样不许进 commit message 和 PR 正文（那两处扫描器管不到，只能靠人）
+
 ## Issue 建议
 
 提 bug 时请尽量包含：
