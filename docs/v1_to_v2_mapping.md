@@ -10,8 +10,9 @@ qz spec 版本 `cf22fdbe`。每一行都用 `qzcli` 的 CAS cookie 实际打过�
    这是最容易踩的坑：按 `qz spec` 的字面描述，`cluster.ListNodeDimension` 和
    `workspace.ListNodeDimension` 描述几乎一样，但前者是集群管理员权限，后者才是工作空间级。
    qzcli 是工作空间级工具，**一律用 `workspace.*`**。
-3. **`project.ListProjects` 对当前账号是 `AccessForbidden`，而 v1 `/api/v1/project/list` 正常**
-   —— 这是 v1 兜底存在的直接理由，不是理论风险。
+3. ~~`project.ListProjects` 对当前账号是 `AccessForbidden`~~ —— **2026-08 上游已放开**，
+   并改名为 `project GetProjectForPage`。它还顺带修掉一个 bug：v1 会把用户**已退出 /
+   已结束**的项目也返回（`is_member=False`），选中就报「您已离开所选项目」。
 
 ## 映射表
 
@@ -28,8 +29,8 @@ qz spec 版本 `cf22fdbe`。每一行都用 `qzcli` 的 CAS cookie 实际打过�
 | 9 | `POST /api/v1/cluster_metric/overview_task_metric` | **`workspace GetOverviewTaskMetric`** | `{filter:{workspace_id}, time_range:{start_timestamp, end_timestamp, interval_second}}` | `Result.task_groups` |
 | 10 | `POST /openapi/v1/specs/list`（**已 404**） | **`workspace GetLogicComputeGroupNodeSpecs`** | `{workspace_id, logic_compute_group_id}` | `Result.node_specs[]` ⚠️ **无 `spec_id`** |
 | 11 | `POST /api/v1/hpc_jobs/list` | `hpc ListJobs` | `{workspace_id, page_num, page_size}` | `Result.jobs[]` + `total` |
-| 12 | `POST /api/v1/project/list` | `project ListProjects` → ❌ **AccessForbidden** | — | **保持 v1** |
-| 13 | `GET /api/v1/notebook/lab/{id}` | ❌ **无任何 v2 对应** | — | **保持 v1** |
+| 12 | `POST /api/v1/project/list` | `project GetProjectForPage` ✅ 已迁 | `{page, page_size}` | `Result.items[]` + `Result.total` |
+| 13 | `GET /api/v1/notebook/lab/{id}` | `notebook GetNotebookAccessUrl` ✅ 已迁 | `{notebook_id}` | `Result.{jupyter_url, vscode_url}` |
 | 14 | `POST /api/v2/train?Action=CreateJobConsole` | 已是 v2，**不动** | — | 已真机验证（commit `0a9902a`） |
 | 15 | `POST /api/v2/train?Action=GetJobLog` | 已是 v2，**不动** | — | — |
 

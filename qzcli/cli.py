@@ -2993,9 +2993,9 @@ def _project_belongs_to_workspace_on_platform(api, workspace_id, project_id):
     逻辑，之前只给计算组加了平台复核，项目这条漏了，于是**新建/新加入的项目
     会原样重演那个 bug**：报「项目 X 不属于当前工作空间」，而它其实属于。
 
-    数据源是 `/api/v1/project/list` 的 `items[].space_list[]`，即"项目 → 它属于
-    哪些工作空间"。用 v1 是因为 v2 的 `project ListProjects` 对普通账号是
-    `AccessForbidden`，全域也没有别的接口给得出这个映射。
+    数据源是项目列表的 `items[].space_list[]`，即"项目 → 它属于哪些工作空间"。
+    走 v2 `project GetProjectForPage`（上游 2026-08 放开了普通用户权限；在那之前
+    它是 `AccessForbidden`，只能用 v1），v2 路由不通时自动回落。
 
     返回 True/False；查询失败或列表为空返回 None（不确定 → 上层放行，
     让平台自己拒，总好过拿过期缓存误伤一个真实项目）。

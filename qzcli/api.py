@@ -2577,7 +2577,7 @@ class QzAPI:
 
     @with_rate_limit_retry
     @with_auth_retry
-    def _project_list_items(self, cookie: str = "") -> List[Dict[str, Any]]:
+    def _project_list_items_v1(self, cookie: str = "") -> List[Dict[str, Any]]:
         """``POST /api/v1/project/list`` → ``data.items``。
 
         ``cookie`` 省略时**从磁盘兜底**，与 ``_request_v2`` 同构。少了这一步，
@@ -2645,15 +2645,56 @@ class QzAPI:
 
         return items
 
+    @with_rate_limit_retry
+    def _project_list_items_v2(self, cookie: str = "") -> List[Dict[str, Any]]:
+        """v2 ``project GetProjectForPage`` → ``items``。
+
+        **只返回当前用户仍是成员的项目**，这正是它比 v1 强的地方：v1 的
+        ``ListProjects`` 会把 ``is_member=False`` / ``status=FINISHED`` 的项目
+        （已退出 / 已结束）也吐出来，用户选中就报
+        ``AccessForbidden: 您已离开所选项目，无法创建``。
+
+        实测本账号：v2 返回 11 条、v1 返回 12 条。**两边不是子集关系** —— v2 排除了
+        2 个「已结束且用户不在其中」的项目，又补上 1 个 v1 没给的。另外 ``is_member``
+        这个字段在 v1 里恒为 ``False``（不可信），v2 才真正填了值。
+
+        逐字段对过，下游依赖的 ``name`` / ``space_list[].id`` /
+        ``space_list[].usage_status`` 与 v1 完全一致；v1 仅多一个
+        ``member_remain_budget``，全仓无人使用。
+
+        分页：一次取 200，覆盖现有规模（本账号 11 个）。上游 spec 里 v1 的
+        ``ListProjects`` 已被移除，这条是唯一正式接口。
+        """
+        result = self._request_v2(
+            "project",
+            "GetProjectForPage",
+            {"page": 1, "page_size": 200},
+            cookie=cookie,
+            referer_path="/operations/projects",
+        )
+        return (result or {}).get("items") or []
+
+    def _project_list_items(self, cookie: str = "") -> List[Dict[str, Any]]:
+        """项目列表原始条目。v2 优先，v2 路由不通时回落 v1。
+
+        **返回值形状是下游 9 个调用点的契约**：
+        ``[{id, name, space_list: [{id, name, usage_status, ...}], ...}]``。
+        形状变了不会报错，只会让 ``list_workspaces`` 静默返空 —— 那比崩掉更难查。
+        """
+        return _v2_then_v1(
+            "project/list",
+            lambda: self._project_list_items_v2(cookie),
+            lambda: self._project_list_items_v1(cookie),
+        )
+
     def list_projects_raw(self, cookie: str = "") -> List[Dict[str, Any]]:
         """项目列表原始条目（``/api/v1/project/list`` 的 ``data.items``）。
 
         每条含 ``id`` / ``name`` / ``space_list[]``，即**项目 → 它属于哪些工作空间**
         的权威映射。``list_workspaces`` 和「项目归属核实」都基于它。
 
-        为什么用 v1：v2 的 ``project ListProjects`` 对普通账号是 ``AccessForbidden``
-        （实测），全域也没有别的接口能给出这个映射。详见
-        ``docs/v1_to_v2_mapping.md``。
+        走 v2 ``project GetProjectForPage``（上游 2026-08 放开了普通用户权限；
+        在那之前它是 ``AccessForbidden``，qzcli 只能用 v1）。v2 路由不通时自动回落。
         """
         return self._project_list_items(cookie)
 

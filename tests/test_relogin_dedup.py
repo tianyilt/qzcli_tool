@@ -213,7 +213,10 @@ class ReloginBaselineTests(unittest.TestCase):
 
 
 class ProjectListCookieFallbackTests(unittest.TestCase):
-    """``list_projects_raw()`` 不传 cookie 时必须从磁盘兜底。
+    """v1 腿不传 cookie 时必须从磁盘兜底。
+
+    **明确打 ``_project_list_items_v1``**：默认路径已经走 v2 了（上游放开了
+    ``GetProjectForPage`` 的普通用户权限），但 v1 腿仍是回落路径，这个兜底不能丢。
 
     v2 那条路有兜底（``_request_v2``），v1 这条漏了 —— 空 cookie 直接进 header，
     必然 401，于是 ``qzcli create`` **每次**都白登一次。
@@ -241,7 +244,7 @@ class ProjectListCookieFallbackTests(unittest.TestCase):
         api = _CountingAPI()
         with sandbox_home(**_SANDBOX):
             with patch.object(api_mod, "_curl_post", side_effect=_fake_curl_post):
-                api.list_projects_raw()
+                api._project_list_items_v1()
         self.assertEqual(
             captured.get("cookie"),
             _STALE_COOKIE,
@@ -267,12 +270,12 @@ class ProjectListCookieFallbackTests(unittest.TestCase):
         api = _CountingAPI()
         with sandbox_home(**_SANDBOX):
             with patch.object(api_mod, "_curl_post", side_effect=_fake_curl_post):
-                api.list_projects_raw("inspire-session=explicit")
+                api._project_list_items_v1("inspire-session=explicit")
         self.assertEqual(captured.get("cookie"), "inspire-session=explicit")
 
 
 class DecoratorStackTests(unittest.TestCase):
-    """``_project_list_items`` 上同一组装饰器挂了两遍 → 429 重试 4×4=16 次。"""
+    """v1 腿上同一组装饰器不能挂两遍（429 重试会变成 4×4=16 次）。"""
 
     def test_rate_limit_retries_are_not_squared(self):
         attempts = {"n": 0}
@@ -287,7 +290,7 @@ class DecoratorStackTests(unittest.TestCase):
                 api_mod, "_curl_post", side_effect=_always_429
             ), patch.object(api_mod._time, "sleep", lambda *_: None):
                 with self.assertRaises(api_mod.QzRateLimitError):
-                    api.list_projects_raw()
+                    api._project_list_items_v1()
         self.assertLessEqual(
             attempts["n"],
             api_mod._RATE_LIMIT_MAX_TRIES,
