@@ -31,11 +31,32 @@ from qzcli import api as qzapi  # noqa: E402
 from qzcli.api import QzAPIError, get_api  # noqa: E402
 from qzcli.config import (  # noqa: E402
     find_workspace_by_name,
+    load_all_resources,
     get_cookie,
     get_credentials,
     get_workspace_resources,
     load_env_file,
 )
+
+
+class _QuietDisplay:
+    """收集输出的假 display —— exec 内部会 print 一堆进度，别打乱 smoke 的表格。
+
+    用 ``__getattr__`` 兜住 print_* 家族：真 display 的方法集合会变，
+    写死几个会因为一个无关的新方法而 AttributeError。
+    """
+
+    def __init__(self):
+        self.lines = []
+
+    def print(self, msg="", *a, **kw):
+        self.lines.append(str(msg))
+
+    def __getattr__(self, name):
+        if name.startswith("print"):
+            return self.print
+        raise AttributeError(name)
+
 
 RESULTS: List[Dict[str, Any]] = []
 
@@ -107,6 +128,13 @@ def main() -> int:
         help=(
             "低优排队用例的目标计算组 lcg-<uuid>。挑一个低优空位远少于 "
             "--queue-instances 的分区，这样任务必定停在排队、不会真占资源"
+        ),
+    )
+    ap.add_argument(
+        "--exec-notebook",
+        help=(
+            "exec 用例的目标开发机（notebook_id 或名字）。不传则自动挑："
+            "优先 CI 空间里 RUNNING 的 mova-base*，再退回任一 RUNNING 的"
         ),
     )
     ap.add_argument(
@@ -494,6 +522,84 @@ def main() -> int:
         return "连跑 3 次无 429"
 
     _cli_repeat()
+
+    # ---- exec：能不能在真实开发机上执行命令
+    #
+    # **这条是补测试方法论漏洞加的。** 上一轮把 exec 的 Jupyter 地址迁到 v2
+    # (notebook GetNotebookAccessUrl) 时，我给它配的是把真机响应抄成常量的单测 ——
+    # 结果把真实 Jupyter token 提交进了仓库（token 就写在那条 URL 里）。
+    #
+    # 正确做法是**动态发现**：现找一台在跑的开发机，直接 exec。凭据全程不落盘，
+    # 而且因为是动态的也不会过期。
+    #
+    # 而且单测只能证明「URL 能解析成三个字段」，证明不了「这个地址真能连上、
+    # 命令真能执行」。那一半只有真机能验。
+    @check("exec 在真实开发机上执行命令", "qzcli exec")
+    def _exec_real():
+        import uuid as _uuid
+
+        display_stub = _QuietDisplay()
+
+        from qzcli.cli import _exec_via_jupyter, _find_notebook_jupyter_info
+
+        # 挑目标：优先用户日常在用的那台，它最能代表真实使用
+        candidates = []
+        if args.exec_notebook:
+            candidates = [(args.exec_notebook, "命令行指定")]
+        else:
+            preferred, others = [], []
+            for wid, wsinfo in load_all_resources().items():
+                try:
+                    r = a.list_notebooks_with_cookie(wid, cookie, page_size=100)
+                except QzAPIError:
+                    continue
+                for n in r.get("list") or []:
+                    if n.get("status") != "RUNNING":
+                        continue
+                    nid = n.get("notebook_id") or n.get("id") or ""
+                    name = str(n.get("name") or "")
+                    if not nid:
+                        continue
+                    if "CI-情境智能" == wsinfo.get("name") and name.startswith(
+                        "mova-base"
+                    ):
+                        preferred.append((nid, name))
+                    else:
+                        others.append((nid, name))
+            candidates = preferred + others
+        assert_true(candidates, "所有工作空间里都没有 RUNNING 的开发机")
+
+        marker = f"QZSMOKE_{_uuid.uuid4().hex[:10]}"
+        failures = []
+        # 逐个试到跑通为止。开发机可能个别不响应（终端起不来 / 负载高），
+        # 那是单台的问题，不代表 exec 这条路坏了 —— 所以要扫，不能试一台就下结论。
+        for nid, name in candidates[:5]:
+            try:
+                info = _find_notebook_jupyter_info(nid, display_stub)
+                if not info:
+                    failures.append(f"{name}: 拿不到 Jupyter 地址")
+                    continue
+                # 不变量：地址要能解析出 exec 需要的三个键
+                for key in ("base_url", "token", "notebook_id"):
+                    assert_true(info.get(key), f"{name}: 解析结果缺 {key}")
+                # 返回的是 (exit_code, output) 元组 —— 别当字符串用
+                exit_code, output = _exec_via_jupyter(
+                    info, f"echo {marker}", display_stub, timeout=90
+                )
+                if exit_code == 0 and marker in (output or ""):
+                    # 只报名字和 id 前 8 位 —— 输出会被贴进 PR 和飞书，
+                    # 绝不能带 token 或完整 access url
+                    return f"{name}（{nid[:8]}…）执行成功，回显匹配"
+                failures.append(f"{name}: exit={exit_code}，回显未匹配")
+            except Exception as exc:  # noqa: BLE001
+                failures.append(f"{name}: {type(exc).__name__}: {str(exc)[:60]}")
+            finally:
+                display_stub.lines.clear()
+        raise AssertionError(
+            f"试了 {len(candidates[:5])} 台开发机都没跑通：" + "; ".join(failures)
+        )
+
+    _exec_real()
 
     cooldown()
 
