@@ -1,5 +1,7 @@
 # qzcli - 启智平台任务管理 CLI
 
+[![MCP Toplist](https://mcptoplist.com/badge/glama%2Ftianyilt%2Fqzcli_tool.svg)](https://mcptoplist.com/server/glama%2Ftianyilt%2Fqzcli_tool)
+
 ![Release](https://img.shields.io/github/v/release/tianyilt/qzcli_tool?sort=semver) ![Python](https://img.shields.io/badge/python-%3E%3D3.8-blue) ![Tests](https://img.shields.io/badge/tests-54%20passed%2C%201%20skipped-brightgreen) ![License](https://img.shields.io/badge/license-MIT-green)
 
 一个类似 `kubectl` / `docker` 风格的启智平台命令行工具，把资源查询、任务提交、任务管理、日志查看和 MCP/agent 工作流收敛到 CLI 里完成。
