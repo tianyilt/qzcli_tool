@@ -20,6 +20,7 @@ import streamlit as st
 
 from qzcli import cli, fragmentation
 from qzcli.api import QzAPIError, get_api
+from qzcli.diag import swallowed
 from qzcli.config import (
     find_workspace_by_name,
     get_cookie,
@@ -521,6 +522,9 @@ def main():
         st.error(f"{e}\n\n请在终端运行 `qzcli login` 后点上方「🔄 刷新数据」。")
         st.stop()
 
+    render_capacity_banner(ws_id, ws_name)
+    st.divider()
+
     tab_comp, tab_frag = st.tabs(["📊 成分下钻（treemap）", "🧱 整节点 / 碎卡治理"])
     with tab_comp:
         if df.empty:
@@ -529,6 +533,65 @@ def main():
             render_composition(df, free_by_lcg, ws_name)
     with tab_frag:
         render_fragmentation(ws_options)
+
+
+def render_capacity_banner(ws_id, ws_name):
+    """顶部横幅：**现在能起几个整节点**。
+
+    这是提交任务前唯一真正要回答的问题 —— 不知道这个数就不知道 ``--instances``
+    该填几。以前这个数存在，但埋在「整节点/碎卡」那张 13 行 × 8 列的宽表里，
+    要自己从「空整节点 / 可凑整节点潜力」两列里挑，而且两者含义不同容易高估。
+
+    口径**只算空整节点**（完全空闲、现在提就能起），不含「低优满占、可抢占」的
+    节点 —— 那些要你提高优先级去挤才拿得到，算进来会让人提了起不来的任务。
+    """
+    try:
+        res = _frag_one(ws_id)
+    except QzAPIError as exc:
+        st.warning(f"容量信息暂不可用：{exc}")
+        return
+    except Exception as exc:  # noqa: BLE001 —— 横幅坏了不该让整个看板打不开
+        swallowed("看板/容量横幅", exc)
+        return
+
+    by_lcg = (res or {}).get("by_lcg") or {}
+    usable = []
+    for lcg, v in by_lcg.items():
+        whole = int(v.get("empty_whole") or 0)
+        if whole > 0:
+            # 空整节点对应的卡数 = 节点数 × 每节点卡数（node_size）。
+            # 别用 frag_free_cards —— 那是**碎卡节点**上零散的空卡，不是整节点的，
+            # 混用会把「能起几个整节点」算歪。实测 70 节点 × 8 = 560 卡，
+            # 与 `qzcli avail` 报的空 GPU 数吻合。
+            size = int(v.get("node_size") or 0)
+            usable.append((str(v.get("lcg") or lcg), whole, whole * size))
+    usable.sort(key=lambda x: -x[1])
+
+    st.markdown("#### 🚀 现在能起几个整节点")
+    if not usable:
+        st.error("**0 个** —— 当前工作空间没有完全空闲的节点，提交会排队等待。")
+        st.caption(
+            "（口径：只算完全空闲的整节点；被低优任务占着的节点需要抢占，未计入）"
+        )
+        return
+
+    cols = st.columns(min(len(usable), 4))
+    for col, (name, whole, cards) in zip(cols, usable[:4]):
+        col.metric(
+            label=name[:18],
+            value=f"{whole} 节点",
+            help=f"计算组 {name}：{whole} 个完全空闲的整节点"
+            + (f"，约 {cards} 张空卡" if cards else ""),
+        )
+    top_name, top_whole, _ = usable[0]
+    st.caption(
+        f"建议：提交到 **{top_name}**，`--instances` 最多填 **{top_whole}**。"
+        f"（口径：只算完全空闲整节点；被低优占用、需抢占的节点未计入）"
+    )
+    if len(usable) > 4:
+        st.caption(
+            "其余可用计算组：" + "、".join(f"{n}({w})" for n, w, _ in usable[4:])
+        )
 
 
 def render_composition(df, free_by_lcg, ws_name):
