@@ -20,6 +20,7 @@ import streamlit as st
 
 from qzcli import cli, fragmentation
 from qzcli.api import QzAPIError, get_api
+from qzcli.diag import swallowed
 from qzcli.config import (
     find_workspace_by_name,
     get_cookie,
@@ -128,8 +129,16 @@ def load_df(ws_id, ws_name):
             r["节点分类"] = "多节点混合"
 
     # 每个计算组的空闲 GPU（按节点容量 − 已用聚合，去重到节点粒度）
+    #
+    # ⚠️ **必须排除调度禁用（cordon）节点**：它们的卡看着空，实际排不上去。
+    # 2026-08-13 实测「分布式训练空间」：697 个节点里 33 个被 cordon，
+    # 全部 137 张空卡中 **121 张（88%）在这些禁用节点上** —— 真正能用的只有 16 张。
+    # 不排除的话页面会显示「空闲 GPU 111」，而顶部横幅（已正确排除）显示
+    # 「0 个整节点」，同一页两个数字自相矛盾，用户会以为看板算错了。
     cap, used = {}, {}
     for info in node_map.values():
+        if not info.get("schedulable", True):
+            continue  # cordon 节点：不计入可用容量
         lcg = info["lcg"]
         cap[lcg] = cap.get(lcg, 0) + info.get("gpu_total", 0)
         used[lcg] = used.get(lcg, 0) + info.get("gpu_used", 0)
@@ -521,6 +530,9 @@ def main():
         st.error(f"{e}\n\n请在终端运行 `qzcli login` 后点上方「🔄 刷新数据」。")
         st.stop()
 
+    render_capacity_banner(ws_id, ws_name)
+    st.divider()
+
     tab_comp, tab_frag = st.tabs(["📊 成分下钻（treemap）", "🧱 整节点 / 碎卡治理"])
     with tab_comp:
         if df.empty:
@@ -529,6 +541,95 @@ def main():
             render_composition(df, free_by_lcg, ws_name)
     with tab_frag:
         render_fragmentation(ws_options)
+
+
+def render_capacity_banner(ws_id, ws_name):
+    """顶部横幅：**现在能起几个整节点**。
+
+    这是提交任务前唯一真正要回答的问题 —— 不知道这个数就不知道 ``--instances``
+    该填几。以前这个数存在，但埋在「整节点/碎卡」那张 13 行 × 8 列的宽表里，
+    要自己从「空整节点 / 可凑整节点潜力」两列里挑，而且两者含义不同容易高估。
+
+    口径**只算空整节点**（完全空闲、现在提就能起），不含「低优满占、可抢占」的
+    节点 —— 那些要你提高优先级去挤才拿得到，算进来会让人提了起不来的任务。
+
+    ## 必须同时看两个数据源（2026-08-13 踩过）
+
+    平台有两套口径，**启动期间会差很多**：
+
+    - 节点侧 ``gpu_used``：**实测**使用率，来自监控，有滞后
+    - 任务侧 ``nodes_occupied``：**已分配**给任务的节点，调度完立刻就有
+
+    实测过一次：某 72 节点任务刚被调度、节点还没上报使用率，节点侧显示
+    「71 个节点空闲」，而那 71 个其实已经被它预定了。**只信节点侧就会建议用户
+    提一个必然排队的任务** —— 正是这个横幅要防的事。
+
+    所以这里取**两者的保守值**：任何一侧认为被占，就算被占。
+    """
+    try:
+        res = _frag_one(ws_id)
+        # 任务侧：本空间已分配出去的 GPU（含刚调度、尚未上报使用率的）
+        _df, _free_by_lcg = load_df(ws_id, ws_name)
+    except QzAPIError as exc:
+        st.warning(f"容量信息暂不可用：{exc}")
+        return
+    except Exception as exc:  # noqa: BLE001 —— 横幅坏了不该让整个看板打不开
+        swallowed("看板/容量横幅", exc)
+        return
+
+    by_lcg = (res or {}).get("by_lcg") or {}
+    usable = []
+    for lcg, v in by_lcg.items():
+        whole = int(v.get("empty_whole") or 0)
+        if whole > 0:
+            # 空整节点对应的卡数 = 节点数 × 每节点卡数（node_size）。
+            # 别用 frag_free_cards —— 那是**碎卡节点**上零散的空卡，不是整节点的，
+            # 混用会把「能起几个整节点」算歪。
+            size = int(v.get("node_size") or 0) or 8
+            name = str(v.get("lcg") or lcg)
+
+            # ⚠️ 与任务侧取保守值：任务侧若显示该组已无空闲卡（刚被调度但监控还没
+            # 上报），说明这些"空闲"节点其实已被预定，不能算数。
+            task_free_cards = _free_by_lcg.get(name)
+            if task_free_cards is not None:
+                whole = min(whole, int(task_free_cards) // size)
+            if whole <= 0:
+                continue
+            usable.append((name, whole, whole * size))
+    usable.sort(key=lambda x: -x[1])
+
+    st.markdown("#### 🚀 现在能起几个整节点")
+    if not usable:
+        st.error("**0 个** —— 当前工作空间没有完全空闲的节点，提交会排队等待。")
+        st.caption(
+            "（口径：只算完全空闲的整节点；被低优任务占着的节点需要抢占，未计入）"
+        )
+        return
+
+    cols = st.columns(min(len(usable), 4))
+    for col, (name, whole, cards) in zip(cols, usable[:4]):
+        col.metric(
+            label=name[:18],
+            value=f"{whole} 节点",
+            help=f"计算组 {name}：{whole} 个完全空闲的整节点"
+            + (f"，约 {cards} 张空卡" if cards else ""),
+        )
+    top_name, top_whole, _ = usable[0]
+    # 加时间戳：这个数变化极快（实测 9 分钟内 71 → 0，因为一个 72 节点任务被调度）。
+    # 不标时刻的话，用户会拿一个几分钟前的数去提任务。
+    import datetime as _dt
+
+    st.caption(
+        f"数据时刻 {_dt.datetime.now().strftime('%H:%M:%S')}｜集群变化很快，提交前请点右上「🔄 刷新数据」"
+    )
+    st.caption(
+        f"建议：提交到 **{top_name}**，`--instances` 最多填 **{top_whole}**。"
+        f"（口径：只算完全空闲整节点；被低优占用、需抢占的节点未计入）"
+    )
+    if len(usable) > 4:
+        st.caption(
+            "其余可用计算组：" + "、".join(f"{n}({w})" for n, w, _ in usable[4:])
+        )
 
 
 def render_composition(df, free_by_lcg, ws_name):
