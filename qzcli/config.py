@@ -73,8 +73,18 @@ def get_proxy(url: str = "") -> str:
     return proxy
 
 
-# 配置目录
-CONFIG_DIR = Path.home() / ".qzcli"
+# 配置目录。``QZCLI_HOME`` 可以把**整个状态目录**搬走（config.json / .cookie /
+# jobs.json / resources.json / .relogin.cooldown / .relogin.lock 全部由它派生），
+# 用于给某个长跑项目一份互不干扰的独立副本——典型场景是 MoVA2 的冻结版 qzcli：
+# 它有自己的凭据和 cookie，我在 ``~/.qzcli`` 这边做什么都影响不到它。
+#
+# ⚠️ 这是**模块级常量**，import 时就求值完了。所以 ``QZCLI_HOME`` 必须在 python
+# 进程启动**之前**设好（wrapper 里 export），运行中改 os.environ 不会生效。
+#
+# 登录失败封锁（.relogin.cooldown）也跟着一起搬，这是有意的：封锁在每个 home
+# 内部依然是永久的，所以账号被锁时另一份 home 至多多试 1 次就自己停住，不会
+# 演变成重试风暴——不值得为这 1 次造一个"不跟随 QZCLI_HOME"的特例目录。
+CONFIG_DIR = Path(os.environ.get("QZCLI_HOME", "").strip() or Path.home() / ".qzcli")
 CONFIG_FILE = CONFIG_DIR / "config.json"
 JOBS_FILE = CONFIG_DIR / "jobs.json"
 TOKEN_CACHE_FILE = CONFIG_DIR / ".token_cache"
