@@ -1445,7 +1445,27 @@ def cmd_workspaces(args):
             ws_name = pending_name or (
                 cached_resources.get("name", "") if cached_resources else ""
             )
-            save_resources(workspace_id, resources, ws_name)
+            # **拉到空就不许覆盖非空缓存。**
+            #
+            # _collect_workspace_resources_from_live_apis 在鉴权失败时会把 API 错误
+            # 吞成空列表（见那边的 diag.swallowed 注释），于是这行会把一份好端端的
+            # 缓存写成 0 个 compute_groups / 0 个 projects。2026-08-16 真发生过：
+            # 账号锁定期间跑了一次 `qzcli res -w 分布式训练空间 -u`，那个工作空间的
+            # 缓存被清空，后续所有命令报「未找到计算组」，看着像平台改了名。
+            #
+            # 并行路径（本函数上面那支）早就有守卫（`if not result["ok"]: continue`），
+            # 只有这条单工作空间路径漏了。
+            if _resources_look_empty(resources) and not _resources_look_empty(
+                cached_resources
+            ):
+                display.print_warning(
+                    f"刷新没拿到任何计算组/项目（多半是登录态失效或被限流），"
+                    f"**保留原缓存不覆盖**。原缓存里有 "
+                    f"{len((cached_resources or {}).get('compute_groups') or {})} 个计算组。"
+                )
+                display.print("[dim]先解决登录问题再重试：qzcli login[/dim]")
+            else:
+                save_resources(workspace_id, resources, ws_name)
             display.print_success("资源配置已保存到本地缓存")
 
             display.print(
@@ -3634,8 +3654,12 @@ def _collect_workspace_resources_from_live_apis(
             resources["projects"] = _merge_resource_lists(
                 resources.get("projects", []), task_projects
             )
-        except QzAPIError:
-            pass
+        except QzAPIError as exc:
+            # 原来是裸 `pass`。后果是鉴权失败被吞成「拉到 0 个项目」，调用方分不清
+            # 「这个空间真没项目」和「我根本没拉到」，再往下就把空结果写回缓存，
+            # 把好数据冲掉（2026-08-16 真发生过）。现在至少留痕，
+            # 调用方也改成「拉到空就不覆盖非空缓存」。
+            swallowed("res/拉取任务维度项目", exc)
 
     cluster_info_failed = False
     try:
@@ -7191,6 +7215,63 @@ def _devbox_render(display, report, dry_run=False):
     return 0
 
 
+def _resources_look_empty(resources):
+    """这份资源结果是不是「什么都没拉到」。
+
+    判据只看 compute_groups 和 projects —— specs 在 quick 模式下本来就是空的，
+    拿它当判据会把正常的 quick 刷新误判成失败。
+    """
+    if not resources:
+        return True
+    for key in ("compute_groups", "projects"):
+        val = resources.get(key)
+        if val:
+            return False
+    return True
+
+
+def _upload_remote_script(jupyter_info, script_text, display):
+    """把一段脚本经 Contents API 传到开发机，返回远端绝对路径（失败返回 ``""``）。
+
+    为什么不直接把脚本当命令发：devbox 的自包含脚本约 18 KB，base64 之后接近
+    30 KB，**PTY 塞不下这么长的命令行**——实测远端一声不吭、什么都不返回。
+    ``exec`` 自己回传输出用的就是 Contents API，这里复用同一条通道。
+
+    落点是 ``_qzcli`` 这个 Contents API 中转目录（symlink 指向 ``/tmp/.qzcli``），
+    先跑一条空命令保证它被建出来，再 PUT。
+    """
+    import base64 as _b64
+
+    base_http = jupyter_info["base_url"]
+    token = jupyter_info["token"]
+    headers = {"authorization": f"token {token}", "content-type": "application/json"}
+
+    # 借一次 exec 把 _qzcli -> /tmp/.qzcli 的中转目录和 symlink 建出来
+    _exec_via_jupyter(jupyter_info, "true", display, timeout=60)
+
+    name = f"devbox_{uuid.uuid4().hex[:8]}.py"
+    try:
+        resp = _requests.put(
+            f"{base_http}/api/contents/_qzcli/{name}",
+            headers=headers,
+            json={
+                "type": "file",
+                "format": "base64",
+                "content": _b64.b64encode(script_text.encode("utf-8")).decode(),
+            },
+            timeout=60,
+        )
+        if resp.status_code >= 400:
+            display.print_error(
+                f"上传脚本失败：HTTP {resp.status_code} {resp.text[:120]}"
+            )
+            return ""
+    except _requests.RequestException as exc:
+        display.print_error(f"上传脚本失败：{type(exc).__name__}: {exc}")
+        return ""
+    return f"/tmp/.qzcli/{name}"
+
+
 def cmd_devbox(args):
     """把开发机上易失的 dotfile / agent home 挪到持久盘。
 
@@ -7235,10 +7316,20 @@ def cmd_devbox(args):
             "include_ssh": getattr(args, "include_ssh", False),
             "dry_run": getattr(args, "dry_run", False),
         }
-    cmd_str = devbox_mod.remote_command(action, **opts)
+
+    # 脚本走 **Contents API 上传成文件**，而不是塞进命令行。
+    # 第一版把整段 base64 当命令发，实测 29920 字节 —— PTY 根本吃不下，
+    # 远端一声不吭什么都不回。exec 自己传输出文件用的就是 Contents API，
+    # 这里复用同一条通道。
+    script = devbox_mod.build_remote_script(action, **opts)
+    remote_path = _upload_remote_script(jupyter_info, script, display)
+    if not remote_path:
+        return 1
 
     display.print(f"[dim]在开发机上执行 devbox {action}...[/dim]")
-    _exit_code, output = _exec_via_jupyter(jupyter_info, cmd_str, display, timeout=300)
+    _exit_code, output = _exec_via_jupyter(
+        jupyter_info, f"python3 {remote_path}", display, timeout=300
+    )
     report = devbox_mod.parse_remote_output(output)
     return _devbox_render(display, report, getattr(args, "dry_run", False))
 
