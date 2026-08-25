@@ -75,6 +75,23 @@ class _CountingAPI(QzAPI):
         time.sleep(0.03)
         return f"inspire-session=fresh-{n}"
 
+    def get_user_detail(self, cookie: str = ""):
+        """鉴权探针的桩。**必须覆盖，否则这个测试会自己制造一次多余的登录。**
+
+        ``ensure_authenticated`` 会拿它当探针。不覆盖的话它走真实 ``_request_v2``、
+        带着本文件里那些假 cookie 去打真网络，必然 401 —— 于是重登一次、换上
+        ``fresh-1``、探针再撞一次 401、再登一次，``cas_calls`` 凭空变成 2，
+        看起来像「分页时登录了两次」的去重缺陷。
+
+        实际排查过：三次 ``_relogin`` 全在 MainThread（worker 隔离是好的），
+        第三次的 ``failing_cookie`` 是刚换上的 ``fresh-1`` —— 只有真实网络调用
+        才会拒绝它。桩掉之后立刻恢复成 1 次。
+
+        所以这是**测试自身的缺陷，不是生产 bug**：生产里探针拿的是真 cookie，
+        重登一次就成功了。
+        """
+        return {"id": "u-1", "name": "test-user"}
+
 
 def _reset():
     api_mod._clear_relogin_failure()
