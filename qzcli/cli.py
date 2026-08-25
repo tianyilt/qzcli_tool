@@ -7251,7 +7251,7 @@ def _upload_remote_script(jupyter_info, script_text, display):
 
     name = f"devbox_{uuid.uuid4().hex[:8]}.py"
     try:
-        resp = _requests.put(
+        resp = requests.put(
             f"{base_http}/api/contents/_qzcli/{name}",
             headers=headers,
             json={
@@ -7266,7 +7266,7 @@ def _upload_remote_script(jupyter_info, script_text, display):
                 f"上传脚本失败：HTTP {resp.status_code} {resp.text[:120]}"
             )
             return ""
-    except _requests.RequestException as exc:
+    except requests.RequestException as exc:
         display.print_error(f"上传脚本失败：{type(exc).__name__}: {exc}")
         return ""
     return f"/tmp/.qzcli/{name}"

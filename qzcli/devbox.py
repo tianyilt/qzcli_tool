@@ -159,14 +159,31 @@ def detect_persist_root(explicit: Optional[str] = None) -> str:
     if not hits:
         raise DevboxError(
             "没探测到可写的持久盘目录。请用 --target-dir 显式指定，例如：\n"
-            "  qzcli devbox init --target-dir /inspire/hdd/global_user/<你的用户id>/devbox"
+            "  qzcli devbox init --target-dir /inspire/hdd/global_user/你的用户id/devbox"
         )
-    if len(hits) > 1:
-        listed = "\n".join(f"    {h}" for h in hits)
+
+    # **优先账号级个人目录**（/inspire/hdd/global_user/<你>），而不是项目级的
+    # （/inspire/ssd/project/<项目>/<你>）。
+    #
+    # 第一版是「命中多个就报错让用户挑」，看着稳妥，实测**等于开箱即用是坏的**：
+    # 每台开发机都同时挂着账号级和项目级两种个人目录，所以永远命中 ≥2、永远拒绝。
+    # dotfile 和 agent home 属于「这个人」而不是「这个项目」，放账号级目录才对；
+    # 项目目录还可能随项目结束被清理。
+    preferred = [h for h in hits if "/global_user/" in h]
+    if len(preferred) == 1:
+        return preferred[0]
+    if len(preferred) > 1:
+        listed = "\n".join(f"    {h}" for h in preferred)
         raise DevboxError(
-            f"探测到多个候选持久目录，不替你挑。请用 --target-dir 指定其一：\n{listed}"
+            f"账号级个人目录命中多个，不替你挑。请用 --target-dir 指定其一：\n{listed}"
         )
-    return hits[0]
+    if len(hits) == 1:
+        return hits[0]
+    listed = "\n".join(f"    {h}" for h in hits)
+    raise DevboxError(
+        "没找到账号级个人目录（/inspire/hdd/global_user/<你的用户id>），"
+        f"候选如下，请用 --target-dir 指定其一：\n{listed}"
+    )
 
 
 # --------------------------------------------------------------------------

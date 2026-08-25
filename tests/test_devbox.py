@@ -17,6 +17,7 @@ import os
 import sys
 import tempfile
 import unittest
+from unittest import mock
 from pathlib import Path
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -84,6 +85,26 @@ class PersistenceGuardTests(unittest.TestCase):
         self.addCleanup(setattr, devbox, "root_is_ephemeral", orig)
         with tempfile.TemporaryDirectory() as tmp:
             self.assertEqual(devbox.fs_label(tmp, root=tmp), "与 / 同盘")
+
+    def test_prefers_account_level_dir_over_project_level(self):
+        """每台开发机都同时挂账号级和项目级个人目录，必须能自己挑，不能一律拒绝。
+
+        第一版「命中多个就报错」实测等于开箱即用是坏的：真机上永远命中两个
+        （/inspire/hdd/global_user/<我> 和 /inspire/ssd/project/<项目>/<我>），
+        于是 devbox init 永远跑不起来。dotfile 属于「人」不属于「项目」，
+        所以优先账号级那个。
+        """
+        cands = [
+            "/inspire/ssd/project/video-generation/liangtianyi-x",
+            "/inspire/hdd/global_user/liangtianyi-x",
+        ]
+        with mock.patch.object(devbox, "is_persistent", lambda p, root="/": True), \
+             mock.patch("glob.glob", lambda pat: cands), \
+             mock.patch("os.path.isdir", lambda p: True), \
+             mock.patch("os.access", lambda p, m: True):
+            self.assertEqual(
+                devbox.detect_persist_root(), "/inspire/hdd/global_user/liangtianyi-x"
+            )
 
     def test_detect_refuses_explicit_non_persistent_target(self):
         with tempfile.TemporaryDirectory() as tmp:
