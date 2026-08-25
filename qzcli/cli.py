@@ -7073,6 +7073,72 @@ def cmd_create(args):
     return 0
 
 
+def cmd_ops(args):
+    """查看操作日志。
+
+    ``--merge`` 是为查锁号这类问题准备的：本机 ``~/.qzcli``、开发机上的、以及
+    项目组冻结版各写各的日志，只看一份会漏掉「另一边在同一时刻也登了一次」。
+    """
+    from . import opslog
+
+    display = get_display()
+    rows = opslog.read(op=getattr(args, "op", None), since_hours=getattr(args, "since", None))
+    seen_paths = [str(opslog.log_path())]
+    for extra in getattr(args, "merge", []) or []:
+        p = Path(extra).expanduser()
+        if p.is_dir():
+            p = p / opslog.LOG_NAME
+        rows += opslog.read(p, op=getattr(args, "op", None), since_hours=getattr(args, "since", None))
+        seen_paths.append(str(p))
+
+    rows.sort(key=lambda r: r.get("ts_utc", ""))
+    if not rows:
+        display.print(f"没有记录。日志位置: {'、'.join(seen_paths)}")
+        display.print("[dim]只读命令（list/status/avail/usage）刻意不记，所以空是正常的[/dim]")
+        return 0
+
+    display.print(f"共 {len(rows)} 条（来自 {len(seen_paths)} 份日志）\n")
+    for r in rows:
+        mark = "✓" if r.get("outcome") == "ok" else "✗"
+        dur = f" {r['duration_ms']}ms" if r.get("duration_ms") is not None else ""
+        tgt = f"  {r['target']}" if r.get("target") else ""
+        err = f"  [{r['err_class']}]" if r.get("err_class") else ""
+        display.print(
+            f"  {r.get('ts_utc','')}  {mark} {r.get('op',''):<12}"
+            f" pid={r.get('pid','?'):<7} {r.get('host','')[:24]}{tgt}{err}{dur}"
+        )
+    return 0
+
+
+def _opslog_name(args):
+    """把「子命令 + 参数」映射成操作日志里的 op 名。
+
+    多数命令直接用子命令名；三个例外是因为**同一个子命令有只读和有副作用两种形态**，
+    只有后者值得记：
+
+    - ``res`` 只读，但 ``res -u`` 会覆盖本地缓存（已知它在鉴权失败时会把缓存清空）
+    - ``worker exec`` 是远程执行，``worker diag`` 只读
+    - ``devbox status`` 只读，``devbox init`` 会动文件
+    """
+    cmd = getattr(args, "command", "") or ""
+    if cmd in ("res", "resources"):
+        return "res-update" if getattr(args, "update", False) else ""
+    if cmd == "worker":
+        return "worker-exec" if getattr(args, "worker_action", "") == "exec" else ""
+    if cmd == "devbox":
+        return "devbox-init" if getattr(args, "devbox_action", "") == "init" else ""
+    return cmd
+
+
+def _opslog_target(args):
+    """操作对象，便于回溯「是哪个任务/哪台机器」。挑第一个非空的，不拼长串。"""
+    for attr in ("job_id", "name", "target", "host", "notebook_id", "workspace"):
+        val = getattr(args, attr, None)
+        if isinstance(val, str) and val:
+            return val[:120]
+    return ""
+
+
 def _devbox_render(display, report, dry_run=False):
     """把 devbox 的结构化报告渲染成人话。本地和远端共用同一套渲染。"""
     if report.get("error"):
@@ -8870,6 +8936,19 @@ def main():
         help="连 .ssh 一起托管（默认不托管：个人持久目录同组可读）",
     )
 
+    ops_parser = subparsers.add_parser(
+        "ops", help="查看操作日志（提交/停止/登录/远程执行等有副作用的操作）"
+    )
+    ops_parser.add_argument("--op", help="只看某一类操作，如 create / login")
+    ops_parser.add_argument("--since", type=float, help="只看最近 N 小时")
+    ops_parser.add_argument(
+        "--merge",
+        action="append",
+        default=[],
+        help="额外并入其它 home 的日志（可多次给）。三份 home 各写各的，"
+        "查锁号这类问题要合起来看时间线",
+    )
+
     hpc_parser = subparsers.add_parser("hpc", help="提交 HPC/CPU 任务到启智平台")
     hpc_parser.add_argument("--name", required=True, help="任务名称")
     hpc_parser.add_argument("--workspace", required=True, help="工作空间名称或 ID")
@@ -8997,6 +9076,7 @@ def main():
         "create": cmd_create,
         "create-job": cmd_create,
         "devbox": cmd_devbox,
+        "ops": cmd_ops,
         "worker": cmd_worker,
         "hpc": cmd_hpc,
         "hpc-usage": cmd_hpc_usage,
@@ -9005,7 +9085,16 @@ def main():
 
     cmd_func = commands.get(args.command)
     if cmd_func:
+        # 操作日志挂在**分发点**而不是逐个 cmd_* 函数里：单一插入点，新命令只要
+        # 进 opslog.RECORDED_OPS 就自动被覆盖，不会因为改了七八处漏掉一处。
+        # 只读命令不在那张表里，record() 会直接忽略。
+        op = _opslog_name(args)
         try:
+            if op:
+                from . import opslog
+
+                with opslog.timed(op, target=_opslog_target(args)):
+                    return cmd_func(args)
             return cmd_func(args)
         except KeyboardInterrupt:
             print("\n操作已取消")
