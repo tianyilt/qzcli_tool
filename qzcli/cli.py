@@ -7073,6 +7073,110 @@ def cmd_create(args):
     return 0
 
 
+def _devbox_render(display, report, dry_run=False):
+    """把 devbox 的结构化报告渲染成人话。本地和远端共用同一套渲染。"""
+    if report.get("error"):
+        display.print_error(report["error"])
+        return 1
+
+    if report.get("mode") == "init":
+        prefix = "[dry-run] " if dry_run or report.get("dry_run") else ""
+        display.print(f"{prefix}持久盘: {report.get('persist_root','')}")
+        for item in report["items"]:
+            line = f"  {item['name']:<14} {item.get('action', '')}"
+            counts = item.get("counts")
+            if counts:
+                line += (
+                    f"（持久 {counts['persist']} 条 + 本机 {counts['local']} 条"
+                    f" → 合并 {counts['merged']} 条）"
+                )
+            merge = item.get("merge")
+            if merge:
+                line += (
+                    f"（新增 {merge.get('copied', 0)}、"
+                    f"保留 {merge.get('kept_persist', 0)}、"
+                    f"替换 {merge.get('replaced', 0)}）"
+                )
+            if item.get("conflict"):
+                line += "  ⚠ 有冲突已备份"
+            if item.get("error"):
+                line += f"  ✗ {item['error']}"
+            display.print(line)
+
+        conflicts = [i for i in report["items"] if i.get("conflict") or (i.get("merge") or {}).get("conflicts")]
+        if conflicts:
+            display.print_warning(
+                f"有冲突文件已备份到 {report.get('conflict_dir','')}，"
+                "两边内容都在，请自行 diff 后取舍"
+            )
+        hist = report.get("histfile") or {}
+        for rc, state in hist.items():
+            display.print(f"  HISTFILE/{rc:<10} {state}")
+        return 0
+
+    # status 形态
+    display.print(f"home: {report.get('home','')}")
+    for item in report.get("items", []):
+        mark = "→ " + item["resolved"] if item.get("is_symlink") else ""
+        display.print(
+            f"  {item['name']:<14} {item['fs']:<14} "
+            f"{'软链' if item.get('is_symlink') else ('存在' if item.get('exists') else '缺失')} {mark}"
+        )
+    return 0
+
+
+def cmd_devbox(args):
+    """把开发机上易失的 dotfile / agent home 挪到持久盘。
+
+    ``target`` 与 ``qzcli exec <target>`` 是同一套契约（名称 / notebook_id / URL），
+    所以用户可以**直接粘一个 notebook URL**，不必先 ssh 进去。不传 target 就操作本机。
+
+    远端形态**一次往返**：把自包含脚本 base64 送过去跑完回传 JSON，而不是逐条 exec
+    （那个通道有超时史，多轮往返很容易半路断在中间状态）。
+    """
+    from . import devbox as devbox_mod
+
+    display = get_display()
+    action = getattr(args, "devbox_action", None) or "status"
+    target = getattr(args, "target", None)
+
+    if not target:
+        try:
+            if action == "status":
+                report = devbox_mod.status(home=None)
+            else:
+                root = devbox_mod.detect_persist_root(getattr(args, "target_dir", None))
+                report = devbox_mod.run(
+                    root,
+                    only=(getattr(args, "only", "") or "").split(",") or None,
+                    include_ssh=getattr(args, "include_ssh", False),
+                    dry_run=getattr(args, "dry_run", False),
+                )
+        except devbox_mod.DevboxError as exc:
+            display.print_error(str(exc))
+            return 1
+        return _devbox_render(display, report, getattr(args, "dry_run", False))
+
+    jupyter_info = _find_notebook_jupyter_info(target, display)
+    if jupyter_info is None:
+        return 1
+
+    opts = {}
+    if action != "status":
+        opts = {
+            "target_dir": getattr(args, "target_dir", None),
+            "only": [s for s in (getattr(args, "only", "") or "").split(",") if s],
+            "include_ssh": getattr(args, "include_ssh", False),
+            "dry_run": getattr(args, "dry_run", False),
+        }
+    cmd_str = devbox_mod.remote_command(action, **opts)
+
+    display.print(f"[dim]在开发机上执行 devbox {action}...[/dim]")
+    _exit_code, output = _exec_via_jupyter(jupyter_info, cmd_str, display, timeout=300)
+    report = devbox_mod.parse_remote_output(output)
+    return _devbox_render(display, report, getattr(args, "dry_run", False))
+
+
 def cmd_worker(args):
     """在分布式训练任务的 worker 容器里执行命令 / 做通信体检。
 
@@ -8741,6 +8845,31 @@ def main():
     _w_diag.add_argument("--instance", help="实例名；缺省用 <job_id>-worker-<index>")
     _w_diag.add_argument("--index", type=int, default=0, help="worker 序号（默认 0）")
 
+    devbox_parser = subparsers.add_parser(
+        "devbox", help="把开发机上易失的 dotfile / agent home 挪到持久盘"
+    )
+    devbox_sub = devbox_parser.add_subparsers(dest="devbox_action")
+
+    # target 与 `qzcli exec <target>` 是**同一套契约**（名字 / notebook_id / URL），
+    # 复用 _extract_notebook_id。不传 target = 操作本机。
+    _db_status = devbox_sub.add_parser("status", help="查看哪些路径已持久化（只读）")
+    _db_status.add_argument(
+        "target", nargs="?", help="开发机：名称 / notebook_id / URL；不传则查本机"
+    )
+
+    _db_init = devbox_sub.add_parser("init", help="持久化（可重复跑，重启后再跑会合并）")
+    _db_init.add_argument(
+        "target", nargs="?", help="开发机：名称 / notebook_id / URL；不传则操作本机"
+    )
+    _db_init.add_argument("--dry-run", action="store_true", help="只打印要做什么")
+    _db_init.add_argument("--only", help="只处理这些项，逗号分隔（如 claude,zsh_history）")
+    _db_init.add_argument("--target-dir", help="持久盘目录；不传则自动探测")
+    _db_init.add_argument(
+        "--include-ssh",
+        action="store_true",
+        help="连 .ssh 一起托管（默认不托管：个人持久目录同组可读）",
+    )
+
     hpc_parser = subparsers.add_parser("hpc", help="提交 HPC/CPU 任务到启智平台")
     hpc_parser.add_argument("--name", required=True, help="任务名称")
     hpc_parser.add_argument("--workspace", required=True, help="工作空间名称或 ID")
@@ -8867,6 +8996,7 @@ def main():
         "dashboard": cmd_dashboard,
         "create": cmd_create,
         "create-job": cmd_create,
+        "devbox": cmd_devbox,
         "worker": cmd_worker,
         "hpc": cmd_hpc,
         "hpc-usage": cmd_hpc_usage,
