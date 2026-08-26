@@ -793,6 +793,70 @@ class _QuietNoop:
         return lambda *a, **kw: None
 
 
+def _events_for_nodes(api, cookie, node_names, display, args):
+    """`qzcli events --node <名字>`：这台机器还能不能用。
+
+    输出刻意分成两栏：**现在有问题** 和 **曾经出过、已恢复**。
+
+    这个区分不是修辞。平台把 condition 的两个方向都记成事件
+    （``XIDIsUnhealthy`` 之后往往跟着 ``XIDIsHealthy``），只 grep "Unhealthy"
+    会把已经恢复的机器天天报成有病 —— 实测那 6 台生产机**每一台**都出现过
+    XID / GPFS / NotReady，全都已恢复。照着误报去 `--exclude-node`，
+    可用机器会被排到没有。
+    """
+    import json as _json
+
+    from . import nodeevents as _ne
+
+    events = api.get_node_events(node_names, cookie, page_size=200)
+    if getattr(args, "output_json", False):
+        print(_json.dumps(events, indent=2, ensure_ascii=False))
+        return 0
+
+    bad_nodes = []
+    for name in node_names:
+        mine = [e for e in events if e.get("node_name") == name]
+        diag = _ne.diagnose_node(mine)
+        exclude = _ne.should_exclude(diag)
+        if exclude:
+            bad_nodes.append(name)
+        mark = "[red]✗[/red]" if exclude else ("[yellow]![/yellow]" if diag["problems"] else "[green]✓[/green]")
+        display.print(f"\n{mark} [bold]{name}[/bold]  ({len(mine)} 条事件)")
+        if not mine:
+            display.print("  [dim]查不到事件记录 —— 可能是节点名写错了，"
+                          "也可能这台确实一直没出过状况[/dim]")
+            continue
+        display.print(f"  {_ne.verdict(diag)}")
+        for p in diag["problems"]:
+            # `p['at']` 已经是**毫秒**，别再乘 1000（第一版乘了，日期显示成 2 月）
+            when = _fmt_event_time(p["at"])
+            days = _ne.age_days(p)
+            if _ne.is_stale(p):
+                # 平台只在状态翻转时记事件，不保证记恢复。陈旧的未恢复记录
+                # 如实说清楚，不替用户下"现在坏着"的结论。
+                display.print(
+                    f"  [yellow]· {p['title']}[/yellow]（{p['reason']}，"
+                    f"最后一次 {when}，约 {days:.0f} 天前，之后没有恢复记录）"
+                )
+                display.print(
+                    "    [dim]年代久远：可能早就好了只是没记录，也可能一直没修。"
+                    "**不据此建议排除**，真撞上失败再回来看这条。[/dim]"
+                )
+            else:
+                display.print(
+                    f"  [red]· {p['title']}[/red]（{p['reason']}，{when}）"
+                )
+                display.print(f"    {p['advice']}")
+        if diag["recovered"]:
+            names = "、".join(f"{r['title']}" for r in diag["recovered"])
+            display.print(f"  [dim]· 曾经出过但已恢复：{names}[/dim]")
+
+    hint = _ne.exclude_hint(bad_nodes)
+    if hint:
+        display.print(f"\n[bold]提交时避开这些机器：[/bold]\n  {hint}")
+    return 0
+
+
 def cmd_events(args):
     """查看任务的平台事件（调度 / 抢占 / 拉镜像 / 失败诊断）。
 
@@ -807,6 +871,14 @@ def cmd_events(args):
     cookie = _get_cookie_value()
     if not cookie:
         display.print_error("未找到有效 cookie，请先 `qzcli login`")
+        return 1
+
+    # `--node` 走完全不同的一条路：问的是**机器**的健康，不是某个任务的遭遇。
+    if getattr(args, "node", None):
+        return _events_for_nodes(api, cookie, args.node, display, args)
+
+    if not job_id:
+        display.print_error("要么给一个任务 ID / 开发机，要么用 `--node <节点名>`")
         return 1
 
     # **开发机走另一条接口。** 训练任务是 train ListJobEvents，开发机是
@@ -8856,7 +8928,22 @@ def main():
     events_parser = subparsers.add_parser(
         "events", aliases=["ev"], help="查看任务平台事件（排队/调度/抢占诊断）"
     )
-    events_parser.add_argument("job_id", help="任务 ID")
+    events_parser.add_argument(
+        "job_id",
+        nargs="?",
+        help="任务 ID / 开发机（名字、notebook_id 或 URL）。用 --node 时可省略",
+    )
+    events_parser.add_argument(
+        "--node",
+        action="append",
+        metavar="节点名",
+        help=(
+            "查**机器自己**的健康事件（可重复）。这是平台上唯一按节点组织的事件源，"
+            "回答的是 `events <job>` 答不了的那个问题：**是不是这台机器本身有病**。"
+            "撞上「同一台机器反复失败」时用它；qzcli 早就有 --exclude-node，"
+            "但此前没有任何东西告诉你该排除谁"
+        ),
+    )
     events_parser.add_argument(
         "--reason", help="按 reason 子串过滤（大小写不敏感，如 Unschedulable）"
     )

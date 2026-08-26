@@ -1224,6 +1224,71 @@ class QzAPI:
         resp = self._request_v2("notebook", "ListNotebookEvents", body, cookie=cookie)
         return (resp or {}).get("list") or []
 
+    def get_node_events(
+        self,
+        node_names: List[str],
+        cookie: str = "",
+        page_size: int = 200,
+    ) -> List[Dict[str, Any]]:
+        """**机器自己**的健康事件（``cluster ListNodeEvents``）。
+
+        这是平台上唯一按**节点**而不是按工作负载组织的事件源。它回答的是
+        `qzcli events <job>` 答不了的那个问题：**「是不是这台机器本身有病？」**
+
+        实测能拿到的 reason：``XIDIsUnhealthy``（GPU 硬件错误）/
+        ``GPFSMountUnhealthy``（共享盘挂载坏）/ ``NodeNotReady`` /
+        ``NodeHasDiskPressure``，以及它们各自对应的恢复事件。
+
+        **注意参数形状**：过滤条件在 ``filter.node_names`` 这个嵌套数组里。
+        平顶层传 ``node_name`` 会被平台以
+        ``InvalidParameter: unknown field "node_name"`` 拒掉 —— 我按直觉试了
+        6 种平铺写法全被拒，翻 ``docs/api_spec_v2.md`` 才拿到正确形状。
+
+        返回原始事件列表，字段：``node_name`` / ``reason`` / ``message`` /
+        ``event_type`` / ``first_timestamp`` / ``last_timestamp``。
+
+        **逐台查，不一次性把 node_names 全塞进去。** 平台按总条数分页，一次问 5 台
+        只回 200 条时实测**只覆盖了前 2 台** —— 后 3 台一条事件都没有，于是被诊断成
+        「没发现异常记录」。那是**静默假阴性**：一台刚报过 XID 的机器会被判成健康。
+        逐台查每台都有自己的额度，慢一点，但结论是真的。
+        """
+        names = [n for n in (node_names or []) if n]
+        if not names:
+            return []
+        out: List[Dict[str, Any]] = []
+        for name in names:
+
+            def _page(n: int):
+                return self._request_v2(
+                    "cluster",
+                    "ListNodeEvents",
+                    {
+                        "filter": {"node_names": [name]},
+                        "PageNumber": n,
+                        "page_size": page_size,
+                    },
+                    cookie=cookie,
+                )
+
+            try:
+                resp = _page(1)
+                total = int((resp or {}).get("total") or 0)
+                # **必须取最后一页。** 平台按时间**升序**返回（实测：第 1 条是
+                # 1 月的、最后一条是 8 月的）。一台机器 total=222、page_size=200
+                # 时，第 1 页给的是**最旧的 200 条，丢掉最新的 22 条** —— 而我们
+                # 要判断的恰恰是"现在健不健康"。用旧数据下结论会把昨天刚坏的机器
+                # 判成健康，是这个功能最坏的失败方式。
+                if total > page_size:
+                    last_page = -(-total // page_size)  # ceil
+                    resp = _page(last_page)
+            except QzAPIError as exc:
+                # 单台查失败不该让整批没结果 —— 但**必须留痕**，否则这台会和
+                # "真的没有事件" 长得一模一样。
+                swallowed(f"nodeevents/{name}", exc)
+                continue
+            out.extend((resp or {}).get("events") or [])
+        return out
+
     def get_job_instance_events_with_cookie(
         self,
         job_id: str,
