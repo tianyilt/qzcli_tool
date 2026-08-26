@@ -573,8 +573,8 @@
       "service": "train",
       "action": "GetJobWorkdir",
       "request_body": {
-        "workspace_id": "ws-8207e9e2-<redacted>",
-        "project_id": "project-c67c548f-<redacted>"
+        "workspace_id": "ws-<redacted>",
+        "project_id": "project-<redacted>"
       },
       "status": 200,
       "content_type": "application/json; charset=utf-8",
@@ -637,7 +637,7 @@
       "service": "train",
       "action": "ListPreCheckItems",
       "request_body": {
-        "logic_compute_group_id": "lcg-2e7c3207-<redacted>"
+        "logic_compute_group_id": "lcg-<redacted>"
       },
       "status": 200,
       "content_type": "application/json; charset=utf-8",
@@ -688,7 +688,7 @@
       "service": "workspace",
       "action": "GetBasicInfo",
       "request_body": {
-        "workspace_id": "ws-8207e9e2-<redacted>"
+        "workspace_id": "ws-<redacted>"
       },
       "status": 200,
       "content_type": "application/json; charset=utf-8",
@@ -762,7 +762,7 @@
       "service": "workspace",
       "action": "GetLogicComputeGroupNodeSpecs",
       "request_body": {
-        "logic_compute_group_id": "lcg-2e7c3207-<redacted>"
+        "logic_compute_group_id": "lcg-<redacted>"
       },
       "status": 200,
       "content_type": "application/json; charset=utf-8",
@@ -773,7 +773,7 @@
       "service": "workspace",
       "action": "GetLogicComputeGroupResource",
       "request_body": {
-        "logic_compute_group_id": "lcg-2e7c3207-<redacted>"
+        "logic_compute_group_id": "lcg-<redacted>"
       },
       "status": 200,
       "content_type": "application/json; charset=utf-8",

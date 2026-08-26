@@ -7108,7 +7108,7 @@ def cmd_create(args):
     # --- Submit ---
     # 平台 Web UI 已把作业创建迁到 v2 Console API
     # (/api/v2/train?Action=CreateJobConsole)，payload 结构与 v1 一致。已真机验证 v2
-    # create 可正常创建作业(job-1434c06e 提交并停止成功)，故默认走 create_job_v2；
+    # create 可正常创建作业(真机提交并停止成功)，故默认走 create_job_v2；
     # 老 v1 create_job_with_cookie 保留作回退。无 cookie 时退老 openapi token path。
     # 注：exclude_nodes 需 workspace 级启用，未启用的空间平台会报
     # "exclude_nodes not enable in workspace"(如 分布式训练空间)。

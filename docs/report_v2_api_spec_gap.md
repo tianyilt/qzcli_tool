@@ -83,7 +83,7 @@
 
 ```
 POST /api/v2/project?Action=GetProjectBudgetUsageOverview
-  {"project_id": "project-7e0957fb-…", "workspace_id": "ws-8207e9e2-…"}
+  {"project_id": "project-<redacted>", "workspace_id": "ws-<redacted>"}
 → {"total":"10,103,676.00", "used":"7,825,893.97", "remain":"2,277,781.34",
    "train":"7,032,724.92", "inference":"793,169.06", "storage":"0.00"}
 
@@ -131,7 +131,7 @@ GetAuditDetail          GetAuditList            GetSecurityShareList
 
 | 传入 | 返回 |
 |---|---|
-| `project-7e0957fb-…`（真实 uuid） | `InvalidParameter: 项目不存在` |
+| `project-<redacted>`（真实 uuid） | `InvalidParameter: 项目不存在` |
 | `video-generation`（en_name） | 通过 acceptor 校验，进入下一道 |
 
 建议：要么改名为 `acceptor_name`，要么同时接受 uuid。
@@ -162,7 +162,7 @@ GetAuditDetail          GetAuditList            GetSecurityShareList
 POST /api/v2/audit?Action=ApplySecurityAudit
   {"acceptor_type":"project","share_type":"mount","acceptor_id":"test-regression",
    "file_path":"/inspire/ssd/project/exploration-topic/public/yrmou/data-mostar-all",
-   "workspace_id":"ws-6e6ba362-…"}
+   "workspace_id":"ws-<redacted>"}
 → AccessForbidden: user is not share project member
 ```
 

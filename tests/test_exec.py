@@ -15,7 +15,7 @@ from qzcli.cli import (
 )
 
 UUID_REAL = "cfe43e55-e7a1-484a-898c-695596b0877b"
-WS_ID = "ws-9dcc0e1f-80a4-4af2-bc2f-0e352e7b17e6"
+WS_ID = "ws-11111111-1111-4111-8111-111111111111"
 
 
 class ExtractNotebookIdTests(unittest.TestCase):
@@ -49,8 +49,8 @@ class ExtractNotebookIdTests(unittest.TestCase):
 
     def test_full_jupyter_url(self):
         url = (
-            "https://ai-notebook-inspire.sii.edu.cn/ws-9dcc0e1f/"
-            "project-7e0957fb/user-ef4936dd/"
+            "https://ai-notebook-inspire.sii.edu.cn/ws-11111111/"
+            "project-44444444/user-55555555/"
             f"jupyter/{UUID_REAL}/80f78fda/lab?token=80f78fda"
         )
         self.assertEqual(_extract_notebook_id(url), UUID_REAL)
@@ -202,8 +202,8 @@ class DetectUserIdFromProbeTests(unittest.TestCase):
     """`_detect_user_id_from_probe` must match by login_name, not 'first job'."""
 
     USERNAME = "253208120278"
-    MY_UID = "user-ef4936dd-0231-4485-ba30-34e92bf3ea53"
-    OTHER_UID = "user-d5360991-3c99-4e2f-b9be-44f8dd56e817"
+    MY_UID = "user-55555555-0231-4485-ba30-34e92bf3ea53"
+    OTHER_UID = "user-66666666-6666-4666-8666-666666666666"
 
     def _job(self, login_name, uid):
         return {

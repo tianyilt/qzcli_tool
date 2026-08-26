@@ -46,11 +46,15 @@ _REDACT_RE = re.compile(rf"\b((?:ws|project|lcg|cg|job|user|nb)-)?({_UUID})\b", 
 
 
 def redact(obj: Any) -> Any:
-    """递归给 ID 打码：``ws-8207e9e2-...`` → ``ws-8207e9e2-<redacted>``。"""
+    """递归给 ID 打码：``ws-1234abcd-5678-...`` → ``ws-<redacted>``。
+
+    **十六进制一位都不留。** 第一版留了前 8 位（``ws-1234abcd-<redacted>``），
+    以为「只是前缀、认不出来」—— 错了：平台 ID 的前 8 位在全平台唯一，等于没打码，
+    照样能反查到是哪个空间。这份产物进的是 public 仓库，所以这里只保留**类型**
+    （是 ws 还是 lcg），标识位全丢掉。
+    """
     if isinstance(obj, str):
-        return _REDACT_RE.sub(
-            lambda m: f"{m.group(1) or ''}{m.group(2)[:8]}-<redacted>", obj
-        )
+        return _REDACT_RE.sub(lambda m: f"{m.group(1) or ''}<redacted>", obj)
     if isinstance(obj, dict):
         return {k: redact(v) for k, v in obj.items()}
     if isinstance(obj, list):

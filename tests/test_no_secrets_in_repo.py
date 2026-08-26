@@ -151,5 +151,101 @@ class NoSecretsInRepoTests(unittest.TestCase):
                 self.fail(f"占位值被 {label} 误报: {m.group(1)}")
 
 
+#: 内部项目名 / 分区名。**这个仓库是 public 的**，这些名字对外等于组织架构情报。
+_INTERNAL_NAMES = (
+    "情境智能",
+    "MOSS-VL",
+    "MOVA2.0",
+    "纯交付",
+    "infra-debug",
+    "ncu-debug",
+)
+
+#: 平台资源 ID 的形状。**十六进制一位都不能留** —— 前 8 位在全平台唯一，
+#: 留着等于没打码（第一版 ``redact()`` 就是这么漏的：``ws-8207e9e2-<redacted>``）。
+_REAL_ID_RE = re.compile(r"\b(ws|project|lcg|cg|user|nb)-([0-9a-f]{8})\b", re.I)
+
+#: 明显编造的占位 ID：同一个字符重复，或 1234abcd 这种键盘序。
+_FAKE_ID_RE = re.compile(r"^(?:(.)\1{7}|1234abcd|0*)$", re.I)
+
+
+class NoInternalIdentifiersTests(unittest.TestCase):
+    """public 仓库里不许出现内部项目名和真实资源 ID。
+
+    ## 为什么单独立一条
+
+    2026-08-26 我做过一轮"清掉内部空间名"，报的是 6 处 → 0。**一天后复查，
+    同一个仓库里还留着 5 处** —— 那轮只按字面名字 grep，漏了：
+
+    1. 空间 **ID**（`ws-8207e9e2-…`）—— 名字清了，ID 还在，一样能反查
+    2. `redact()` 自己：它把 UUID 打码成 `ws-8207e9e2-<redacted>`，**保留了前 8 位**。
+       写的时候觉得"只是前缀"，实际前 8 位全平台唯一，等于没打
+    3. 测试 docstring 里的分区名（`MOVA2.0纯交付分区`）—— 不在源码，在注释里
+
+    共同点是：**靠人 grep 一遍就宣布干净，下次照样漏。** 所以这里钉成测试。
+
+    这条只看工作区，拦不住 git 历史和 commit message（本仓历史里确实还有，
+    需要另行处置）—— 但至少能保证"从今天起不再新增"。
+    """
+
+    def _tracked_text(self):
+        for path in _tracked_files():
+            if path.name == pathlib.Path(__file__).name:
+                continue  # 本文件写着这些词本身
+            try:
+                yield path, path.read_text(encoding="utf-8", errors="ignore")
+            except OSError:
+                continue
+
+    def test_no_internal_project_names(self):
+        offenders = [
+            f"{path.relative_to(REPO)}:{text[: text.index(name)].count(chr(10)) + 1}  {name}"
+            for path, text in self._tracked_text()
+            for name in _INTERNAL_NAMES
+            if name in text
+        ]
+        self.assertEqual(
+            offenders,
+            [],
+            "public 仓库里出现内部项目名：\n  "
+            + "\n  ".join(offenders)
+            + "\n\n举例统一用「分布式空间」这类通用说法。",
+        )
+
+    def test_no_real_platform_ids(self):
+        offenders = []
+        for path, text in self._tracked_text():
+            for m in _REAL_ID_RE.finditer(text):
+                if _FAKE_ID_RE.match(m.group(2)):
+                    continue
+                line = text[: m.start()].count("\n") + 1
+                offenders.append(f"{path.relative_to(REPO)}:{line}  {m.group(0)}")
+        self.assertEqual(
+            offenders,
+            [],
+            "public 仓库里出现真实平台资源 ID：\n  "
+            + "\n  ".join(offenders)
+            + "\n\n换成明显编造的（如 ws-11111111-1111-4111-8111-111111111111）。",
+        )
+
+    def test_the_check_would_have_caught_the_half_redaction(self):
+        """自检：喂**上次真漏掉的那个形状**，必须被抓到。
+
+        不是"我想象中的泄漏"，是实际躺在 docs/v2_probe_raw.json 里那行。
+        """
+        half = '"workspace_id": "ws-8207e9e2-<redacted>"'
+        self.assertIsNotNone(_REAL_ID_RE.search(half))
+        self.assertIsNone(_FAKE_ID_RE.match("8207e9e2"))
+
+    def test_fake_ids_are_not_flagged(self):
+        """对照：占位 ID 不该被报，否则大家会学会忽略这条测试。"""
+        for fake in ("ws-11111111", "lcg-22222222", "project-44444444", "ws-1234abcd"):
+            m = _REAL_ID_RE.search(fake)
+            self.assertIsNotNone(m, fake)
+            self.assertIsNotNone(
+                _FAKE_ID_RE.match(m.group(2)), f"{fake} 被误报成真 ID"
+            )
+
+
 if __name__ == "__main__":
     unittest.main()

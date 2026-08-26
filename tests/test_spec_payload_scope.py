@@ -7,7 +7,7 @@
 计算组缓存过，就会把那边的 ``gpu_type`` 一起带进 payload。
 
 实测：向「训练区-H200-1号机房」提交，缓存里那条 8卡160核 记录的
-``logic_compute_group_ids`` 是 ``['lcg-79b2ad0e-…']``（开发区-H100-183核），
+``logic_compute_group_ids`` 是 ``['lcg-22222222-…']``（某 H100 计算组），
 于是 payload 里的 ``gpu_type`` 成了 ``NVIDIA_H100_SXM_80G``，
 而该组 180 个节点全是 ``NVIDIA_H200_SXM_141G``。
 
