@@ -499,6 +499,38 @@ def _recent_relogin_failure():
     return None
 
 
+def describe_credential_block():
+    """被凭据类封锁时该告诉用户什么。
+
+    以前这里只说「请先解决登录问题再重试」—— **没说怎么解决**，于是所有人（包括
+    我自己和同事）都以为要「等一会儿再试」。**等是没用的**：凭据类封锁不看时间
+    （见 ``_recent_relogin_failure`` 里那两处 ``is_credential_failure`` 判据，
+    没有任何时间比较），文件放一年也还在。唯一能清掉它的是一次成功的
+    ``qzcli login``（``cmd_login`` 故意绕过封锁，成功后 ``_clear_relogin_failure``
+    删掉记录）。
+
+    所以这段话必须同时给出三件事：等待无效、确切的恢复命令、记录文件在哪。
+    """
+    at = ""
+    try:
+        raw = _cooldown_path().read_text(encoding="utf-8")
+        at_str, _, _msg = raw.partition("\n")
+        at = _time.strftime(
+            "%Y-%m-%d %H:%M:%S", _time.localtime(float(at_str))
+        )
+    except (OSError, ValueError):
+        pass
+
+    when = f"（记于 {at}）" if at else ""
+    return (
+        f"已阻止本次并发请求：账号处于锁定/凭据失效状态时继续重试，"
+        f"只会让 CAS 把锁定期拖得更长。\n"
+        f"  这条封锁是**本地永久记录**{when}，不会随时间自动解除 —— 等待无效。\n"
+        f"  平台账号解锁后，跑一次 `qzcli login` 即可恢复（成功会自动清掉这条记录）。\n"
+        f"  记录文件：{_cooldown_path()}"
+    )
+
+
 def _record_relogin_failure(message):
     now = _time.time()
     with _relogin_failure_lock:
@@ -674,11 +706,7 @@ class QzAPI:
         """
         blocked = _recent_relogin_failure()
         if blocked is not None and is_credential_failure(blocked):
-            raise QzAPIError(
-                f"{blocked}\n"
-                "已阻止本次并发请求：账号处于锁定/凭据失效状态时继续重试，"
-                "只会让 CAS 把锁定期拖得更长。请先解决登录问题再重试。"
-            )
+            raise QzAPIError(f"{blocked}\n{describe_credential_block()}")
         candidate = cookie or (get_cookie() or {}).get("cookie", "")
         if probe:
             try:

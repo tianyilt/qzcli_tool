@@ -1445,7 +1445,27 @@ def cmd_workspaces(args):
             ws_name = pending_name or (
                 cached_resources.get("name", "") if cached_resources else ""
             )
-            save_resources(workspace_id, resources, ws_name)
+            # **拉到空就不许覆盖非空缓存。**
+            #
+            # _collect_workspace_resources_from_live_apis 在鉴权失败时会把 API 错误
+            # 吞成空列表（见那边的 diag.swallowed 注释），于是这行会把一份好端端的
+            # 缓存写成 0 个 compute_groups / 0 个 projects。2026-08-16 真发生过：
+            # 账号锁定期间跑了一次 `qzcli res -w 分布式训练空间 -u`，那个工作空间的
+            # 缓存被清空，后续所有命令报「未找到计算组」，看着像平台改了名。
+            #
+            # 并行路径（本函数上面那支）早就有守卫（`if not result["ok"]: continue`），
+            # 只有这条单工作空间路径漏了。
+            if _resources_look_empty(resources) and not _resources_look_empty(
+                cached_resources
+            ):
+                display.print_warning(
+                    f"刷新没拿到任何计算组/项目（多半是登录态失效或被限流），"
+                    f"**保留原缓存不覆盖**。原缓存里有 "
+                    f"{len((cached_resources or {}).get('compute_groups') or {})} 个计算组。"
+                )
+                display.print("[dim]先解决登录问题再重试：qzcli login[/dim]")
+            else:
+                save_resources(workspace_id, resources, ws_name)
             display.print_success("资源配置已保存到本地缓存")
 
             display.print(
@@ -3634,8 +3654,12 @@ def _collect_workspace_resources_from_live_apis(
             resources["projects"] = _merge_resource_lists(
                 resources.get("projects", []), task_projects
             )
-        except QzAPIError:
-            pass
+        except QzAPIError as exc:
+            # 原来是裸 `pass`。后果是鉴权失败被吞成「拉到 0 个项目」，调用方分不清
+            # 「这个空间真没项目」和「我根本没拉到」，再往下就把空结果写回缓存，
+            # 把好数据冲掉（2026-08-16 真发生过）。现在至少留痕，
+            # 调用方也改成「拉到空就不覆盖非空缓存」。
+            swallowed("res/拉取任务维度项目", exc)
 
     cluster_info_failed = False
     try:
@@ -7073,6 +7097,243 @@ def cmd_create(args):
     return 0
 
 
+def cmd_ops(args):
+    """查看操作日志。
+
+    ``--merge`` 是为查锁号这类问题准备的：本机 ``~/.qzcli``、开发机上的、以及
+    项目组冻结版各写各的日志，只看一份会漏掉「另一边在同一时刻也登了一次」。
+    """
+    from . import opslog
+
+    display = get_display()
+    rows = opslog.read(op=getattr(args, "op", None), since_hours=getattr(args, "since", None))
+    seen_paths = [str(opslog.log_path())]
+    for extra in getattr(args, "merge", []) or []:
+        p = Path(extra).expanduser()
+        if p.is_dir():
+            p = p / opslog.LOG_NAME
+        rows += opslog.read(p, op=getattr(args, "op", None), since_hours=getattr(args, "since", None))
+        seen_paths.append(str(p))
+
+    rows.sort(key=lambda r: r.get("ts_utc", ""))
+    if not rows:
+        display.print(f"没有记录。日志位置: {'、'.join(seen_paths)}")
+        display.print("[dim]只读命令（list/status/avail/usage）刻意不记，所以空是正常的[/dim]")
+        return 0
+
+    display.print(f"共 {len(rows)} 条（来自 {len(seen_paths)} 份日志）\n")
+    for r in rows:
+        mark = "✓" if r.get("outcome") == "ok" else "✗"
+        dur = f" {r['duration_ms']}ms" if r.get("duration_ms") is not None else ""
+        tgt = f"  {r['target']}" if r.get("target") else ""
+        err = f"  [{r['err_class']}]" if r.get("err_class") else ""
+        display.print(
+            f"  {r.get('ts_utc','')}  {mark} {r.get('op',''):<12}"
+            f" pid={r.get('pid','?'):<7} {r.get('host','')[:24]}{tgt}{err}{dur}"
+        )
+    return 0
+
+
+def _opslog_name(args):
+    """把「子命令 + 参数」映射成操作日志里的 op 名。
+
+    多数命令直接用子命令名；三个例外是因为**同一个子命令有只读和有副作用两种形态**，
+    只有后者值得记：
+
+    - ``res`` 只读，但 ``res -u`` 会覆盖本地缓存（已知它在鉴权失败时会把缓存清空）
+    - ``worker exec`` 是远程执行，``worker diag`` 只读
+    - ``devbox status`` 只读，``devbox init`` 会动文件
+    """
+    cmd = getattr(args, "command", "") or ""
+    if cmd in ("res", "resources"):
+        return "res-update" if getattr(args, "update", False) else ""
+    if cmd == "worker":
+        return "worker-exec" if getattr(args, "worker_action", "") == "exec" else ""
+    if cmd == "devbox":
+        return "devbox-init" if getattr(args, "devbox_action", "") == "init" else ""
+    return cmd
+
+
+def _opslog_target(args):
+    """操作对象，便于回溯「是哪个任务/哪台机器」。挑第一个非空的，不拼长串。"""
+    for attr in ("job_id", "name", "target", "host", "notebook_id", "workspace"):
+        val = getattr(args, attr, None)
+        if isinstance(val, str) and val:
+            return val[:120]
+    return ""
+
+
+def _devbox_render(display, report, dry_run=False):
+    """把 devbox 的结构化报告渲染成人话。本地和远端共用同一套渲染。"""
+    if report.get("error"):
+        display.print_error(report["error"])
+        return 1
+
+    if report.get("mode") == "init":
+        prefix = "[dry-run] " if dry_run or report.get("dry_run") else ""
+        display.print(f"{prefix}持久盘: {report.get('persist_root','')}")
+        for item in report["items"]:
+            line = f"  {item['name']:<14} {item.get('action', '')}"
+            counts = item.get("counts")
+            if counts:
+                line += (
+                    f"（持久 {counts['persist']} 条 + 本机 {counts['local']} 条"
+                    f" → 合并 {counts['merged']} 条）"
+                )
+            merge = item.get("merge")
+            if merge:
+                line += (
+                    f"（新增 {merge.get('copied', 0)}、"
+                    f"保留 {merge.get('kept_persist', 0)}、"
+                    f"替换 {merge.get('replaced', 0)}）"
+                )
+            if item.get("conflict"):
+                line += "  ⚠ 有冲突已备份"
+            if item.get("error"):
+                line += f"  ✗ {item['error']}"
+            display.print(line)
+
+        conflicts = [i for i in report["items"] if i.get("conflict") or (i.get("merge") or {}).get("conflicts")]
+        if conflicts:
+            display.print_warning(
+                f"有冲突文件已备份到 {report.get('conflict_dir','')}，"
+                "两边内容都在，请自行 diff 后取舍"
+            )
+        hist = report.get("histfile") or {}
+        for rc, state in hist.items():
+            display.print(f"  HISTFILE/{rc:<10} {state}")
+        return 0
+
+    # status 形态
+    display.print(f"home: {report.get('home','')}")
+    for item in report.get("items", []):
+        mark = "→ " + item["resolved"] if item.get("is_symlink") else ""
+        display.print(
+            f"  {item['name']:<14} {item['fs']:<14} "
+            f"{'软链' if item.get('is_symlink') else ('存在' if item.get('exists') else '缺失')} {mark}"
+        )
+    return 0
+
+
+def _resources_look_empty(resources):
+    """这份资源结果是不是「什么都没拉到」。
+
+    判据只看 compute_groups 和 projects —— specs 在 quick 模式下本来就是空的，
+    拿它当判据会把正常的 quick 刷新误判成失败。
+    """
+    if not resources:
+        return True
+    for key in ("compute_groups", "projects"):
+        val = resources.get(key)
+        if val:
+            return False
+    return True
+
+
+def _upload_remote_script(jupyter_info, script_text, display):
+    """把一段脚本经 Contents API 传到开发机，返回远端绝对路径（失败返回 ``""``）。
+
+    为什么不直接把脚本当命令发：devbox 的自包含脚本约 18 KB，base64 之后接近
+    30 KB，**PTY 塞不下这么长的命令行**——实测远端一声不吭、什么都不返回。
+    ``exec`` 自己回传输出用的就是 Contents API，这里复用同一条通道。
+
+    落点是 ``_qzcli`` 这个 Contents API 中转目录（symlink 指向 ``/tmp/.qzcli``），
+    先跑一条空命令保证它被建出来，再 PUT。
+    """
+    import base64 as _b64
+
+    base_http = jupyter_info["base_url"]
+    token = jupyter_info["token"]
+    headers = {"authorization": f"token {token}", "content-type": "application/json"}
+
+    # 借一次 exec 把 _qzcli -> /tmp/.qzcli 的中转目录和 symlink 建出来
+    _exec_via_jupyter(jupyter_info, "true", display, timeout=60)
+
+    name = f"devbox_{uuid.uuid4().hex[:8]}.py"
+    try:
+        resp = requests.put(
+            f"{base_http}/api/contents/_qzcli/{name}",
+            headers=headers,
+            json={
+                "type": "file",
+                "format": "base64",
+                "content": _b64.b64encode(script_text.encode("utf-8")).decode(),
+            },
+            timeout=60,
+        )
+        if resp.status_code >= 400:
+            display.print_error(
+                f"上传脚本失败：HTTP {resp.status_code} {resp.text[:120]}"
+            )
+            return ""
+    except requests.RequestException as exc:
+        display.print_error(f"上传脚本失败：{type(exc).__name__}: {exc}")
+        return ""
+    return f"/tmp/.qzcli/{name}"
+
+
+def cmd_devbox(args):
+    """把开发机上易失的 dotfile / agent home 挪到持久盘。
+
+    ``target`` 与 ``qzcli exec <target>`` 是同一套契约（名称 / notebook_id / URL），
+    所以用户可以**直接粘一个 notebook URL**，不必先 ssh 进去。不传 target 就操作本机。
+
+    远端形态**一次往返**：把自包含脚本 base64 送过去跑完回传 JSON，而不是逐条 exec
+    （那个通道有超时史，多轮往返很容易半路断在中间状态）。
+    """
+    from . import devbox as devbox_mod
+
+    display = get_display()
+    action = getattr(args, "devbox_action", None) or "status"
+    target = getattr(args, "target", None)
+
+    if not target:
+        try:
+            if action == "status":
+                report = devbox_mod.status(home=None)
+            else:
+                root = devbox_mod.detect_persist_root(getattr(args, "target_dir", None))
+                report = devbox_mod.run(
+                    root,
+                    only=(getattr(args, "only", "") or "").split(",") or None,
+                    include_ssh=getattr(args, "include_ssh", False),
+                    dry_run=getattr(args, "dry_run", False),
+                )
+        except devbox_mod.DevboxError as exc:
+            display.print_error(str(exc))
+            return 1
+        return _devbox_render(display, report, getattr(args, "dry_run", False))
+
+    jupyter_info = _find_notebook_jupyter_info(target, display)
+    if jupyter_info is None:
+        return 1
+
+    opts = {}
+    if action != "status":
+        opts = {
+            "target_dir": getattr(args, "target_dir", None),
+            "only": [s for s in (getattr(args, "only", "") or "").split(",") if s],
+            "include_ssh": getattr(args, "include_ssh", False),
+            "dry_run": getattr(args, "dry_run", False),
+        }
+
+    # 脚本走 **Contents API 上传成文件**，而不是塞进命令行。
+    # 第一版把整段 base64 当命令发，实测 29920 字节 —— PTY 根本吃不下，
+    # 远端一声不吭什么都不回。exec 自己传输出文件用的就是 Contents API，
+    # 这里复用同一条通道。
+    script = devbox_mod.build_remote_script(action, **opts)
+    remote_path = _upload_remote_script(jupyter_info, script, display)
+    if not remote_path:
+        return 1
+
+    display.print(f"[dim]在开发机上执行 devbox {action}...[/dim]")
+    _exit_code, output = _exec_via_jupyter(
+        jupyter_info, f"python3 {remote_path}", display, timeout=300
+    )
+    report = devbox_mod.parse_remote_output(output)
+    return _devbox_render(display, report, getattr(args, "dry_run", False))
+
+
 def cmd_worker(args):
     """在分布式训练任务的 worker 容器里执行命令 / 做通信体检。
 
@@ -8741,6 +9002,44 @@ def main():
     _w_diag.add_argument("--instance", help="实例名；缺省用 <job_id>-worker-<index>")
     _w_diag.add_argument("--index", type=int, default=0, help="worker 序号（默认 0）")
 
+    devbox_parser = subparsers.add_parser(
+        "devbox", help="把开发机上易失的 dotfile / agent home 挪到持久盘"
+    )
+    devbox_sub = devbox_parser.add_subparsers(dest="devbox_action")
+
+    # target 与 `qzcli exec <target>` 是**同一套契约**（名字 / notebook_id / URL），
+    # 复用 _extract_notebook_id。不传 target = 操作本机。
+    _db_status = devbox_sub.add_parser("status", help="查看哪些路径已持久化（只读）")
+    _db_status.add_argument(
+        "target", nargs="?", help="开发机：名称 / notebook_id / URL；不传则查本机"
+    )
+
+    _db_init = devbox_sub.add_parser("init", help="持久化（可重复跑，重启后再跑会合并）")
+    _db_init.add_argument(
+        "target", nargs="?", help="开发机：名称 / notebook_id / URL；不传则操作本机"
+    )
+    _db_init.add_argument("--dry-run", action="store_true", help="只打印要做什么")
+    _db_init.add_argument("--only", help="只处理这些项，逗号分隔（如 claude,zsh_history）")
+    _db_init.add_argument("--target-dir", help="持久盘目录；不传则自动探测")
+    _db_init.add_argument(
+        "--include-ssh",
+        action="store_true",
+        help="连 .ssh 一起托管（默认不托管：个人持久目录同组可读）",
+    )
+
+    ops_parser = subparsers.add_parser(
+        "ops", help="查看操作日志（提交/停止/登录/远程执行等有副作用的操作）"
+    )
+    ops_parser.add_argument("--op", help="只看某一类操作，如 create / login")
+    ops_parser.add_argument("--since", type=float, help="只看最近 N 小时")
+    ops_parser.add_argument(
+        "--merge",
+        action="append",
+        default=[],
+        help="额外并入其它 home 的日志（可多次给）。三份 home 各写各的，"
+        "查锁号这类问题要合起来看时间线",
+    )
+
     hpc_parser = subparsers.add_parser("hpc", help="提交 HPC/CPU 任务到启智平台")
     hpc_parser.add_argument("--name", required=True, help="任务名称")
     hpc_parser.add_argument("--workspace", required=True, help="工作空间名称或 ID")
@@ -8867,6 +9166,8 @@ def main():
         "dashboard": cmd_dashboard,
         "create": cmd_create,
         "create-job": cmd_create,
+        "devbox": cmd_devbox,
+        "ops": cmd_ops,
         "worker": cmd_worker,
         "hpc": cmd_hpc,
         "hpc-usage": cmd_hpc_usage,
@@ -8875,7 +9176,16 @@ def main():
 
     cmd_func = commands.get(args.command)
     if cmd_func:
+        # 操作日志挂在**分发点**而不是逐个 cmd_* 函数里：单一插入点，新命令只要
+        # 进 opslog.RECORDED_OPS 就自动被覆盖，不会因为改了七八处漏掉一处。
+        # 只读命令不在那张表里，record() 会直接忽略。
+        op = _opslog_name(args)
         try:
+            if op:
+                from . import opslog
+
+                with opslog.timed(op, target=_opslog_target(args)):
+                    return cmd_func(args)
             return cmd_func(args)
         except KeyboardInterrupt:
             print("\n操作已取消")
