@@ -51,6 +51,7 @@ from .config import (
     update_workspace_compute_groups,
     update_workspace_projects,
 )
+from . import priority as _priority
 from .diag import last_reason, swallowed
 from .display import get_display
 from .store import JobRecord, get_store
@@ -6765,6 +6766,24 @@ def cmd_dashboard(args):
         return 0
 
 
+
+def _spec_gpu_count(spec_id):
+    """尽力从本地缓存拿这个规格的 GPU 数，只用于把报错说得具体一点。
+
+    **拿不到就返回 None**，绝不能因为它让提交流程报错 —— 它只是文案里的一个数字。
+    """
+    if not spec_id:
+        return None
+    try:
+        for ws in (load_all_resources() or {}).values():
+            spec = (ws.get("specs") or {}).get(spec_id)
+            if spec:
+                return spec.get("gpu_count")
+    except Exception:  # noqa: BLE001
+        swallowed("create/查规格卡数", RuntimeError("spec lookup failed"))
+    return None
+
+
 def cmd_create(args):
     """创建任务"""
     display = get_display()
@@ -7122,6 +7141,17 @@ def cmd_create(args):
     # 老 v1 create_job_with_cookie 保留作回退。无 cookie 时退老 openapi token path。
     # 注：exclude_nodes 需 workspace 级启用，未启用的空间平台会报
     # "exclude_nodes not enable in workspace"(如 分布式训练空间)。
+    # 提交前：这个（空间, 规格, 优先级）组合上次被平台拒过吗？
+    #
+    # **只拦已知被拒的组合，没见过的一律放行。** 反过来做（维护一张"允许"白名单）
+    # 会把平台后来放开的组合永久挡在门外 —— 而允许范围我们根本读不到，
+    # 白名单从第一天起就是错的。
+    if not getattr(args, "force_priority", False):
+        known = _priority.known_rejection(workspace_id, spec_id, args.priority)
+        if known:
+            display.print_error(_priority.explain_known(known, cg_display))
+            return 1
+
     try:
         cookie_data = get_cookie()
         if cookie_data and cookie_data.get("cookie"):
@@ -7129,6 +7159,23 @@ def cmd_create(args):
         else:
             result = api.create_job(payload)
     except QzAPIError as e:
+        # 「优先级不在该资源规格允许的范围内」原样抛给用户等于没说 —— 他不知道
+        # 该改什么。翻译成下一步，并记住这次拒绝供下次提前拦。
+        if _priority.is_priority_rejection(str(e)):
+            _priority.remember_rejection(
+                workspace_id, spec_id, args.priority, _spec_gpu_count(spec_id)
+            )
+            display.print_error(
+                "任务创建失败：优先级不被这个资源规格接受\n\n"
+                + _priority.explain(
+                    workspace_id,
+                    spec_id,
+                    args.priority,
+                    _spec_gpu_count(spec_id),
+                    cg_display,
+                )
+            )
+            return 1
         display.print_error(f"任务创建失败: {e}")
         return 1
 
@@ -9106,6 +9153,15 @@ def main():
         "--priority",
         type=int,
         help=f"任务优先级 1-10，**数字越小越低优**（默认 {DEFAULT_CREATE_PRIORITY}=LOW；10 是最高优，会和生产任务抢卡）",
+    )
+    create_parser.add_argument(
+        "--force-priority",
+        action="store_true",
+        help=(
+            "跳过「这个规格上次拒过这个优先级」的本地拦截。平台**逐个规格行**限制"
+            "可用优先级，且允许范围没有任何接口能读，所以 qzcli 只能记住真实被拒过的"
+            "组合。确认平台已放开时用这个绕过"
+        ),
     )
     create_parser.add_argument(
         "--framework", help=f"框架类型（默认 {DEFAULT_CREATE_FRAMEWORK}）"
