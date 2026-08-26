@@ -1105,6 +1105,9 @@ def main() -> int:
                     None,
                 )
 
+            # 注意：**不能给 ws 赋值**。函数里一旦有 `ws = ...`，Python 就把 ws
+            # 当成局部变量，前面读它时直接 UnboundLocalError（改这段时踩过）。
+            # 所以另起一个名字，提交时显式用它。
             hpc_ws, sample = ws, _hpc_sample(ws)
             if sample is None:
                 for wid, wsinfo in (load_all_resources() or {}).items():
@@ -1113,8 +1116,10 @@ def main() -> int:
                     cand = _hpc_sample(wid)
                     if cand is not None:
                         hpc_ws, sample = wid, cand
+                        # **不打印空间名。** 红线：任何输出都不许带出内部空间名 ——
+                        # 冒烟日志会被贴进交付文档和群消息，第一版就这么把名字漏出去了。
                         print(
-                            f"  [i] 本空间无 HPC 历史，改用 {wsinfo.get('name', wid)} 反推规格",
+                            "  [i] 本空间无 HPC 历史，已自动改用另一个有 HPC 历史的空间反推规格",
                             file=sys.stderr,
                         )
                         break
@@ -1124,13 +1129,12 @@ def main() -> int:
                 "（若确实从没跑过 HPC，这条不适用，属环境限制不是缺陷）",
             )
             sp = sample["slurm_cluster_spec"]
-            ws = hpc_ws  # 后续提交/停止都用这个空间
             state["hpc_ws"] = hpc_ws
             state["hpc_lcg"] = sample["logic_compute_group_id"]
             r = a.create_hpc_job(
                 cookie=cookie,
                 job_name=f"qzcli-v2-smoke-hpc-{int(time.time())}",
-                workspace_id=ws,
+                workspace_id=hpc_ws,
                 project_id=sample["project_id"],
                 logic_compute_group_id=sample["logic_compute_group_id"],
                 entrypoint="echo QZCLI_V2_SMOKE_HPC_OK",
