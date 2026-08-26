@@ -1044,10 +1044,10 @@ class CreateInteractiveTests(unittest.TestCase):
 
         text = "\n".join(display.messages)
         self.assertIn("工作空间总览 (2 个)", text)
-        self.assertIn("空节点 5/15 | 空GPU 40/120 | GPU利用率 66.7%", text)
+        self.assertIn("空节点 5/15 | 空GPU 40/120 | GPU分配率 66.7%", text)
         self.assertIn("工作空间", text)
         self.assertIn("空节点", text)
-        self.assertIn("GPU利用率", text)
+        self.assertIn("GPU分配率", text)
         self.assertIn("Alpha Workspace", text)
         self.assertIn("ws-1", text)
 
@@ -1378,7 +1378,7 @@ class CreateInteractiveTests(unittest.TestCase):
         text = "\n".join(display.messages)
         self.assertIn("计算组总览 (3 个)", text)
         self.assertIn(
-            "按唯一资源池汇总: 空节点 48/86 | 空GPU 384/688 | GPU利用率 44.2%", text
+            "按唯一资源池汇总: 空节点 48/86 | 空GPU 384/688 | GPU分配率 44.2%", text
         )
         self.assertIn("计算组", text)
         self.assertIn("GPU类型", text)

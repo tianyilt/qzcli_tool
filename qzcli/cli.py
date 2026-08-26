@@ -2211,11 +2211,11 @@ def cmd_avail(args):
         total_free_gpus = sum(r.get("total_free_gpus", 0) for r in sorted_results)
         total_gpus = sum(r.get("total_gpus", 0) for r in sorted_results)
         total_used_gpus = max(0, total_gpus - total_free_gpus)
-        total_gpu_util_ratio = _format_percent(total_used_gpus, total_gpus)
+        total_gpu_alloc_ratio = _format_percent(total_used_gpus, total_gpus)
 
         display.print(f"[bold]全分区总览 ({total_groups} 个计算组)[/bold]")
         display.print(
-            f"[dim]空节点 {total_free_nodes}/{total_nodes} | 空GPU {total_free_gpus}/{total_gpus} | GPU利用率 {total_gpu_util_ratio}[/dim]"
+            f"[dim]空节点 {total_free_nodes}/{total_nodes} | 空GPU {total_free_gpus}/{total_gpus} | GPU分配率 {total_gpu_alloc_ratio}[/dim]"
         )
 
         if RICH_TABLE_AVAILABLE and getattr(display, "console", None):
@@ -2236,7 +2236,7 @@ def cmd_avail(args):
                 table.add_column("可用节点", justify="right")
             table.add_column("总节点", justify="right", style="dim")
             table.add_column("空GPU", justify="right")
-            table.add_column("GPU利用率", justify="right")
+            table.add_column("GPU分配率", justify="right")
             table.add_column("GPU类型", style="magenta", no_wrap=True)
 
             section_break_set = set(section_break_after_rows)
@@ -2266,17 +2266,17 @@ def cmd_avail(args):
                 )
 
                 used_gpu = max(0, total_gpu - total_free_gpu)
-                gpu_util_text = _format_percent(used_gpu, total_gpu)
+                gpu_alloc_text = _format_percent(used_gpu, total_gpu)
                 if total_gpu > 0:
-                    gpu_util_ratio = used_gpu / total_gpu
-                    if gpu_util_ratio >= 0.8:
-                        gpu_util_text = f"[green]{gpu_util_text}[/green]"
-                    elif gpu_util_ratio >= 0.4:
-                        gpu_util_text = f"[yellow]{gpu_util_text}[/yellow]"
+                    gpu_alloc_ratio = used_gpu / total_gpu
+                    if gpu_alloc_ratio >= 0.8:
+                        gpu_alloc_text = f"[green]{gpu_alloc_text}[/green]"
+                    elif gpu_alloc_ratio >= 0.4:
+                        gpu_alloc_text = f"[yellow]{gpu_alloc_text}[/yellow]"
                     else:
-                        gpu_util_text = f"[red]{gpu_util_text}[/red]"
+                        gpu_alloc_text = f"[red]{gpu_alloc_text}[/red]"
                 else:
-                    gpu_util_text = "[dim]-[/dim]"
+                    gpu_alloc_text = "[dim]-[/dim]"
 
                 row = [
                     str(idx),
@@ -2290,7 +2290,7 @@ def cmd_avail(args):
                     [
                         str(r.get("total_nodes", 0)),
                         f"{total_free_gpu}/{total_gpu}",
-                        gpu_util_text,
+                        gpu_alloc_text,
                         r.get("gpu_type", "") or "-",
                     ]
                 )
@@ -2334,7 +2334,7 @@ def cmd_avail(args):
                 headers.extend(["低优空余", "碎片低优", "可用节点"])
                 aligns.extend(["right", "right", "right"])
                 max_widths.extend([8, 8, 8])
-            headers.extend(["总节点", "空GPU", "GPU利用率", "GPU类型"])
+            headers.extend(["总节点", "空GPU", "GPU分配率", "GPU类型"])
             aligns.extend(["right", "right", "right", "left"])
             max_widths.extend([6, 12, 9, 10])
 
@@ -3637,14 +3637,24 @@ def _summarize_node_capacity(nodes: List[Dict[str, Any]]) -> Dict[str, Any]:
             free_nodes += 1
 
     used_gpus = max(0, total_gpus - free_gpus)
-    gpu_util_ratio = (used_gpus / total_gpus) if total_gpus > 0 else None
+    # **这是「分配率」，不是「利用率」——两者在最要命的场景下结论相反。**
+    #
+    # 它算的是 `(总卡 − 空闲卡) / 总卡`，即有多少卡被**分配出去**了。一个占着
+    # 8 张卡跑 0% 的任务，在这里是 100%。而平台的空闲回收判的是**真实利用率**
+    # （实测口径「GPU 低于 15% 持续 3 小时」就回收）。所以拿这个数去回答
+    # 「我这台机器会不会被收走」会得到完全相反的答案。
+    #
+    # 真实利用率在本文件里**另有来源**：`task_dimension_to_row()` 用的
+    # `gpu.usage_rate`（来自 list_task_dimension），那一处标的才是「GPU利用率」，
+    # 改名时别顺手把它一起统一了 —— `tests/test_gpu_alloc_vs_util.py` 钉着这条。
+    gpu_alloc_ratio = (used_gpus / total_gpus) if total_gpus > 0 else None
     return {
         "total_nodes": total_nodes,
         "schedulable_nodes": schedulable_nodes,
         "free_nodes": free_nodes,
         "total_gpus": total_gpus,
         "free_gpus": free_gpus,
-        "gpu_util_ratio": gpu_util_ratio,
+        "gpu_alloc_ratio": gpu_alloc_ratio,
     }
 
 
@@ -4306,14 +4316,14 @@ def _format_capacity_summary(option: Dict[str, Any]) -> str:
     free_nodes = option.get("free_nodes", 0)
     total_gpus = option.get("total_gpus", 0)
     free_gpus = option.get("free_gpus", 0)
-    gpu_util_ratio = option.get("gpu_util_ratio")
+    gpu_alloc_ratio = option.get("gpu_alloc_ratio")
 
     if total_nodes:
         parts.append(f"空节点 {free_nodes}/{total_nodes}")
     if total_gpus:
         parts.append(f"空GPU {free_gpus}/{total_gpus}")
-    if gpu_util_ratio is not None:
-        parts.append(f"GPU利用率 {gpu_util_ratio * 100:.1f}%")
+    if gpu_alloc_ratio is not None:
+        parts.append(f"GPU分配率 {gpu_alloc_ratio * 100:.1f}%")
 
     return " | ".join(parts)
 
@@ -4889,9 +4899,9 @@ def _render_workspace_selection_table(display, options: List[Dict[str, Any]]) ->
             int(option.get("total_gpus", 0) or 0) for option in known_capacity_options
         )
         total_used_gpus = max(0, total_gpus - total_free_gpus)
-        total_gpu_util_ratio = _format_percent(total_used_gpus, total_gpus)
+        total_gpu_alloc_ratio = _format_percent(total_used_gpus, total_gpus)
         display.print(
-            f"[dim]空节点 {total_free_nodes}/{total_nodes} | 空GPU {total_free_gpus}/{total_gpus} | GPU利用率 {total_gpu_util_ratio}[/dim]"
+            f"[dim]空节点 {total_free_nodes}/{total_nodes} | 空GPU {total_free_gpus}/{total_gpus} | GPU分配率 {total_gpu_alloc_ratio}[/dim]"
         )
 
     if RICH_TABLE_AVAILABLE and getattr(display, "console", None):
@@ -4907,7 +4917,7 @@ def _render_workspace_selection_table(display, options: List[Dict[str, Any]]) ->
         table.add_column("空节点", justify="right")
         table.add_column("总节点", justify="right", style="dim")
         table.add_column("空GPU", justify="right")
-        table.add_column("GPU利用率", justify="right")
+        table.add_column("GPU分配率", justify="right")
         table.add_column("ID", style="magenta", no_wrap=True)
 
         for idx, option in enumerate(options, 1):
@@ -4923,21 +4933,21 @@ def _render_workspace_selection_table(display, options: List[Dict[str, Any]]) ->
                 )
                 free_gpu_text = f"{free_gpus}/{total_gpus}" if total_gpus > 0 else "-"
                 used_gpus = max(0, total_gpus - free_gpus)
-                gpu_util_text = _format_percent(used_gpus, total_gpus)
+                gpu_alloc_text = _format_percent(used_gpus, total_gpus)
                 if total_gpus > 0:
-                    gpu_util_ratio = used_gpus / total_gpus
-                    if gpu_util_ratio >= 0.8:
-                        gpu_util_text = f"[green]{gpu_util_text}[/green]"
-                    elif gpu_util_ratio >= 0.4:
-                        gpu_util_text = f"[yellow]{gpu_util_text}[/yellow]"
+                    gpu_alloc_ratio = used_gpus / total_gpus
+                    if gpu_alloc_ratio >= 0.8:
+                        gpu_alloc_text = f"[green]{gpu_alloc_text}[/green]"
+                    elif gpu_alloc_ratio >= 0.4:
+                        gpu_alloc_text = f"[yellow]{gpu_alloc_text}[/yellow]"
                     else:
-                        gpu_util_text = f"[red]{gpu_util_text}[/red]"
+                        gpu_alloc_text = f"[red]{gpu_alloc_text}[/red]"
                 else:
-                    gpu_util_text = "[dim]-[/dim]"
+                    gpu_alloc_text = "[dim]-[/dim]"
             else:
                 free_nodes_text = "[dim]-[/dim]"
                 free_gpu_text = "[dim]-[/dim]"
-                gpu_util_text = "[dim]-[/dim]"
+                gpu_alloc_text = "[dim]-[/dim]"
 
             table.add_row(
                 str(idx),
@@ -4945,7 +4955,7 @@ def _render_workspace_selection_table(display, options: List[Dict[str, Any]]) ->
                 free_nodes_text,
                 str(total_nodes) if has_capacity else "-",
                 free_gpu_text,
-                gpu_util_text,
+                gpu_alloc_text,
                 option.get("id", ""),
             )
 
@@ -4974,7 +4984,7 @@ def _render_workspace_selection_table(display, options: List[Dict[str, Any]]) ->
         )
 
     table_lines = _render_plain_table(
-        headers=["排名", "工作空间", "空节点", "总节点", "空GPU", "GPU利用率", "ID"],
+        headers=["排名", "工作空间", "空节点", "总节点", "空GPU", "GPU分配率", "ID"],
         rows=table_rows,
         aligns=["right", "left", "right", "right", "right", "right", "left"],
         max_widths=[4, 24, 6, 6, 12, 9, 40],
@@ -5057,10 +5067,10 @@ def _render_compute_group_selection_table(
             int(option.get("total_gpus", 0) or 0) for option in unique_capacity_options
         )
         total_used_gpus = max(0, total_gpus - total_free_gpus)
-        total_gpu_util_ratio = _format_percent(total_used_gpus, total_gpus)
+        total_gpu_alloc_ratio = _format_percent(total_used_gpus, total_gpus)
         prefix = "按唯一资源池汇总: " if has_shared_pool else ""
         display.print(
-            f"[dim]{prefix}空节点 {total_free_nodes}/{total_nodes} | 空GPU {total_free_gpus}/{total_gpus} | GPU利用率 {total_gpu_util_ratio}[/dim]"
+            f"[dim]{prefix}空节点 {total_free_nodes}/{total_nodes} | 空GPU {total_free_gpus}/{total_gpus} | GPU分配率 {total_gpu_alloc_ratio}[/dim]"
         )
 
     if RICH_TABLE_AVAILABLE and getattr(display, "console", None):
@@ -5079,7 +5089,7 @@ def _render_compute_group_selection_table(
         table.add_column("空节点", justify="right")
         table.add_column("总节点", justify="right", style="dim")
         table.add_column("空GPU", justify="right")
-        table.add_column("GPU利用率", justify="right")
+        table.add_column("GPU分配率", justify="right")
         table.add_column("ID", style="dim", no_wrap=True)
 
         for idx, option in enumerate(options, 1):
@@ -5095,21 +5105,21 @@ def _render_compute_group_selection_table(
                 )
                 free_gpu_text = f"{free_gpus}/{total_gpus}" if total_gpus > 0 else "-"
                 used_gpus = max(0, total_gpus - free_gpus)
-                gpu_util_text = _format_percent(used_gpus, total_gpus)
+                gpu_alloc_text = _format_percent(used_gpus, total_gpus)
                 if total_gpus > 0:
-                    gpu_util_ratio = used_gpus / total_gpus
-                    if gpu_util_ratio >= 0.8:
-                        gpu_util_text = f"[green]{gpu_util_text}[/green]"
-                    elif gpu_util_ratio >= 0.4:
-                        gpu_util_text = f"[yellow]{gpu_util_text}[/yellow]"
+                    gpu_alloc_ratio = used_gpus / total_gpus
+                    if gpu_alloc_ratio >= 0.8:
+                        gpu_alloc_text = f"[green]{gpu_alloc_text}[/green]"
+                    elif gpu_alloc_ratio >= 0.4:
+                        gpu_alloc_text = f"[yellow]{gpu_alloc_text}[/yellow]"
                     else:
-                        gpu_util_text = f"[red]{gpu_util_text}[/red]"
+                        gpu_alloc_text = f"[red]{gpu_alloc_text}[/red]"
                 else:
-                    gpu_util_text = "[dim]-[/dim]"
+                    gpu_alloc_text = "[dim]-[/dim]"
             else:
                 free_nodes_text = "[dim]-[/dim]"
                 free_gpu_text = "[dim]-[/dim]"
-                gpu_util_text = "[dim]-[/dim]"
+                gpu_alloc_text = "[dim]-[/dim]"
 
             table.add_row(
                 str(idx),
@@ -5120,7 +5130,7 @@ def _render_compute_group_selection_table(
                 free_nodes_text,
                 str(total_nodes) if has_capacity else "-",
                 free_gpu_text,
-                gpu_util_text,
+                gpu_alloc_text,
                 option.get("id", ""),
             )
 
@@ -5161,7 +5171,7 @@ def _render_compute_group_selection_table(
             "空节点",
             "总节点",
             "空GPU",
-            "GPU利用率",
+            "GPU分配率",
             "ID",
         ],
         rows=table_rows,
@@ -5247,9 +5257,9 @@ def _build_workspace_choice_context_lines(options: List[Dict[str, Any]]) -> List
         int(option.get("total_gpus", 0) or 0) for option in known_capacity_options
     )
     total_used_gpus = max(0, total_gpus - total_free_gpus)
-    total_gpu_util_ratio = _format_percent(total_used_gpus, total_gpus)
+    total_gpu_alloc_ratio = _format_percent(total_used_gpus, total_gpus)
     return [
-        f"总览: 空节点 {total_free_nodes}/{total_nodes} | 空GPU {total_free_gpus}/{total_gpus} | GPU利用率 {total_gpu_util_ratio}"
+        f"总览: 空节点 {total_free_nodes}/{total_nodes} | 空GPU {total_free_gpus}/{total_gpus} | GPU分配率 {total_gpu_alloc_ratio}"
     ]
 
 
@@ -5289,10 +5299,10 @@ def _build_compute_group_choice_context_lines(
             int(option.get("total_gpus", 0) or 0) for option in unique_capacity_options
         )
         total_used_gpus = max(0, total_gpus - total_free_gpus)
-        total_gpu_util_ratio = _format_percent(total_used_gpus, total_gpus)
+        total_gpu_alloc_ratio = _format_percent(total_used_gpus, total_gpus)
         prefix = "按唯一资源池汇总: " if has_shared_pool else "总览: "
         lines.append(
-            f"{prefix}空节点 {total_free_nodes}/{total_nodes} | 空GPU {total_free_gpus}/{total_gpus} | GPU利用率 {total_gpu_util_ratio}"
+            f"{prefix}空节点 {total_free_nodes}/{total_nodes} | 空GPU {total_free_gpus}/{total_gpus} | GPU分配率 {total_gpu_alloc_ratio}"
         )
     else:
         lines.append("当前未获取到实时占用，以下为缓存计算组列表。")
