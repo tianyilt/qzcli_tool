@@ -728,6 +728,70 @@ def _pick_scheduling_reason(events) -> Optional[tuple]:
     return (latest.get("reason") or "", (latest.get("message") or "").strip())
 
 
+def _events_for_notebook(api, cookie, target, display, args):
+    """开发机的事件 + 一句可执行的诊断。
+
+    返回 ``None`` 表示"这不是开发机"，让调用方继续按训练任务处理 —— 不能直接
+    报错，否则传训练任务 id 时会被这条分支吃掉。
+    """
+    from . import nbevents
+
+    nb_id = _extract_notebook_id(target)
+    if not nb_id:
+        info = _find_notebook_jupyter_info(target, _QuietNoop())
+        nb_id = (info or {}).get("notebook_id") or ""
+    if not nb_id:
+        return None
+
+    try:
+        events = api.get_notebook_events(nb_id, cookie)
+    except QzAPIError as exc:
+        display.print_error(f"拉开发机事件失败：{exc}")
+        return 1
+
+    if not events:
+        display.print("该开发机没有事件记录")
+        return 0
+
+    diag = nbevents.diagnose(events)
+    if diag:
+        display.print(f"\n[bold]诊断：{diag['title']}[/bold]")
+        if diag.get("advice"):
+            display.print(f"  {diag['advice']}")
+        for line in diag.get("breakdown") or []:
+            display.print(f"    · {line}")
+        display.print(f"[dim]  平台原文：{diag['raw'][:160]}[/dim]")
+    else:
+        display.print("\n[bold]诊断：没发现卡点[/bold]（最近一轮事件都是正常进展）")
+
+    shown = nbevents.current_round(events)
+    if getattr(args, "all_instances", False):
+        shown = events  # --all-instances 对开发机的含义：连历史轮次一起看
+    tail = getattr(args, "tail", 0) or 0
+    if tail:
+        shown = shown[-tail:]
+    display.print(f"\n[bold]事件（{len(shown)} 条）[/bold]")
+    for ev in shown:
+        ts = _fmt_event_time(ev.get("created_at"))
+        display.print(f"  {ts}  {(ev.get('content') or '')[:150]}")
+    return 0
+
+
+def _fmt_event_time(raw):
+    """平台给的是毫秒时间戳字符串；取不到就原样返回，别让格式化把命令搞挂。"""
+    try:
+        return time.strftime("%m-%d %H:%M:%S", time.localtime(int(raw) / 1000))
+    except (TypeError, ValueError):
+        return str(raw or "")[:19]
+
+
+class _QuietNoop:
+    """吞掉查找开发机时的进度输出 —— 这里只想拿 id，不想打乱 events 的排版。"""
+
+    def __getattr__(self, name):
+        return lambda *a, **kw: None
+
+
 def cmd_events(args):
     """查看任务的平台事件（调度 / 抢占 / 拉镜像 / 失败诊断）。
 
@@ -743,6 +807,16 @@ def cmd_events(args):
     if not cookie:
         display.print_error("未找到有效 cookie，请先 `qzcli login`")
         return 1
+
+    # **开发机走另一条接口。** 训练任务是 train ListJobEvents，开发机是
+    # notebook ListNotebookEvents —— 以前只接了前者，于是开发机排队时这条命令
+    # 什么都给不出来。用户拿到一个 id 时并不关心它属于哪类对象，所以在这里
+    # 自动分流，而不是让他先搞清楚再选命令。
+    nb_id = _extract_notebook_id(job_id)
+    if nb_id or not str(job_id).startswith("job-"):
+        rc = _events_for_notebook(api, cookie, nb_id or job_id, display, args)
+        if rc is not None:
+            return rc
 
     source = {}
     try:

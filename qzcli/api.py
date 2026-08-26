@@ -1193,6 +1193,37 @@ class QzAPI:
             job_id, cookie, "job", [job_id], page_size=page_size
         )
 
+    @with_rate_limit_retry
+    @with_auth_retry
+    def get_notebook_events(
+        self, notebook_id: str, cookie: str = "", page_size: int = 100
+    ) -> List[Dict[str, Any]]:
+        """开发机（notebook）的平台侧事件。
+
+        **为什么单开一个方法**：``get_job_events_with_cookie`` 走的是训练任务的
+        事件接口（``train ListJobEvents``），开发机是另一类对象、另一个 Action
+        （``notebook ListNotebookEvents``）。以前 qzcli 只接了前者，于是开发机
+        排队时拿不到任何平台原因 —— 2026-08 我为此对着一台 PENDING 的开发机
+        猜了 55 分钟，而平台其实一直存着答案：
+
+            0/1100 nodes are unavailable: 177 Insufficient memory,
+            260 Insufficient cpu, 599 node(s) didn't match Pod's
+            node affinity/selector, ...
+
+        那句 ``didn't match Pod's node affinity/selector`` 就直说了「计算组挑错」。
+
+        返回按时间升序的事件列表；字段是 ``content`` / ``created_at``（毫秒串）/
+        ``event_id``。平台这个接口**不返回 reason/type 字段**，只有一段 content，
+        所以分类只能靠文本匹配（见 ``classify_notebook_event``）。
+        """
+        body = {
+            "notebook_id": notebook_id,
+            "PageNumber": 1,
+            "page_size": page_size,
+        }
+        resp = self._request_v2("notebook", "ListNotebookEvents", body, cookie=cookie)
+        return (resp or {}).get("list") or []
+
     def get_job_instance_events_with_cookie(
         self,
         job_id: str,
