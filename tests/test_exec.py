@@ -18,6 +18,18 @@ UUID_REAL = "cfe43e55-e7a1-484a-898c-695596b0877b"
 WS_ID = "ws-11111111-1111-4111-8111-111111111111"
 
 
+
+def _real_cmd(sent):
+    """从发出去的 stdin 里挑出**真正那条命令**。
+
+    第一条现在是就绪探针（`echo QZRDY…`）——先确认 shell 会执行，再发正事。
+    断言必须跳过它，否则测的是探针不是命令。
+    """
+    real = [p for p in sent if "QZRDY" not in str(p)]
+    assert real, f"只发出了就绪探针，没发真命令：{sent}"
+    return real[-1]
+
+
 class ExtractNotebookIdTests(unittest.TestCase):
     """`_extract_notebook_id` must accept UUID + 5 URL forms; reject plain names."""
 
@@ -398,14 +410,36 @@ class ExecConcurrencyTests(unittest.TestCase):
             return _Resp({})
 
         class _WS:
+            """假终端要**像真终端**：回显你打的字，并且真会执行命令。
+
+            以前它 `recv()` 一律抛异常 —— 那等于模拟了一台"只回显、永不执行"
+            的机器。而 2026-08-27 真机上挂掉的正是这种机器（shell 还没就绪就被
+            关掉终端）。假得不像真的，就永远盖着这个 bug。
+            """
+
+            def __init__(self):
+                self._q = []
+
             def settimeout(self, *_a):
                 pass
 
             def recv(self):
+                if self._q:
+                    return self._q.pop(0)
                 raise RuntimeError("drain")
 
             def send(self, payload):
                 sent.append(payload)
+                import json as _j
+
+                try:
+                    text = _j.loads(payload)[1]
+                except Exception:  # noqa: BLE001
+                    text = str(payload)
+                self._q.append(text)  # PTY 回显
+                if text.startswith("echo QZRDY"):
+                    # shell 真执行了才会再输出一次 —— 就绪判据靠的就是这第二次
+                    self._q.append(text.split()[1])
 
             def close(self):
                 pass
@@ -447,7 +481,7 @@ class ExecConcurrencyTests(unittest.TestCase):
     def test_command_is_detached_so_it_survives_terminal_delete(self):
         """终端删掉后命令还得继续跑完，靠 setsid/nohup 摘出去。"""
         _, _, _, sent = self._launch(1)
-        payload = sent[0]
+        payload = _real_cmd(sent)
         self.assertIn("setsid", payload)
         self.assertIn("nohup", payload)
 
@@ -561,14 +595,36 @@ class ExecShellCommandTests(unittest.TestCase):
                 return self._p
 
         class _WS:
+            """假终端要**像真终端**：回显你打的字，并且真会执行命令。
+
+            以前它 `recv()` 一律抛异常 —— 那等于模拟了一台"只回显、永不执行"
+            的机器。而 2026-08-27 真机上挂掉的正是这种机器（shell 还没就绪就被
+            关掉终端）。假得不像真的，就永远盖着这个 bug。
+            """
+
+            def __init__(self):
+                self._q = []
+
             def settimeout(self, *_a):
                 pass
 
             def recv(self):
+                if self._q:
+                    return self._q.pop(0)
                 raise RuntimeError("drain")
 
             def send(self, payload):
                 sent.append(payload)
+                import json as _j
+
+                try:
+                    text = _j.loads(payload)[1]
+                except Exception:  # noqa: BLE001
+                    text = str(payload)
+                self._q.append(text)  # PTY 回显
+                if text.startswith("echo QZRDY"):
+                    # shell 真执行了才会再输出一次 —— 就绪判据靠的就是这第二次
+                    self._q.append(text.split()[1])
 
             def close(self):
                 pass
@@ -589,7 +645,7 @@ class ExecShellCommandTests(unittest.TestCase):
                 "echo hi",
                 MagicMock(),
             )
-        return sent[0]
+        return _real_cmd(sent)
 
     def test_output_goes_into_session_dir(self):
         payload = self._sent()
@@ -617,3 +673,111 @@ class ExecShellCommandTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ExecShellReadyTests(unittest.TestCase):
+    """发命令前必须先确认 shell 真的会执行。
+
+    ## 真实故障（2026-08-27）
+
+    冒烟连续三轮报「exec 在真实开发机上执行命令」失败，5 台机器全 exit=124。
+    我先后归因为「本机 Mac 环境特有」和「昇腾机器走另一个网关连不上」，
+    **两次都错**，还照着第二个错误结论往冒烟里加了「昇腾机器排到最后」的规避
+    逻辑 —— 红灯变绿，真 bug 继续躺在生产里。
+
+    真因是两个叠加的：
+
+    1. `_qzcli` 被 Contents API 建成**真目录**，`ln -sfn` 的 `-n` 只防符号链接，
+       于是链接被建进目录里面，Contents API 永远读不到输出文件
+    2. **PTY 一连上就回显你打的字，哪怕 shell 还没起来**。而发完命令只等 1 秒
+       就 close + DELETE 终端 —— 慢机器上 shell 还在跑 rc 文件，命令一次都没
+       执行就被删了
+
+    第 2 条是这里守的。判据必须是「回显 + 执行结果」两次出现：只出现一次
+    说明 shell 只是回显、还没执行。
+    """
+
+    class _WS:
+        def __init__(self, execute=True, echo=True):
+            self.execute, self.echo, self._q, self.sent = execute, echo, [], []
+
+        def settimeout(self, *_a):
+            pass
+
+        def recv(self):
+            if self._q:
+                return self._q.pop(0)
+            raise RuntimeError("empty")
+
+        def send(self, payload):
+            import json as _j
+
+            self.sent.append(payload)
+            text = _j.loads(payload)[1]
+            if self.echo:
+                self._q.append(text)
+            if self.execute and text.startswith("echo QZRDY"):
+                self._q.append(text.split()[1])
+
+        def close(self):
+            pass
+
+    def test_ready_when_shell_executes(self):
+        import json as _j
+
+        from qzcli import cli
+
+        self.assertTrue(cli._wait_shell_ready(self._WS(), _j, timeout=3))
+
+    def test_not_ready_when_only_echoing(self):
+        """**这条是核心**：只回显、不执行 —— 正是真机上挂掉的那种状态。"""
+        import json as _j
+
+        from qzcli import cli
+
+        self.assertFalse(
+            cli._wait_shell_ready(self._WS(execute=False), _j, timeout=2)
+        )
+
+    def test_not_ready_when_silent(self):
+        import json as _j
+
+        from qzcli import cli
+
+        self.assertFalse(
+            cli._wait_shell_ready(self._WS(execute=False, echo=False), _j, timeout=2)
+        )
+
+
+class ExecSymlinkHealTests(unittest.TestCase):
+    """`_qzcli` 已被建成真目录的机器要能自愈。
+
+    只 `rmdir` 是不够的 —— 坏掉的 `_qzcli` 里通常已经躺着上一轮 `ln -sfn`
+    建歪进去的 `.qzcli` 链接，目录非空，`rmdir` 直接失败。第一版就是这么写的，
+    实测四台机器照样 124。
+    """
+
+    def _cmd(self):
+        # 复用 ExecShellCommandTests 的假环境；它的 _sent() 已经挑掉就绪探针了
+        return ExecShellCommandTests._sent(ExecShellCommandTests())
+
+    def test_no_longer_creates_the_dir_via_contents_api(self):
+        """那句 PUT 是障碍的来源，必须已经删掉。"""
+        import inspect
+
+        from qzcli import cli
+
+        src = inspect.getsource(cli._exec_launch)
+        self.assertNotIn('json={"type": "directory"}', src)
+
+    def test_heal_removes_inner_link_before_rmdir(self):
+        payload = self._cmd()
+        self.assertIn("rm -f", payload)
+        self.assertIn("rmdir", payload)
+        # 顺序：先删内层链接再 rmdir，反了就删不掉
+        self.assertLess(payload.index("rm -f"), payload.index("rmdir"))
+
+    def test_heal_never_uses_rm_rf_on_the_dir(self):
+        """`rm -rf` 会连用户放在那儿的东西一起删。这个目录在项目盘上，是持久的。"""
+        payload = self._cmd()
+        self.assertNotIn("rm -rf \"$PWD/_qzcli\"", payload)

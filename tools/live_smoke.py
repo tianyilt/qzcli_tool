@@ -232,9 +232,10 @@ def main() -> int:
     ap.add_argument(
         "--exec-notebook",
         help=(
-            "exec 用例的目标开发机（notebook_id 或名字）。不传则自动挑："
-            "优先名字以 test/mova-base 开头的，昇腾/国产卡机器（npu/ascend/gjt）"
-            "排到最后——它们走另一个网关，qzcli exec 连不上，挑中会误报成功能坏了"
+            "exec 用例的目标开发机（notebook_id 或名字）。不传则自动挑：优先"
+            "名字以 test/mova-base 开头的，其余按平台返回顺序。**不按机器类型"
+            "挑挑拣拣** —— 曾经把昇腾机器排到最后，理由是「它们连不上」，那个"
+            "诊断是错的，真因是 exec 自己的 bug（见 _exec_launch 注释）"
         ),
     )
     ap.add_argument(
@@ -667,7 +668,19 @@ def main() -> int:
         if args.exec_notebook:
             candidates = [(args.exec_notebook, "命令行指定")]
         else:
-            preferred, others, deprioritized = [], [], []
+            # **不按机器类型挑挑拣拣了。**
+            #
+            # 这里原来把昇腾/国产卡机器（npu / ascend / -gjt）排到最后，理由写的是
+            # 「它们走另一个 Jupyter 网关，exec 连不上」。**那个诊断是错的。**
+            # 2026-08-27 定位到真因是 exec 自身的两个 bug（`_qzcli` 被 Contents API
+            # 建成真目录导致 symlink 建歪；终端 shell 还没就绪就被关掉），修完之后
+            # 昇腾机器 3/3 全通、原先失败的 5 台也 5/5 全通。
+            #
+            # 教训记在这儿：**冒烟报某一类机器全挂时，先怀疑被测功能，别急着把那类
+            # 机器从样本里排掉。** 排掉它只会让红灯变绿，真 bug 继续躺在生产里 ——
+            # 这个 bug 让 exec 在任何没用过 exec 的新机器上都是坏的，被这条规避
+            # 逻辑盖了整整一轮。
+            preferred, others = [], []
             for wid, wsinfo in load_all_resources().items():
                 try:
                     r = a.list_notebooks_with_cookie(wid, cookie, page_size=100)
@@ -680,20 +693,12 @@ def main() -> int:
                     name = str(n.get("name") or "")
                     if not nid:
                         continue
-                    # **昇腾/国产卡机器排到最后。** 它们走另一个 Jupyter 网关，
-                    # qzcli exec 连不上、必然超时。实测冒烟连续两轮挑中的 5 台
-                    # 全是这类（llm-dev-npu-2 / vllm-ascend-* / *-gjt），
-                    # 于是报「exec 坏了」——换一台普通开发机同一时刻一次就通。
-                    # 这是**选机逻辑的误报**，不是功能缺陷。
-                    lowered = name.lower()
-                    if any(k in lowered for k in ("npu", "ascend", "-gjt")):
-                        deprioritized.append((nid, name))
-                    elif name.startswith("test") or name.startswith("mova-base"):
+                    if name.startswith("test") or name.startswith("mova-base"):
                         # 专门留作冒烟靶机的、以及日常在用的基线机，优先
                         preferred.append((nid, name))
                     else:
                         others.append((nid, name))
-            candidates = preferred + others + deprioritized
+            candidates = preferred + others
         assert_true(candidates, "所有工作空间里都没有 RUNNING 的开发机")
 
         marker = f"QZSMOKE_{_uuid.uuid4().hex[:10]}"

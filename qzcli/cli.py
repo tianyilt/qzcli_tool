@@ -8113,6 +8113,51 @@ def _exec_paths(job_id):
     return f"{base}/{job_id}_out", f"{base}/{job_id}_exit"
 
 
+#: 等开发机 shell 就绪的上限。项目盘上的 rc 文件可能要十几秒才跑完，
+#: 给足余量 —— 这段等待只在慢机器上真的花掉，快机器一两秒就返回。
+EXEC_SHELL_READY_TIMEOUT = 40
+
+
+def _wait_shell_ready(ws, _json, timeout=EXEC_SHELL_READY_TIMEOUT):
+    """确认终端里的 shell **真的会执行命令**，不只是回显。
+
+    PTY 一连上就回显输入，哪怕 shell 还没起来 —— 所以「发出去没报错」完全
+    不能说明命令跑了。这里打一个 sentinel 进去：
+
+    - 回显让 sentinel 出现**第 1 次**（shell 没起来也会有）
+    - shell 真执行了 ``echo``，sentinel 才出现**第 2 次**
+
+    所以判据是**出现 ≥2 次**。返回 ``False`` 表示到点还没执行。
+    """
+    import time as _t
+
+    sentinel = f"QZRDY{uuid.uuid4().hex[:8]}"
+    try:
+        ws.send(_json.dumps(["stdin", f"echo {sentinel}\r"]))
+    except Exception as exc:  # noqa: BLE001
+        swallowed("exec/就绪探测发送", exc)
+        return False
+
+    buf = ""
+    last_exc = None
+    deadline = _t.time() + timeout
+    while _t.time() < deadline:
+        try:
+            ws.settimeout(1.0)
+            buf += str(ws.recv())
+        except Exception as exc:  # noqa: BLE001
+            # 单轮 recv 超时是**正常**的：shell 还没输出而已，每轮都记一条
+            # 就成了刷屏。但真失败（连接断了、协议错）不能没有现场 ——
+            # 所以留住最后一个，只在最终没等到时报出去。
+            last_exc = exc
+        if buf.count(sentinel) >= 2:
+            return True
+
+    if last_exc is not None:
+        swallowed("exec/就绪探测轮询", last_exc)
+    return False
+
+
 def _exec_launch(jupyter_info, cmd_str, display, job_id=None):
     """发起 fire-and-forget 执行：建好 Contents API 中转目录，再通过 Terminal 写入
     一条复合命令（输出落到 /tmp/.qzcli/<job_id>_out、退出码落到 _exit）。
@@ -8156,18 +8201,19 @@ def _exec_launch(jupyter_info, cmd_str, display, job_id=None):
     # Contents API 通过 symlink 读取 /tmp/.qzcli
     api_dir = "_qzcli"
 
-    # 1. 确保 Contents API 中转目录存在
-    try:
-        _requests.put(
-            f"{base_http}/api/contents/{api_dir}",
-            headers=headers,
-            json={"type": "directory"},
-            timeout=10,
-        )
-    except _requests.RequestException as exc:
-        # 目录多半已存在；真建不出来的话，后面读 exit 文件会一路 404 到超时，
-        # 那时 last_reason() 能把这条捞回去。
-        swallowed("exec/建中转目录", exc)
+    # 1. **不要**在这里用 Contents API 建 `_qzcli` 目录。
+    #
+    # 原来这里有一句 `PUT /api/contents/_qzcli`，注释写的是「确保中转目录存在」。
+    # 它恰恰**制造了**下一步的障碍：Contents API 建出来的是一个**真目录**，而
+    # 下一步 `ln -sfn /tmp/.qzcli "$PWD/_qzcli"` 的 `-n` 只防「_qzcli 已经是指向
+    # 目录的**符号链接**」这一种情况 —— 对真目录无效，链接会被建到目录**里面**
+    # （`_qzcli/.qzcli`），`_qzcli` 本身留成一个空真目录。于是轮询
+    # `_qzcli/<session>/<job>_exit` 永远 404，一路等到超时报 124。
+    #
+    # 后果是 **exec 在任何没用过 exec 的机器上都是坏的**：老机器上 `_qzcli` 早就
+    # 是符号链接（那时还没有这句 PUT），`ln -sfn` 能正确替换，所以一直没暴露。
+    #
+    # 现在这个目录只由下面那条 shell 命令里的 `ln -sfn` 创建，是唯一来源。
 
     # 2. 通过 Terminal 发送一条复合命令（fire-and-forget）
     #    输出写到 /tmp/.qzcli/<session>/，通过 symlink 让 Contents API 可读
@@ -8189,8 +8235,26 @@ def _exec_launch(jupyter_info, cmd_str, display, job_id=None):
         f"find {tmp_root} -mindepth 1 -maxdepth 1 -type d "
         f"-mtime +{EXEC_SESSION_TTL_DAYS} -exec rm -rf {{}} + 2>/dev/null || true"
     )
+    # 已经被上一版搞坏的机器要能自愈：`_qzcli` 若是**真目录**（不是符号链接），
+    # 清掉再建链接。
+    #
+    # 两步缺一不可 —— 只 `rmdir` 是不够的：坏掉的 `_qzcli` 里通常已经躺着上一轮
+    # `ln -sfn` 建歪进去的 `.qzcli` 链接，目录非空，`rmdir` 直接失败、自愈无效
+    # （第一版就是这么写的，实测四台机器照样 124）。所以先删那个内层链接。
+    #
+    # 用 `rm -f <内层链接>` + `rmdir`，**不用 `rm -rf`**：`rm -f` 删的是符号链接
+    # 本身而不是它指向的 /tmp/.qzcli；`rmdir` 只删空目录。万一那底下真有用户的
+    # 东西，宁可这次 exec 失败，也不能删掉人家的数据 —— 这个目录在 `/inspire/...`
+    # 项目盘上，是持久且可能共享的。
+    heal = (
+        f'[ -L "$PWD/{api_dir}" ] || {{ '
+        f'rm -f "$PWD/{api_dir}/.qzcli"; '
+        f'rmdir "$PWD/{api_dir}" 2>/dev/null; '
+        f"}}; true"
+    )
     shell_cmd = (
         f"mkdir -p {tmp_dir} && "
+        f"{{ {heal}; }}; "
         f'ln -sfn {tmp_root} "$PWD/{api_dir}" && '
         f"{{ {prune}; }}; "
         f"{{ command -v setsid >/dev/null && setsid bash -c {shlex.quote(inner)} "
@@ -8220,6 +8284,22 @@ def _exec_launch(jupyter_info, cmd_str, display, job_id=None):
                     ws.recv()
                 except Exception:
                     break
+
+            # **必须先确认 shell 真的能执行命令，再发正事。**
+            #
+            # PTY 一连上就会回显你打的字 —— 哪怕 shell 还没起来。而下面发完命令
+            # 只等 1 秒就 close + DELETE 终端。慢机器上 shell 还在跑 rc 文件
+            # （项目盘上的 .bashrc 可能要十几秒），命令还躺在 PTY 缓冲里，
+            # 终端就被删了，命令**一次都没执行**，于是轮询一路 404 到 124。
+            #
+            # 2026-08-27 实测：一个网关下的机器全中招，终端只回显我打的字、
+            # 不返回展开后的 `$PWD`；同一时刻另一个网关的机器秒通。我先后把这
+            # 误判成「Mac 环境特有」「昇腾机器」，都错了。
+            if not _wait_shell_ready(ws, _json):
+                raise RuntimeError(
+                    f"终端 {EXEC_SHELL_READY_TIMEOUT}s 内没就绪（只回显、不执行），"
+                    "这台开发机的 shell 可能起得特别慢或已卡死"
+                )
 
             ws.send(_json.dumps(["stdin", shell_cmd + "\r"]))
             # 给 setsid/nohup 一点时间把子进程摘出去，再关终端
