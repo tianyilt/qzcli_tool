@@ -84,6 +84,14 @@ def get_proxy(url: str = "") -> str:
 # 登录失败封锁（.relogin.cooldown）也跟着一起搬，这是有意的：封锁在每个 home
 # 内部依然是永久的，所以账号被锁时另一份 home 至多多试 1 次就自己停住，不会
 # 演变成重试风暴——不值得为这 1 次造一个"不跟随 QZCLI_HOME"的特例目录。
+#
+# **多份 home 各持一份 cookie 是安全的，平台是多会话。** 2026-08-27 实测：
+# 本机 cookie 探针为「有效」→ 在另一台机器上用同一账号登录一次 → 立刻重探本机
+# cookie（内容指纹未变，只看服务端认不认）→ 仍然「有效」。
+# 也就是说另一处登录**不会把已有会话踢下线**，不存在「两份 cookie 互相失效、
+# 各自不停重登」这种放大器。
+# 曾经担心平台是单会话、多份 home 会互相踢，为此考虑过把 .cookie 做成软链共用 ——
+# 实验推翻了这个担心，维持各自独立，隔离性更好也更简单。
 CONFIG_DIR = Path(os.environ.get("QZCLI_HOME", "").strip() or Path.home() / ".qzcli")
 CONFIG_FILE = CONFIG_DIR / "config.json"
 JOBS_FILE = CONFIG_DIR / "jobs.json"
