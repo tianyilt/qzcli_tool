@@ -1083,18 +1083,49 @@ def main() -> int:
         # 正因为没迁才更要测：确认 v1 这条腿在本次改动后依然是通的。
         @check("提交 HPC 任务", "qzcli hpc（仍走 v1）")
         def _hpc_create():
-            # 规格从历史 HPC 任务反推，不写死 —— 换工作空间也能跑
-            hist = a.list_hpc_jobs(ws, page_size=20).get("jobs") or []
-            sample = next(
-                (
-                    j
-                    for j in hist
-                    if (j.get("slurm_cluster_spec") or {}).get("predef_quota_id")
-                ),
-                None,
+            # 规格从历史 HPC 任务反推，不写死 —— 换工作空间也能跑。
+            #
+            # **本空间没有 HPC 历史时，自动换一个有的空间。** 实测全平台 16 个
+            # 工作空间里只有 3 个跑过 HPC；训练任务多的空间（如「分布式」）
+            # HPC 历史是 0 条。原来在这种空间跑就必然报「找不到可复用的规格」，
+            # 看起来像 HPC 提交坏了 —— 其实只是**这个空间从来没用过 HPC**。
+            # 反过来纯 HPC 空间又没有训练任务和 GPU 节点，训练类用例会全红。
+            # 所以两类用例本来就该各自找合适的空间，不能强求同一个。
+            def _hpc_sample(space):
+                try:
+                    hist = a.list_hpc_jobs(space, page_size=20).get("jobs") or []
+                except QzAPIError:
+                    return None
+                return next(
+                    (
+                        j
+                        for j in hist
+                        if (j.get("slurm_cluster_spec") or {}).get("predef_quota_id")
+                    ),
+                    None,
+                )
+
+            hpc_ws, sample = ws, _hpc_sample(ws)
+            if sample is None:
+                for wid, wsinfo in (load_all_resources() or {}).items():
+                    if wid == ws or not isinstance(wsinfo, dict):
+                        continue
+                    cand = _hpc_sample(wid)
+                    if cand is not None:
+                        hpc_ws, sample = wid, cand
+                        print(
+                            f"  [i] 本空间无 HPC 历史，改用 {wsinfo.get('name', wid)} 反推规格",
+                            file=sys.stderr,
+                        )
+                        break
+            assert_true(
+                sample,
+                "所有工作空间的历史 HPC 任务里都找不到可复用的规格"
+                "（若确实从没跑过 HPC，这条不适用，属环境限制不是缺陷）",
             )
-            assert_true(sample, "历史 HPC 任务里找不到可复用的规格")
             sp = sample["slurm_cluster_spec"]
+            ws = hpc_ws  # 后续提交/停止都用这个空间
+            state["hpc_ws"] = hpc_ws
             state["hpc_lcg"] = sample["logic_compute_group_id"]
             r = a.create_hpc_job(
                 cookie=cookie,
