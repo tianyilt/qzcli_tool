@@ -7,8 +7,8 @@ v1→v2 迁移最典型的翻车是"接口通了但语义变了"（过滤被忽�
 
 用法::
 
-    python3 tools/live_smoke.py --workspace CI-情境智能            # 只读部分
-    python3 tools/live_smoke.py --workspace CI-情境智能 --submit   # 含真实提交+停止
+    python3 tools/live_smoke.py --workspace 分布式            # 只读部分
+    python3 tools/live_smoke.py --workspace 分布式 --submit   # 含真实提交+停止
 
 `--submit` 会**真的提交一个任务并在验证完后停掉它**（默认 1 卡、低优先级、
 命令是 echo 立即退出）。会消耗少量点券。不加这个 flag 则完全只读。
@@ -233,7 +233,8 @@ def main() -> int:
         "--exec-notebook",
         help=(
             "exec 用例的目标开发机（notebook_id 或名字）。不传则自动挑："
-            "优先 CI 空间里 RUNNING 的 mova-base*，再退回任一 RUNNING 的"
+            "优先名字以 test/mova-base 开头的，昇腾/国产卡机器（npu/ascend/gjt）"
+            "排到最后——它们走另一个网关，qzcli exec 连不上，挑中会误报成功能坏了"
         ),
     )
     ap.add_argument(
@@ -666,7 +667,7 @@ def main() -> int:
         if args.exec_notebook:
             candidates = [(args.exec_notebook, "命令行指定")]
         else:
-            preferred, others = [], []
+            preferred, others, deprioritized = [], [], []
             for wid, wsinfo in load_all_resources().items():
                 try:
                     r = a.list_notebooks_with_cookie(wid, cookie, page_size=100)
@@ -679,13 +680,20 @@ def main() -> int:
                     name = str(n.get("name") or "")
                     if not nid:
                         continue
-                    if "CI-情境智能" == wsinfo.get("name") and name.startswith(
-                        "mova-base"
-                    ):
+                    # **昇腾/国产卡机器排到最后。** 它们走另一个 Jupyter 网关，
+                    # qzcli exec 连不上、必然超时。实测冒烟连续两轮挑中的 5 台
+                    # 全是这类（llm-dev-npu-2 / vllm-ascend-* / *-gjt），
+                    # 于是报「exec 坏了」——换一台普通开发机同一时刻一次就通。
+                    # 这是**选机逻辑的误报**，不是功能缺陷。
+                    lowered = name.lower()
+                    if any(k in lowered for k in ("npu", "ascend", "-gjt")):
+                        deprioritized.append((nid, name))
+                    elif name.startswith("test") or name.startswith("mova-base"):
+                        # 专门留作冒烟靶机的、以及日常在用的基线机，优先
                         preferred.append((nid, name))
                     else:
                         others.append((nid, name))
-            candidates = preferred + others
+            candidates = preferred + others + deprioritized
         assert_true(candidates, "所有工作空间里都没有 RUNNING 的开发机")
 
         marker = f"QZSMOKE_{_uuid.uuid4().hex[:10]}"
@@ -787,7 +795,7 @@ def main() -> int:
                 # logic_compute_group ...`。和「挑项目」是同一类病：
                 # **挑候选时不验证它真的能用**。
                 #
-                # 判据不能只是「这个组有规格」—— 实测 CI-情境智能 13 个组里：
+                # 判据不能只是「这个组有规格」—— 实测某工作空间 13 个组里：
                 #   4 个是 0 个 node_spec（GPU资源组 / MOVA-2.0-cuda13.2 / …）
                 #   3 个只有 CPU 规格且 support_job_type 只含 interactive_modeling
                 #     （开发机专用，收不了训练任务）

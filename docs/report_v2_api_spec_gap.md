@@ -166,7 +166,7 @@ POST /api/v2/audit?Action=ApplySecurityAudit
 → AccessForbidden: user is not share project member
 ```
 
-原因是 `file_path` 落在 `exploration-topic`（CI-情境智能-探索课题）下，
+原因是 `file_path` 落在 `exploration-topic`（某工作空间-探索课题）下，
 而本账号对该项目**没有任何权限**。三路独立证据：
 
 | 证据 | 结果 |

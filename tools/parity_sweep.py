@@ -20,7 +20,7 @@
 用法::
 
     python3 tools/parity_sweep.py                    # 全部工作空间
-    python3 tools/parity_sweep.py --workspace CI-情境智能
+    python3 tools/parity_sweep.py --workspace 分布式
     python3 tools/parity_sweep.py --only jobs nodes  # 只扫指定端点
 """
 

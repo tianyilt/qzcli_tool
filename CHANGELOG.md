@@ -169,7 +169,7 @@ spec 里 1 个 action，前端在用 32 个。spec 里完全没有的服务包�
 选中就报 `AccessForbidden: 您已离开所选项目，无法创建`。
 
 ⚠️ **一个要说清的更正**：迁移时我照抄 spec 描述写了「v2 只返回当前用户所属的项目」，
-**这是错的**。实测 11 条里有 1 条 `is_member=False`（`CI-情境智能-探索课题`，
+**这是错的**。实测 11 条里有 1 条 `is_member=False`（`某工作空间-探索课题`，
 状态 `PASS_MODIFY_RESOURCE`）。需要按成员身份过滤的调用方必须自己滤。
 
 另外 `is_member` **只在 v2 可信**：v1 对全部 12 条一律返回 `False`，
@@ -226,7 +226,7 @@ spec 里 1 个 action，前端在用 32 个。spec 里完全没有的服务包�
 
 1. **选计算组不验证可用性**。挑出 GPU 数最小的 spec 后闭眼取
    `logic_compute_group_ids[0]`，而 spec 是从历史任务反推的，记着的组现在可能
-   已经不合适。实测 CI-情境智能 13 个组里 4 个 `node_spec` 数为 0、3 个只收开发机。
+   已经不合适。实测 某工作空间 13 个组里 4 个 `node_spec` 数为 0、3 个只收开发机。
    判据改成「该组存在一个 node_spec 同时满足 `support_job_type` 含
    `distributed_training` 且 `gpu_count` 够用」。
 2. **停止是竞态且不验证结果**。提交完 0.0 秒就调 `StopJob`，任务还没进入可停止
