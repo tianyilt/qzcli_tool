@@ -6,7 +6,7 @@ import unittest
 from contextlib import redirect_stdout
 from unittest.mock import MagicMock, patch
 
-from qzcli.api import QzAPI, V2_CLIENT_SOURCE
+from qzcli.api import QzAPI, QzAPIError, V2_CLIENT_SOURCE
 from qzcli.cli import _parse_since, cmd_logs
 from qzcli.display import Display
 
@@ -42,33 +42,89 @@ class ParseSinceTests(unittest.TestCase):
 
 
 class ResolvePodNamesTests(unittest.TestCase):
+    """实例名要**问平台**，不要猜命名约定。
+
+    ## 真实故障（2026-08-27）
+
+    这里原来只按 ``{job_id}-worker-{i}`` 拼。而平台真实的实例名是
+    ``{job_id}-worker-{i}-{round}`` —— **末尾多一段**。少那一段，日志接口报：
+
+        InvalidParameter: Invalid instance names, the job ids length of
+        instances except 1, but got 0
+
+    于是 ``qzcli logs`` 对**所有**任务全挂（实测扫 60 个任务 0 条日志），
+    而报错文案跟真实原因（名字拼错了）毫无关系。修完 5/5 全部取到。
+
+    v0.4.12 也一样挂 —— 不是新回归，是约定漂了之后一直没人对过。
+    **这是第二次栽在"猜平台的命名约定"上**（上一次是 exec 的中转目录）。
+
+    所以下面的用例分两层：平台给得出真名时**必须用真名**；
+    只有平台那条路不通时才回落到拼接。
+    """
+
     def setUp(self):
         with patch("qzcli.api.get_api_base_url", return_value="https://qz.test"), \
              patch("qzcli.api.get_credentials", return_value=("u", "p")):
             self.api = QzAPI("u", "p")
             self.api._token = "tok"
 
-    def test_framework_config_path(self):
-        with patch.object(self.api, "get_job_detail",
-                          return_value={"framework_config": [{"instance_count": 3}]}):
+    def test_platform_names_win_over_convention(self):
+        """**核心**：平台给了真名就用真名，哪怕它跟约定长得不一样。"""
+        real = [
+            {"name": "job-abc-worker-0-0"},
+            {"name": "job-abc-worker-1-0"},
+        ]
+        with patch.object(self.api, "list_job_instances", return_value=real), \
+             patch.object(self.api, "get_job_detail") as detail:
+            self.assertEqual(
+                self.api._resolve_pod_names("job-abc"),
+                ["job-abc-worker-0-0", "job-abc-worker-1-0"],
+            )
+            detail.assert_not_called()
+
+    def test_real_platform_shape_has_trailing_round(self):
+        """钉住真机抓到的形状：末尾那个 ``-0`` 不能被当成噪声去掉。"""
+        with patch.object(
+            self.api,
+            "list_job_instances",
+            return_value=[{"name": "job-56d9fa68-worker-0-0"}],
+        ):
+            names = self.api._resolve_pod_names("job-56d9fa68")
+        self.assertEqual(names, ["job-56d9fa68-worker-0-0"])
+        self.assertNotEqual(names, ["job-56d9fa68-worker-0"], "退回猜的约定了")
+
+    def test_falls_back_to_convention_when_platform_unavailable(self):
+        """平台那条路不通时至少还能试一把 —— 但只在那时。"""
+        with patch.object(
+            self.api, "list_job_instances", side_effect=QzAPIError("boom")
+        ), patch.object(
+            self.api,
+            "get_job_detail",
+            return_value={"framework_config": [{"instance_count": 3}]},
+        ):
             self.assertEqual(
                 self.api._resolve_pod_names("job-abc"),
                 ["job-abc-worker-0", "job-abc-worker-1", "job-abc-worker-2"],
             )
 
-    def test_top_level_field(self):
-        with patch.object(self.api, "get_job_detail", return_value={"instance_count": 2}):
+    def test_empty_platform_list_also_falls_back(self):
+        """返回空列表和报错一样，都要回落 —— 否则日志接口会收到空的实例名。"""
+        with patch.object(self.api, "list_job_instances", return_value=[]), \
+             patch.object(self.api, "get_job_detail", return_value={"instance_count": 2}):
             self.assertEqual(
                 self.api._resolve_pod_names("job-x"),
                 ["job-x-worker-0", "job-x-worker-1"],
             )
 
     def test_default_one_when_missing(self):
-        with patch.object(self.api, "get_job_detail", return_value={}):
+        with patch.object(self.api, "list_job_instances", return_value=[]), \
+             patch.object(self.api, "get_job_detail", return_value={}):
             self.assertEqual(self.api._resolve_pod_names("job-y"), ["job-y-worker-0"])
 
-    def test_explicit_n_skips_detail(self):
-        with patch.object(self.api, "get_job_detail") as m:
+    def test_explicit_n_still_consults_platform_first(self):
+        """显式传 n_instances 只影响**兜底**那条路，不该让我们跳过问平台。"""
+        with patch.object(self.api, "list_job_instances", return_value=[]), \
+             patch.object(self.api, "get_job_detail") as m:
             self.assertEqual(
                 self.api._resolve_pod_names("job-z", n_instances=4),
                 [f"job-z-worker-{i}" for i in range(4)],

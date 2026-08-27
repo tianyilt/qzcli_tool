@@ -1308,14 +1308,53 @@ class QzAPI:
             job_id, cookie, "instance", pod_names, page_size=page_size
         )
 
+    def list_job_instances(
+        self, job_id: str, cookie: str = "", page_size: int = 100
+    ) -> List[Dict[str, Any]]:
+        """问平台要这个 job 的**真实实例名**（``train ListJobInstances``）。
+
+        返回 ``items``，每条含 ``name`` / ``instance_status`` / ``node`` /
+        ``running_round`` 等。``name`` 就是日志接口要的那个实例名。
+        """
+        resp = self._request_v2(
+            "train",
+            "ListJobInstances",
+            {"job_id": job_id, "PageNumber": 1, "page_size": page_size},
+            cookie=cookie,
+        )
+        return (resp or {}).get("items") or []
+
     def _resolve_pod_names(
         self, job_id: str, n_instances: Optional[int] = None
     ) -> List[str]:
-        """推断 job 的所有 worker pod 名。
+        """拿到 job 的所有 worker pod 名。
 
-        平台规则：pod 命名为 ``{job_id}-worker-{i}`` for i in 0..n-1。
-        n_instances 没显式给时从 detail 反推（兼容多种字段位置）。
+        **优先问平台，别猜命名约定。** 约定会漂：这里原来只按
+        ``{job_id}-worker-{i}`` 拼，而平台真实的实例名是
+        ``{job_id}-worker-{i}-{round}``（**末尾多一段**）。少那一段，日志接口
+        直接报 ``InvalidParameter: Invalid instance names, the job ids length of
+        instances except 1, but got 0`` —— 于是 `qzcli logs` 对**所有**任务全挂，
+        而报错文案跟真实原因（名字拼错了）毫无关系。
+
+        2026-08-27 实测：v0.4.12 也一样挂，说明这不是新回归，是约定漂了之后
+        一直没人对过。**这是第二次栽在"猜平台的命名约定"上**（上一次是 exec 的
+        中转目录）。
+
+        兜底仍保留老的拼接规则：平台接口不可用时至少还能试一把，但会留痕。
         """
+        try:
+            names = [
+                str(it.get("name") or "")
+                for it in self.list_job_instances(job_id)
+                if it.get("name")
+            ]
+            if names:
+                return names
+        except (QzAPIError, requests.RequestException) as exc:
+            # 拿不到真名就退回猜，但**必须留痕** —— 否则"猜错了"和"平台没数据"
+            # 长得一模一样。
+            swallowed("logs/取实例名", exc)
+
         if n_instances is None:
             try:
                 d = self.get_job_detail(job_id)
