@@ -1224,6 +1224,71 @@ class QzAPI:
         resp = self._request_v2("notebook", "ListNotebookEvents", body, cookie=cookie)
         return (resp or {}).get("list") or []
 
+    def get_node_events(
+        self,
+        node_names: List[str],
+        cookie: str = "",
+        page_size: int = 200,
+    ) -> List[Dict[str, Any]]:
+        """**机器自己**的健康事件（``cluster ListNodeEvents``）。
+
+        这是平台上唯一按**节点**而不是按工作负载组织的事件源。它回答的是
+        `qzcli events <job>` 答不了的那个问题：**「是不是这台机器本身有病？」**
+
+        实测能拿到的 reason：``XIDIsUnhealthy``（GPU 硬件错误）/
+        ``GPFSMountUnhealthy``（共享盘挂载坏）/ ``NodeNotReady`` /
+        ``NodeHasDiskPressure``，以及它们各自对应的恢复事件。
+
+        **注意参数形状**：过滤条件在 ``filter.node_names`` 这个嵌套数组里。
+        平顶层传 ``node_name`` 会被平台以
+        ``InvalidParameter: unknown field "node_name"`` 拒掉 —— 我按直觉试了
+        6 种平铺写法全被拒，翻 ``docs/api_spec_v2.md`` 才拿到正确形状。
+
+        返回原始事件列表，字段：``node_name`` / ``reason`` / ``message`` /
+        ``event_type`` / ``first_timestamp`` / ``last_timestamp``。
+
+        **逐台查，不一次性把 node_names 全塞进去。** 平台按总条数分页，一次问 5 台
+        只回 200 条时实测**只覆盖了前 2 台** —— 后 3 台一条事件都没有，于是被诊断成
+        「没发现异常记录」。那是**静默假阴性**：一台刚报过 XID 的机器会被判成健康。
+        逐台查每台都有自己的额度，慢一点，但结论是真的。
+        """
+        names = [n for n in (node_names or []) if n]
+        if not names:
+            return []
+        out: List[Dict[str, Any]] = []
+        for name in names:
+
+            def _page(n: int):
+                return self._request_v2(
+                    "cluster",
+                    "ListNodeEvents",
+                    {
+                        "filter": {"node_names": [name]},
+                        "PageNumber": n,
+                        "page_size": page_size,
+                    },
+                    cookie=cookie,
+                )
+
+            try:
+                resp = _page(1)
+                total = int((resp or {}).get("total") or 0)
+                # **必须取最后一页。** 平台按时间**升序**返回（实测：第 1 条是
+                # 1 月的、最后一条是 8 月的）。一台机器 total=222、page_size=200
+                # 时，第 1 页给的是**最旧的 200 条，丢掉最新的 22 条** —— 而我们
+                # 要判断的恰恰是"现在健不健康"。用旧数据下结论会把昨天刚坏的机器
+                # 判成健康，是这个功能最坏的失败方式。
+                if total > page_size:
+                    last_page = -(-total // page_size)  # ceil
+                    resp = _page(last_page)
+            except QzAPIError as exc:
+                # 单台查失败不该让整批没结果 —— 但**必须留痕**，否则这台会和
+                # "真的没有事件" 长得一模一样。
+                swallowed(f"nodeevents/{name}", exc)
+                continue
+            out.extend((resp or {}).get("events") or [])
+        return out
+
     def get_job_instance_events_with_cookie(
         self,
         job_id: str,
@@ -1243,14 +1308,53 @@ class QzAPI:
             job_id, cookie, "instance", pod_names, page_size=page_size
         )
 
+    def list_job_instances(
+        self, job_id: str, cookie: str = "", page_size: int = 100
+    ) -> List[Dict[str, Any]]:
+        """问平台要这个 job 的**真实实例名**（``train ListJobInstances``）。
+
+        返回 ``items``，每条含 ``name`` / ``instance_status`` / ``node`` /
+        ``running_round`` 等。``name`` 就是日志接口要的那个实例名。
+        """
+        resp = self._request_v2(
+            "train",
+            "ListJobInstances",
+            {"job_id": job_id, "PageNumber": 1, "page_size": page_size},
+            cookie=cookie,
+        )
+        return (resp or {}).get("items") or []
+
     def _resolve_pod_names(
         self, job_id: str, n_instances: Optional[int] = None
     ) -> List[str]:
-        """推断 job 的所有 worker pod 名。
+        """拿到 job 的所有 worker pod 名。
 
-        平台规则：pod 命名为 ``{job_id}-worker-{i}`` for i in 0..n-1。
-        n_instances 没显式给时从 detail 反推（兼容多种字段位置）。
+        **优先问平台，别猜命名约定。** 约定会漂：这里原来只按
+        ``{job_id}-worker-{i}`` 拼，而平台真实的实例名是
+        ``{job_id}-worker-{i}-{round}``（**末尾多一段**）。少那一段，日志接口
+        直接报 ``InvalidParameter: Invalid instance names, the job ids length of
+        instances except 1, but got 0`` —— 于是 `qzcli logs` 对**所有**任务全挂，
+        而报错文案跟真实原因（名字拼错了）毫无关系。
+
+        2026-08-27 实测：v0.4.12 也一样挂，说明这不是新回归，是约定漂了之后
+        一直没人对过。**这是第二次栽在"猜平台的命名约定"上**（上一次是 exec 的
+        中转目录）。
+
+        兜底仍保留老的拼接规则：平台接口不可用时至少还能试一把，但会留痕。
         """
+        try:
+            names = [
+                str(it.get("name") or "")
+                for it in self.list_job_instances(job_id)
+                if it.get("name")
+            ]
+            if names:
+                return names
+        except (QzAPIError, requests.RequestException) as exc:
+            # 拿不到真名就退回猜，但**必须留痕** —— 否则"猜错了"和"平台没数据"
+            # 长得一模一样。
+            swallowed("logs/取实例名", exc)
+
         if n_instances is None:
             try:
                 d = self.get_job_detail(job_id)

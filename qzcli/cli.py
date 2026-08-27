@@ -51,6 +51,7 @@ from .config import (
     update_workspace_compute_groups,
     update_workspace_projects,
 )
+from . import priority as _priority
 from .diag import last_reason, swallowed
 from .display import get_display
 from .store import JobRecord, get_store
@@ -792,6 +793,70 @@ class _QuietNoop:
         return lambda *a, **kw: None
 
 
+def _events_for_nodes(api, cookie, node_names, display, args):
+    """`qzcli events --node <名字>`：这台机器还能不能用。
+
+    输出刻意分成两栏：**现在有问题** 和 **曾经出过、已恢复**。
+
+    这个区分不是修辞。平台把 condition 的两个方向都记成事件
+    （``XIDIsUnhealthy`` 之后往往跟着 ``XIDIsHealthy``），只 grep "Unhealthy"
+    会把已经恢复的机器天天报成有病 —— 实测那 6 台生产机**每一台**都出现过
+    XID / GPFS / NotReady，全都已恢复。照着误报去 `--exclude-node`，
+    可用机器会被排到没有。
+    """
+    import json as _json
+
+    from . import nodeevents as _ne
+
+    events = api.get_node_events(node_names, cookie, page_size=200)
+    if getattr(args, "output_json", False):
+        print(_json.dumps(events, indent=2, ensure_ascii=False))
+        return 0
+
+    bad_nodes = []
+    for name in node_names:
+        mine = [e for e in events if e.get("node_name") == name]
+        diag = _ne.diagnose_node(mine)
+        exclude = _ne.should_exclude(diag)
+        if exclude:
+            bad_nodes.append(name)
+        mark = "[red]✗[/red]" if exclude else ("[yellow]![/yellow]" if diag["problems"] else "[green]✓[/green]")
+        display.print(f"\n{mark} [bold]{name}[/bold]  ({len(mine)} 条事件)")
+        if not mine:
+            display.print("  [dim]查不到事件记录 —— 可能是节点名写错了，"
+                          "也可能这台确实一直没出过状况[/dim]")
+            continue
+        display.print(f"  {_ne.verdict(diag)}")
+        for p in diag["problems"]:
+            # `p['at']` 已经是**毫秒**，别再乘 1000（第一版乘了，日期显示成 2 月）
+            when = _fmt_event_time(p["at"])
+            days = _ne.age_days(p)
+            if _ne.is_stale(p):
+                # 平台只在状态翻转时记事件，不保证记恢复。陈旧的未恢复记录
+                # 如实说清楚，不替用户下"现在坏着"的结论。
+                display.print(
+                    f"  [yellow]· {p['title']}[/yellow]（{p['reason']}，"
+                    f"最后一次 {when}，约 {days:.0f} 天前，之后没有恢复记录）"
+                )
+                display.print(
+                    "    [dim]年代久远：可能早就好了只是没记录，也可能一直没修。"
+                    "**不据此建议排除**，真撞上失败再回来看这条。[/dim]"
+                )
+            else:
+                display.print(
+                    f"  [red]· {p['title']}[/red]（{p['reason']}，{when}）"
+                )
+                display.print(f"    {p['advice']}")
+        if diag["recovered"]:
+            names = "、".join(f"{r['title']}" for r in diag["recovered"])
+            display.print(f"  [dim]· 曾经出过但已恢复：{names}[/dim]")
+
+    hint = _ne.exclude_hint(bad_nodes)
+    if hint:
+        display.print(f"\n[bold]提交时避开这些机器：[/bold]\n  {hint}")
+    return 0
+
+
 def cmd_events(args):
     """查看任务的平台事件（调度 / 抢占 / 拉镜像 / 失败诊断）。
 
@@ -806,6 +871,14 @@ def cmd_events(args):
     cookie = _get_cookie_value()
     if not cookie:
         display.print_error("未找到有效 cookie，请先 `qzcli login`")
+        return 1
+
+    # `--node` 走完全不同的一条路：问的是**机器**的健康，不是某个任务的遭遇。
+    if getattr(args, "node", None):
+        return _events_for_nodes(api, cookie, args.node, display, args)
+
+    if not job_id:
+        display.print_error("要么给一个任务 ID / 开发机，要么用 `--node <节点名>`")
         return 1
 
     # **开发机走另一条接口。** 训练任务是 train ListJobEvents，开发机是
@@ -2211,11 +2284,11 @@ def cmd_avail(args):
         total_free_gpus = sum(r.get("total_free_gpus", 0) for r in sorted_results)
         total_gpus = sum(r.get("total_gpus", 0) for r in sorted_results)
         total_used_gpus = max(0, total_gpus - total_free_gpus)
-        total_gpu_util_ratio = _format_percent(total_used_gpus, total_gpus)
+        total_gpu_alloc_ratio = _format_percent(total_used_gpus, total_gpus)
 
         display.print(f"[bold]全分区总览 ({total_groups} 个计算组)[/bold]")
         display.print(
-            f"[dim]空节点 {total_free_nodes}/{total_nodes} | 空GPU {total_free_gpus}/{total_gpus} | GPU利用率 {total_gpu_util_ratio}[/dim]"
+            f"[dim]空节点 {total_free_nodes}/{total_nodes} | 空GPU {total_free_gpus}/{total_gpus} | GPU分配率 {total_gpu_alloc_ratio}[/dim]"
         )
 
         if RICH_TABLE_AVAILABLE and getattr(display, "console", None):
@@ -2236,7 +2309,7 @@ def cmd_avail(args):
                 table.add_column("可用节点", justify="right")
             table.add_column("总节点", justify="right", style="dim")
             table.add_column("空GPU", justify="right")
-            table.add_column("GPU利用率", justify="right")
+            table.add_column("GPU分配率", justify="right")
             table.add_column("GPU类型", style="magenta", no_wrap=True)
 
             section_break_set = set(section_break_after_rows)
@@ -2266,17 +2339,17 @@ def cmd_avail(args):
                 )
 
                 used_gpu = max(0, total_gpu - total_free_gpu)
-                gpu_util_text = _format_percent(used_gpu, total_gpu)
+                gpu_alloc_text = _format_percent(used_gpu, total_gpu)
                 if total_gpu > 0:
-                    gpu_util_ratio = used_gpu / total_gpu
-                    if gpu_util_ratio >= 0.8:
-                        gpu_util_text = f"[green]{gpu_util_text}[/green]"
-                    elif gpu_util_ratio >= 0.4:
-                        gpu_util_text = f"[yellow]{gpu_util_text}[/yellow]"
+                    gpu_alloc_ratio = used_gpu / total_gpu
+                    if gpu_alloc_ratio >= 0.8:
+                        gpu_alloc_text = f"[green]{gpu_alloc_text}[/green]"
+                    elif gpu_alloc_ratio >= 0.4:
+                        gpu_alloc_text = f"[yellow]{gpu_alloc_text}[/yellow]"
                     else:
-                        gpu_util_text = f"[red]{gpu_util_text}[/red]"
+                        gpu_alloc_text = f"[red]{gpu_alloc_text}[/red]"
                 else:
-                    gpu_util_text = "[dim]-[/dim]"
+                    gpu_alloc_text = "[dim]-[/dim]"
 
                 row = [
                     str(idx),
@@ -2290,7 +2363,7 @@ def cmd_avail(args):
                     [
                         str(r.get("total_nodes", 0)),
                         f"{total_free_gpu}/{total_gpu}",
-                        gpu_util_text,
+                        gpu_alloc_text,
                         r.get("gpu_type", "") or "-",
                     ]
                 )
@@ -2334,7 +2407,7 @@ def cmd_avail(args):
                 headers.extend(["低优空余", "碎片低优", "可用节点"])
                 aligns.extend(["right", "right", "right"])
                 max_widths.extend([8, 8, 8])
-            headers.extend(["总节点", "空GPU", "GPU利用率", "GPU类型"])
+            headers.extend(["总节点", "空GPU", "GPU分配率", "GPU类型"])
             aligns.extend(["right", "right", "right", "left"])
             max_widths.extend([6, 12, 9, 10])
 
@@ -3637,14 +3710,24 @@ def _summarize_node_capacity(nodes: List[Dict[str, Any]]) -> Dict[str, Any]:
             free_nodes += 1
 
     used_gpus = max(0, total_gpus - free_gpus)
-    gpu_util_ratio = (used_gpus / total_gpus) if total_gpus > 0 else None
+    # **这是「分配率」，不是「利用率」——两者在最要命的场景下结论相反。**
+    #
+    # 它算的是 `(总卡 − 空闲卡) / 总卡`，即有多少卡被**分配出去**了。一个占着
+    # 8 张卡跑 0% 的任务，在这里是 100%。而平台的空闲回收判的是**真实利用率**
+    # （实测口径「GPU 低于 15% 持续 3 小时」就回收）。所以拿这个数去回答
+    # 「我这台机器会不会被收走」会得到完全相反的答案。
+    #
+    # 真实利用率在本文件里**另有来源**：`task_dimension_to_row()` 用的
+    # `gpu.usage_rate`（来自 list_task_dimension），那一处标的才是「GPU利用率」，
+    # 改名时别顺手把它一起统一了 —— `tests/test_gpu_alloc_vs_util.py` 钉着这条。
+    gpu_alloc_ratio = (used_gpus / total_gpus) if total_gpus > 0 else None
     return {
         "total_nodes": total_nodes,
         "schedulable_nodes": schedulable_nodes,
         "free_nodes": free_nodes,
         "total_gpus": total_gpus,
         "free_gpus": free_gpus,
-        "gpu_util_ratio": gpu_util_ratio,
+        "gpu_alloc_ratio": gpu_alloc_ratio,
     }
 
 
@@ -4306,14 +4389,14 @@ def _format_capacity_summary(option: Dict[str, Any]) -> str:
     free_nodes = option.get("free_nodes", 0)
     total_gpus = option.get("total_gpus", 0)
     free_gpus = option.get("free_gpus", 0)
-    gpu_util_ratio = option.get("gpu_util_ratio")
+    gpu_alloc_ratio = option.get("gpu_alloc_ratio")
 
     if total_nodes:
         parts.append(f"空节点 {free_nodes}/{total_nodes}")
     if total_gpus:
         parts.append(f"空GPU {free_gpus}/{total_gpus}")
-    if gpu_util_ratio is not None:
-        parts.append(f"GPU利用率 {gpu_util_ratio * 100:.1f}%")
+    if gpu_alloc_ratio is not None:
+        parts.append(f"GPU分配率 {gpu_alloc_ratio * 100:.1f}%")
 
     return " | ".join(parts)
 
@@ -4889,9 +4972,9 @@ def _render_workspace_selection_table(display, options: List[Dict[str, Any]]) ->
             int(option.get("total_gpus", 0) or 0) for option in known_capacity_options
         )
         total_used_gpus = max(0, total_gpus - total_free_gpus)
-        total_gpu_util_ratio = _format_percent(total_used_gpus, total_gpus)
+        total_gpu_alloc_ratio = _format_percent(total_used_gpus, total_gpus)
         display.print(
-            f"[dim]空节点 {total_free_nodes}/{total_nodes} | 空GPU {total_free_gpus}/{total_gpus} | GPU利用率 {total_gpu_util_ratio}[/dim]"
+            f"[dim]空节点 {total_free_nodes}/{total_nodes} | 空GPU {total_free_gpus}/{total_gpus} | GPU分配率 {total_gpu_alloc_ratio}[/dim]"
         )
 
     if RICH_TABLE_AVAILABLE and getattr(display, "console", None):
@@ -4907,7 +4990,7 @@ def _render_workspace_selection_table(display, options: List[Dict[str, Any]]) ->
         table.add_column("空节点", justify="right")
         table.add_column("总节点", justify="right", style="dim")
         table.add_column("空GPU", justify="right")
-        table.add_column("GPU利用率", justify="right")
+        table.add_column("GPU分配率", justify="right")
         table.add_column("ID", style="magenta", no_wrap=True)
 
         for idx, option in enumerate(options, 1):
@@ -4923,21 +5006,21 @@ def _render_workspace_selection_table(display, options: List[Dict[str, Any]]) ->
                 )
                 free_gpu_text = f"{free_gpus}/{total_gpus}" if total_gpus > 0 else "-"
                 used_gpus = max(0, total_gpus - free_gpus)
-                gpu_util_text = _format_percent(used_gpus, total_gpus)
+                gpu_alloc_text = _format_percent(used_gpus, total_gpus)
                 if total_gpus > 0:
-                    gpu_util_ratio = used_gpus / total_gpus
-                    if gpu_util_ratio >= 0.8:
-                        gpu_util_text = f"[green]{gpu_util_text}[/green]"
-                    elif gpu_util_ratio >= 0.4:
-                        gpu_util_text = f"[yellow]{gpu_util_text}[/yellow]"
+                    gpu_alloc_ratio = used_gpus / total_gpus
+                    if gpu_alloc_ratio >= 0.8:
+                        gpu_alloc_text = f"[green]{gpu_alloc_text}[/green]"
+                    elif gpu_alloc_ratio >= 0.4:
+                        gpu_alloc_text = f"[yellow]{gpu_alloc_text}[/yellow]"
                     else:
-                        gpu_util_text = f"[red]{gpu_util_text}[/red]"
+                        gpu_alloc_text = f"[red]{gpu_alloc_text}[/red]"
                 else:
-                    gpu_util_text = "[dim]-[/dim]"
+                    gpu_alloc_text = "[dim]-[/dim]"
             else:
                 free_nodes_text = "[dim]-[/dim]"
                 free_gpu_text = "[dim]-[/dim]"
-                gpu_util_text = "[dim]-[/dim]"
+                gpu_alloc_text = "[dim]-[/dim]"
 
             table.add_row(
                 str(idx),
@@ -4945,7 +5028,7 @@ def _render_workspace_selection_table(display, options: List[Dict[str, Any]]) ->
                 free_nodes_text,
                 str(total_nodes) if has_capacity else "-",
                 free_gpu_text,
-                gpu_util_text,
+                gpu_alloc_text,
                 option.get("id", ""),
             )
 
@@ -4974,7 +5057,7 @@ def _render_workspace_selection_table(display, options: List[Dict[str, Any]]) ->
         )
 
     table_lines = _render_plain_table(
-        headers=["排名", "工作空间", "空节点", "总节点", "空GPU", "GPU利用率", "ID"],
+        headers=["排名", "工作空间", "空节点", "总节点", "空GPU", "GPU分配率", "ID"],
         rows=table_rows,
         aligns=["right", "left", "right", "right", "right", "right", "left"],
         max_widths=[4, 24, 6, 6, 12, 9, 40],
@@ -5057,10 +5140,10 @@ def _render_compute_group_selection_table(
             int(option.get("total_gpus", 0) or 0) for option in unique_capacity_options
         )
         total_used_gpus = max(0, total_gpus - total_free_gpus)
-        total_gpu_util_ratio = _format_percent(total_used_gpus, total_gpus)
+        total_gpu_alloc_ratio = _format_percent(total_used_gpus, total_gpus)
         prefix = "按唯一资源池汇总: " if has_shared_pool else ""
         display.print(
-            f"[dim]{prefix}空节点 {total_free_nodes}/{total_nodes} | 空GPU {total_free_gpus}/{total_gpus} | GPU利用率 {total_gpu_util_ratio}[/dim]"
+            f"[dim]{prefix}空节点 {total_free_nodes}/{total_nodes} | 空GPU {total_free_gpus}/{total_gpus} | GPU分配率 {total_gpu_alloc_ratio}[/dim]"
         )
 
     if RICH_TABLE_AVAILABLE and getattr(display, "console", None):
@@ -5079,7 +5162,7 @@ def _render_compute_group_selection_table(
         table.add_column("空节点", justify="right")
         table.add_column("总节点", justify="right", style="dim")
         table.add_column("空GPU", justify="right")
-        table.add_column("GPU利用率", justify="right")
+        table.add_column("GPU分配率", justify="right")
         table.add_column("ID", style="dim", no_wrap=True)
 
         for idx, option in enumerate(options, 1):
@@ -5095,21 +5178,21 @@ def _render_compute_group_selection_table(
                 )
                 free_gpu_text = f"{free_gpus}/{total_gpus}" if total_gpus > 0 else "-"
                 used_gpus = max(0, total_gpus - free_gpus)
-                gpu_util_text = _format_percent(used_gpus, total_gpus)
+                gpu_alloc_text = _format_percent(used_gpus, total_gpus)
                 if total_gpus > 0:
-                    gpu_util_ratio = used_gpus / total_gpus
-                    if gpu_util_ratio >= 0.8:
-                        gpu_util_text = f"[green]{gpu_util_text}[/green]"
-                    elif gpu_util_ratio >= 0.4:
-                        gpu_util_text = f"[yellow]{gpu_util_text}[/yellow]"
+                    gpu_alloc_ratio = used_gpus / total_gpus
+                    if gpu_alloc_ratio >= 0.8:
+                        gpu_alloc_text = f"[green]{gpu_alloc_text}[/green]"
+                    elif gpu_alloc_ratio >= 0.4:
+                        gpu_alloc_text = f"[yellow]{gpu_alloc_text}[/yellow]"
                     else:
-                        gpu_util_text = f"[red]{gpu_util_text}[/red]"
+                        gpu_alloc_text = f"[red]{gpu_alloc_text}[/red]"
                 else:
-                    gpu_util_text = "[dim]-[/dim]"
+                    gpu_alloc_text = "[dim]-[/dim]"
             else:
                 free_nodes_text = "[dim]-[/dim]"
                 free_gpu_text = "[dim]-[/dim]"
-                gpu_util_text = "[dim]-[/dim]"
+                gpu_alloc_text = "[dim]-[/dim]"
 
             table.add_row(
                 str(idx),
@@ -5120,7 +5203,7 @@ def _render_compute_group_selection_table(
                 free_nodes_text,
                 str(total_nodes) if has_capacity else "-",
                 free_gpu_text,
-                gpu_util_text,
+                gpu_alloc_text,
                 option.get("id", ""),
             )
 
@@ -5161,7 +5244,7 @@ def _render_compute_group_selection_table(
             "空节点",
             "总节点",
             "空GPU",
-            "GPU利用率",
+            "GPU分配率",
             "ID",
         ],
         rows=table_rows,
@@ -5247,9 +5330,9 @@ def _build_workspace_choice_context_lines(options: List[Dict[str, Any]]) -> List
         int(option.get("total_gpus", 0) or 0) for option in known_capacity_options
     )
     total_used_gpus = max(0, total_gpus - total_free_gpus)
-    total_gpu_util_ratio = _format_percent(total_used_gpus, total_gpus)
+    total_gpu_alloc_ratio = _format_percent(total_used_gpus, total_gpus)
     return [
-        f"总览: 空节点 {total_free_nodes}/{total_nodes} | 空GPU {total_free_gpus}/{total_gpus} | GPU利用率 {total_gpu_util_ratio}"
+        f"总览: 空节点 {total_free_nodes}/{total_nodes} | 空GPU {total_free_gpus}/{total_gpus} | GPU分配率 {total_gpu_alloc_ratio}"
     ]
 
 
@@ -5289,10 +5372,10 @@ def _build_compute_group_choice_context_lines(
             int(option.get("total_gpus", 0) or 0) for option in unique_capacity_options
         )
         total_used_gpus = max(0, total_gpus - total_free_gpus)
-        total_gpu_util_ratio = _format_percent(total_used_gpus, total_gpus)
+        total_gpu_alloc_ratio = _format_percent(total_used_gpus, total_gpus)
         prefix = "按唯一资源池汇总: " if has_shared_pool else "总览: "
         lines.append(
-            f"{prefix}空节点 {total_free_nodes}/{total_nodes} | 空GPU {total_free_gpus}/{total_gpus} | GPU利用率 {total_gpu_util_ratio}"
+            f"{prefix}空节点 {total_free_nodes}/{total_nodes} | 空GPU {total_free_gpus}/{total_gpus} | GPU分配率 {total_gpu_alloc_ratio}"
         )
     else:
         lines.append("当前未获取到实时占用，以下为缓存计算组列表。")
@@ -6755,6 +6838,24 @@ def cmd_dashboard(args):
         return 0
 
 
+
+def _spec_gpu_count(spec_id):
+    """尽力从本地缓存拿这个规格的 GPU 数，只用于把报错说得具体一点。
+
+    **拿不到就返回 None**，绝不能因为它让提交流程报错 —— 它只是文案里的一个数字。
+    """
+    if not spec_id:
+        return None
+    try:
+        for ws in (load_all_resources() or {}).values():
+            spec = (ws.get("specs") or {}).get(spec_id)
+            if spec:
+                return spec.get("gpu_count")
+    except Exception:  # noqa: BLE001
+        swallowed("create/查规格卡数", RuntimeError("spec lookup failed"))
+    return None
+
+
 def cmd_create(args):
     """创建任务"""
     display = get_display()
@@ -7112,6 +7213,17 @@ def cmd_create(args):
     # 老 v1 create_job_with_cookie 保留作回退。无 cookie 时退老 openapi token path。
     # 注：exclude_nodes 需 workspace 级启用，未启用的空间平台会报
     # "exclude_nodes not enable in workspace"(如 分布式训练空间)。
+    # 提交前：这个（空间, 规格, 优先级）组合上次被平台拒过吗？
+    #
+    # **只拦已知被拒的组合，没见过的一律放行。** 反过来做（维护一张"允许"白名单）
+    # 会把平台后来放开的组合永久挡在门外 —— 而允许范围我们根本读不到，
+    # 白名单从第一天起就是错的。
+    if not getattr(args, "force_priority", False):
+        known = _priority.known_rejection(workspace_id, spec_id, args.priority)
+        if known:
+            display.print_error(_priority.explain_known(known, cg_display))
+            return 1
+
     try:
         cookie_data = get_cookie()
         if cookie_data and cookie_data.get("cookie"):
@@ -7119,6 +7231,23 @@ def cmd_create(args):
         else:
             result = api.create_job(payload)
     except QzAPIError as e:
+        # 「优先级不在该资源规格允许的范围内」原样抛给用户等于没说 —— 他不知道
+        # 该改什么。翻译成下一步，并记住这次拒绝供下次提前拦。
+        if _priority.is_priority_rejection(str(e)):
+            _priority.remember_rejection(
+                workspace_id, spec_id, args.priority, _spec_gpu_count(spec_id)
+            )
+            display.print_error(
+                "任务创建失败：优先级不被这个资源规格接受\n\n"
+                + _priority.explain(
+                    workspace_id,
+                    spec_id,
+                    args.priority,
+                    _spec_gpu_count(spec_id),
+                    cg_display,
+                )
+            )
+            return 1
         display.print_error(f"任务创建失败: {e}")
         return 1
 
@@ -8799,7 +8928,22 @@ def main():
     events_parser = subparsers.add_parser(
         "events", aliases=["ev"], help="查看任务平台事件（排队/调度/抢占诊断）"
     )
-    events_parser.add_argument("job_id", help="任务 ID")
+    events_parser.add_argument(
+        "job_id",
+        nargs="?",
+        help="任务 ID / 开发机（名字、notebook_id 或 URL）。用 --node 时可省略",
+    )
+    events_parser.add_argument(
+        "--node",
+        action="append",
+        metavar="节点名",
+        help=(
+            "查**机器自己**的健康事件（可重复）。这是平台上唯一按节点组织的事件源，"
+            "回答的是 `events <job>` 答不了的那个问题：**是不是这台机器本身有病**。"
+            "撞上「同一台机器反复失败」时用它；qzcli 早就有 --exclude-node，"
+            "但此前没有任何东西告诉你该排除谁"
+        ),
+    )
     events_parser.add_argument(
         "--reason", help="按 reason 子串过滤（大小写不敏感，如 Unschedulable）"
     )
@@ -9096,6 +9240,15 @@ def main():
         "--priority",
         type=int,
         help=f"任务优先级 1-10，**数字越小越低优**（默认 {DEFAULT_CREATE_PRIORITY}=LOW；10 是最高优，会和生产任务抢卡）",
+    )
+    create_parser.add_argument(
+        "--force-priority",
+        action="store_true",
+        help=(
+            "跳过「这个规格上次拒过这个优先级」的本地拦截。平台**逐个规格行**限制"
+            "可用优先级，且允许范围没有任何接口能读，所以 qzcli 只能记住真实被拒过的"
+            "组合。确认平台已放开时用这个绕过"
+        ),
     )
     create_parser.add_argument(
         "--framework", help=f"框架类型（默认 {DEFAULT_CREATE_FRAMEWORK}）"

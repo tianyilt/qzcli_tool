@@ -1209,7 +1209,24 @@ def main() -> int:
                     f"UNKNOWN 是提交后的过渡态，若一直卡在这里说明平台侧异常，"
                     f"手工确认: {jid}",
                 )
-                a._request_v2("hpc", "StopJob", {"job_id": jid})
+                # **读状态和发 StopJob 之间还有一个窗口。** smoke 的 HPC 任务是
+                # 秒级 echo：上一行刚读到 RUNNING，这一行发出去时它已经 SUCCEEDED，
+                # 平台回 `Conflict: only hpc job status ... can be stop`。
+                # 2026-08-27 实测这条只用了 0.1 秒就红了，而任务其实好好地结束了、
+                # 没有任何残留。
+                #
+                # 所以 Conflict 不能直接当失败：**回头再读一次状态**，
+                # 已经是终态就说明本来就没东西可停。只有仍然停不掉才算真失败。
+                try:
+                    a._request_v2("hpc", "StopJob", {"job_id": jid})
+                except QzAPIError as exc:
+                    st = _status()
+                    if st in TERMINAL:
+                        return f"发 StopJob 时任务已自行结束（status={st}），无残留"
+                    raise AssertionError(
+                        f"StopJob 失败且任务未终止（status={st}）：{exc}。"
+                        f"**可能有残留任务**，手工确认: {jid}"
+                    ) from exc
 
                 for _ in range(20):  # 最多等 60 秒确认终态
                     time.sleep(3)

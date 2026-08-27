@@ -20,6 +20,7 @@
 - **交互式提交**: `qzcli create -i` 提供层级式选择界面，缺少快照时按需预加载
 - **任务列表**: 美观的卡片式显示，完整 URL 方便点击
 - **日志查看**: `qzcli logs <job-id>` 直连平台日志接口，支持 tail、follow、raw/json 输出
+- **机器健康**: `qzcli events --node <节点名>` 查这台机器自己的病历（GPU XID 硬件错误、共享盘挂载坏、掉线），并给出能直接粘用的 `--exclude-node` 串 —— 以前有 `--exclude-node` 却没有判断该排除谁的依据
 - **排队诊断**: `qzcli events <id>` 给出平台侧的**真实排队原因**，不用自己猜。训练任务和开发机都支持（两者走不同接口，命令会自动分流）。开发机还会把 K8s 原文翻成能直接行动的结论 —— 比如「计算组挑错了：594 台机器不属于你选的组，换个组，等再久也没用」
 - **状态监控**: watch 模式实时跟踪任务进度
 
@@ -378,7 +379,7 @@ qzcli create --name test --command "echo hi" --workspace "我的工作空间" --
 
 兼容性说明：历史脚本中的 `qzcli create -i <image>` 仍可用，CLI 会自动按旧语义解析为 `--image`。
 
-> **提示**: `qzcli create -i` 在 TTY 终端下会先进入单实例全屏的层级式选择菜单，按 `workspace -> project -> compute_group -> spec` 的顺序逐级选择，`Enter/→` 进入下一层，`←` 返回上一层重新选择，界面会直接覆盖刷新而不是连续堆叠多个表格。`compute_group` 选项里会展示 `GPU类型 / 占用口径 / 规格状态 / 空节点 / 空GPU / GPU利用率`，其中 `共享池` 表示该数值来自底层物理 compute group 的共享资源池实时占用，`规格状态` 会标识该计算组的 spec 列表是否来自实时接口、缓存或异常分支。若某个计算组的实时 spec 查询失败，界面不会退出 TUI，而是在同一屏内给出告警，并支持 `m` 手动输入 spec ID、`r` 重试拉取、`←` 返回上一级更换计算组。完成资源选择后，再按原来的方式输入任务名称、执行命令、Docker 镜像等参数。若当前环境不是 TTY，或缺少 `prompt_toolkit`，CLI 会自动回退到原来的文本交互模式。若本地 cookie 已失效且已配置 CAS 账号密码，CLI 会自动刷新 cookie 后重试；若本地没有可复用的交互快照，`create -i` 会按需预加载当前可访问 workspace 的资源快照，并将结果保存到 `~/.qzcli/create_interactive_snapshot.json` 供后续复用。已经显式传入的参数会直接跳过。非交互模式下，`--project`、`--compute-group`、`--spec` 省略时仍会自动从 `qzcli res` 缓存中选取第一个。首次使用前建议先运行 `qzcli login && qzcli res -u`。
+> **提示**: `qzcli create -i` 在 TTY 终端下会先进入单实例全屏的层级式选择菜单，按 `workspace -> project -> compute_group -> spec` 的顺序逐级选择，`Enter/→` 进入下一层，`←` 返回上一层重新选择，界面会直接覆盖刷新而不是连续堆叠多个表格。`compute_group` 选项里会展示 `GPU类型 / 占用口径 / 规格状态 / 空节点 / 空GPU / GPU分配率`，其中 `共享池` 表示该数值来自底层物理 compute group 的共享资源池实时占用，`规格状态` 会标识该计算组的 spec 列表是否来自实时接口、缓存或异常分支。若某个计算组的实时 spec 查询失败，界面不会退出 TUI，而是在同一屏内给出告警，并支持 `m` 手动输入 spec ID、`r` 重试拉取、`←` 返回上一级更换计算组。完成资源选择后，再按原来的方式输入任务名称、执行命令、Docker 镜像等参数。若当前环境不是 TTY，或缺少 `prompt_toolkit`，CLI 会自动回退到原来的文本交互模式。若本地 cookie 已失效且已配置 CAS 账号密码，CLI 会自动刷新 cookie 后重试；若本地没有可复用的交互快照，`create -i` 会按需预加载当前可访问 workspace 的资源快照，并将结果保存到 `~/.qzcli/create_interactive_snapshot.json` 供后续复用。已经显式传入的参数会直接跳过。非交互模式下，`--project`、`--compute-group`、`--spec` 省略时仍会自动从 `qzcli res` 缓存中选取第一个。首次使用前建议先运行 `qzcli login && qzcli res -u`。
 
 ### 提交 HPC/CPU 任务
 
