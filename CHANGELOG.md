@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+- **`create` 新增平台自动容错开关。** `--auto-fault-tolerance` 把 payload 顶层的
+  `auto_fault_tolerance` 从写死的 `false` 变成 `true`，任务异常退出后由平台自动重跑
+  同一条命令；`--fault-tolerance-max-retry N` / `--fault-tolerance-retry-interval-sec SEC`
+  对应 `fault_tolerance_max_retry` / `fault_tolerance_retry_interval_sec`，不指定则用平台
+  默认。两个数值参数单独给出时平台会静默忽略，所以 CLI 直接拒绝并要求同时开开关。
+
 ## v0.4.14 - 2026-08-27
 
 **把 v0.4.13 改错的一处改回来。**

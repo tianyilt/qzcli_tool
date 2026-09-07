@@ -338,6 +338,10 @@ qzcli create \
   --instances 4 \
   --priority 10
 
+# 开启平台自动容错：任务异常退出后由平台自动重跑同一条命令，最多重试 3 次、间隔 300 秒
+qzcli create -n my-job -c "bash /path/to/wrapper.sh" --instances 144 \
+    --auto-fault-tolerance --fault-tolerance-max-retry 3 --fault-tolerance-retry-interval-sec 300
+
 # 使用 ID
 qzcli create \
   --name "my-training-job" \

@@ -7121,7 +7121,7 @@ def cmd_create(args):
         "framework": args.framework,
         "command": args.cmd_str,
         "task_priority": args.priority,
-        "auto_fault_tolerance": False,
+        "auto_fault_tolerance": bool(getattr(args, "auto_fault_tolerance", False)),
         "framework_config": [
             {
                 "cpu": int(spec_obj.get("cpu_count") or 0),
@@ -7160,6 +7160,35 @@ def cmd_create(args):
         if vals is None:
             return 1
         payload["specified_nodes"] = vals
+
+    # --- Auto fault tolerance（平台自动容错：顶层 auto_fault_tolerance /
+    # fault_tolerance_max_retry / fault_tolerance_retry_interval_sec）---
+    # 两个数值参数只在开了 --auto-fault-tolerance 时才有意义；单独给出时
+    # 平台会静默忽略，所以这里直接拒绝，避免"以为设了重试其实没开容错"。
+    max_retry = getattr(args, "fault_tolerance_max_retry", None)
+    retry_interval = getattr(args, "fault_tolerance_retry_interval_sec", None)
+    if (max_retry is not None or retry_interval is not None) and not payload[
+        "auto_fault_tolerance"
+    ]:
+        display.print_error(
+            "--fault-tolerance-max-retry / --fault-tolerance-retry-interval-sec "
+            "需要同时指定 --auto-fault-tolerance"
+        )
+        return 1
+    for flag, value, key in (
+        ("--fault-tolerance-max-retry", max_retry, "fault_tolerance_max_retry"),
+        (
+            "--fault-tolerance-retry-interval-sec",
+            retry_interval,
+            "fault_tolerance_retry_interval_sec",
+        ),
+    ):
+        if value is None:
+            continue
+        if int(value) < 0:
+            display.print_error(f"{flag} 不能为负数: {value}")
+            return 1
+        payload[key] = int(value)
 
     # --- Dataset mounting ---
     if getattr(args, "dataset", None):
@@ -9283,6 +9312,29 @@ def main():
         help="把作业锁定到指定节点（node pinning，可多次指定 → 平台 specified_nodes）。"
         "与 --exclude-node 相对。注：需 workspace 启用该能力，未启用时平台报 "
         "specified_nodes not enable。",
+    )
+    create_parser.add_argument(
+        "--auto-fault-tolerance",
+        dest="auto_fault_tolerance",
+        action="store_true",
+        help="开启平台自动容错：任务异常退出后由平台自动重试同一条命令"
+        "（payload 顶层 auto_fault_tolerance=true；默认关闭）。",
+    )
+    create_parser.add_argument(
+        "--fault-tolerance-max-retry",
+        dest="fault_tolerance_max_retry",
+        type=int,
+        metavar="N",
+        help="自动容错最大重试次数（payload fault_tolerance_max_retry）。"
+        "需配合 --auto-fault-tolerance；不指定则用平台默认。",
+    )
+    create_parser.add_argument(
+        "--fault-tolerance-retry-interval-sec",
+        dest="fault_tolerance_retry_interval_sec",
+        type=int,
+        metavar="SEC",
+        help="自动容错两次重试之间的间隔秒数（payload fault_tolerance_retry_interval_sec）。"
+        "需配合 --auto-fault-tolerance；不指定则用平台默认。",
     )
     create_parser.add_argument("--no-track", action="store_true", help="不自动追踪任务")
     create_parser.add_argument(
