@@ -1,6 +1,15 @@
 # Changelog
 
-## Unreleased
+## v0.4.15 - 2026-09-10
+
+**主题：把平台一直支持、CLI 却锁死了六个月的自动容错打开。**
+
+驱动这一版的是一次真实阻塞：`motor` 的 `submit_qzcli.sh` 已经在给 `qzcli create`
+发这三个参数，而**任何已发布版本都不认**，128 节点的训练任务提交直接报
+`unrecognized arguments`。查下来根因不是"新版丢了兼容"，方向是反的 ——
+脚本跑在 CLI 前面：平台的 `train CreateJob` 从来支持这三个字段，
+但 `auto_fault_tolerance` 自 2026-03-15 `create` 命令诞生起就被硬编码成 `false`，
+另外两个 CLI 压根没暴露过。
 
 - **`create` 新增平台自动容错开关。** `--auto-fault-tolerance` 把 payload 顶层的
   `auto_fault_tolerance` 从写死的 `false` 变成 `true`，任务异常退出后由平台自动重跑
