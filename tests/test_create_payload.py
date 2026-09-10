@@ -227,6 +227,54 @@ class CreatePayloadTests(unittest.TestCase):
             rc, api = self._run_create(_build_args())
         self.assertNotIn("specified_nodes", api.last_payload)
 
+    def test_fault_tolerance_off_by_default(self):
+        # 不传 --auto-fault-tolerance：顶层 auto_fault_tolerance=false，且不带重试字段
+        with redirect_stdout(io.StringIO()):
+            rc, api = self._run_create(_build_args())
+        self.assertEqual(0, rc)
+        self.assertIs(api.last_payload["auto_fault_tolerance"], False)
+        self.assertNotIn("fault_tolerance_max_retry", api.last_payload)
+        self.assertNotIn("fault_tolerance_retry_interval_sec", api.last_payload)
+
+    def test_auto_fault_tolerance_flags_to_payload(self):
+        # --auto-fault-tolerance + 两个数值 → 顶层三个字段，数值原样为 int
+        args = _build_args(
+            auto_fault_tolerance=True,
+            fault_tolerance_max_retry=3,
+            fault_tolerance_retry_interval_sec=300,
+        )
+        with redirect_stdout(io.StringIO()):
+            rc, api = self._run_create(args)
+        self.assertEqual(0, rc)
+        self.assertIs(api.last_payload["auto_fault_tolerance"], True)
+        self.assertEqual(api.last_payload["fault_tolerance_max_retry"], 3)
+        self.assertEqual(api.last_payload["fault_tolerance_retry_interval_sec"], 300)
+
+    def test_auto_fault_tolerance_alone_leaves_platform_defaults(self):
+        with redirect_stdout(io.StringIO()):
+            rc, api = self._run_create(_build_args(auto_fault_tolerance=True))
+        self.assertEqual(0, rc)
+        self.assertIs(api.last_payload["auto_fault_tolerance"], True)
+        self.assertNotIn("fault_tolerance_max_retry", api.last_payload)
+        self.assertNotIn("fault_tolerance_retry_interval_sec", api.last_payload)
+
+    def test_fault_tolerance_numbers_require_the_switch(self):
+        # 只给重试次数不开容错：平台会静默忽略，所以本地直接拒绝
+        with redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()):
+            rc, api = self._run_create(_build_args(fault_tolerance_max_retry=3))
+        self.assertEqual(1, rc)
+        self.assertIsNone(api.last_payload)
+
+    def test_fault_tolerance_negative_rejected(self):
+        with redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()):
+            rc, api = self._run_create(
+                _build_args(
+                    auto_fault_tolerance=True, fault_tolerance_retry_interval_sec=-1
+                )
+            )
+        self.assertEqual(1, rc)
+        self.assertIsNone(api.last_payload)
+
     def _run_counting_routes(self, args):
         """跑 cmd_create，返回 {'v1':n,'v2':n} 路由计数。"""
         api = _FakeAPI()
