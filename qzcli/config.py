@@ -181,6 +181,51 @@ def load_env_file() -> Dict[str, str]:
 #: 环境变量；期间还白白消耗了 CAS 的锁定计数。
 CREDENTIAL_SOURCES = ("环境变量", ".env 文件", "config.json")
 
+#: 显式指定来源时用的短名，顺序 **就是**默认优先级。
+#: 给 ``qzcli login --source`` 用 —— 冲突时让用户能说清"用哪一处"，
+#: 而不是靠猜优先级。
+CREDENTIAL_SOURCE_KEYS = ("env", "envfile", "config")
+
+
+def password_fingerprint(value: str) -> str:
+    """密码指纹 = sha256 前 8 位。
+
+    **所有面向用户的凭据输出都只许出现指纹，永远不许出现明文。**
+    指纹足够回答「这两处是不是同一个密码」和「生效的是不是我刚改的那个」，
+    而这正是排查时唯一需要知道的事。
+    """
+    return hashlib.sha256(value.encode()).hexdigest()[:8] if value else ""
+
+
+def _credential_slots():
+    """三个来源各自的 ``(短名, 标签, 用户名, 密码)``，按优先级从高到低。
+
+    抽出来是为了让「取值」「报冲突」「按来源取」三件事共用**同一份**定义 ——
+    各写一遍的话，迟早出现"提示说用 A、实际用了 B"。
+    """
+    config = load_config()
+    env_file_values = load_env_file()
+    return (
+        (
+            "env",
+            "环境变量 QZCLI_PASSWORD",
+            os.environ.get("QZCLI_USERNAME", ""),
+            os.environ.get("QZCLI_PASSWORD", ""),
+        ),
+        (
+            "envfile",
+            str(get_env_file_path()),
+            env_file_values.get("QZCLI_USERNAME", ""),
+            env_file_values.get("QZCLI_PASSWORD", ""),
+        ),
+        (
+            "config",
+            str(CONFIG_FILE),
+            config.get("username", ""),
+            config.get("password", ""),
+        ),
+    )
+
 
 def _pick(key: str, config_key: str, env_file_values, config):
     """按优先级取一个凭据字段，**连同它来自哪里**一起返回。
@@ -212,44 +257,77 @@ def get_credentials_with_source() -> tuple[str, str, str, str]:
     return username, password, user_src, pass_src
 
 
-def describe_credential_conflict() -> str:
-    """**多个来源都有密码、且值不一样**时，返回一句能直接照着做的提示；否则返回空串。
+def credential_conflict() -> List[tuple]:
+    """**多处都存了密码、且值不一样**时返回 ``[(标签, 指纹), …]``（按优先级）；否则 ``[]``。
+
+    这是一个**判据**，不是一句提示 —— 调用方要能据此决定「还发不发这次认证请求」。
+    ``describe_credential_conflict()`` 只是它的人类可读外衣。
+
+    为什么需要判据而不只是提示：认证服务按**失败次数**锁账号（5 次）。冲突时
+    照着优先级发请求，如果优先级最高的那处是过期的 export，就是白烧一格锁定
+    计数，而且**每条命令都烧一次**。检测到了就必须能挡住。
+    """
+    seen = [
+        (label, password_fingerprint(pw))
+        for _, label, _, pw in _credential_slots()
+        if pw
+    ]
+    if len(seen) < 2 or len({f for _, f in seen}) < 2:
+        return []
+    return seen
+
+
+def describe_credential_conflict(action: str = "本次使用") -> str:
+    """冲突时返回一段能直接照着做的说明；无冲突返回空串。
 
     这正是 2026-09-11 那次事故的形状：``config.json`` 已经是新密码，
     shell 里的 ``QZCLI_PASSWORD`` 还是旧的，而环境变量优先级更高。
     只报「密码错误」的话，用户会一直以为是自己密码记错了。
 
     **不比较、也不回显任何密码明文** —— 只比较指纹。
+
+    Args:
+        action: 标在优先级最高那一行后面的字样。自动重登路径会传
+            「自动重登会用」，以便说清是谁要发这个请求。
     """
-    import hashlib
-
-    config = load_config()
-    env_file_values = load_env_file()
-
-    def fp(v):
-        return hashlib.sha256(v.encode()).hexdigest()[:8] if v else ""
-
-    seen = []
-    for label, value in (
-        (f"环境变量 QZCLI_PASSWORD", os.environ.get("QZCLI_PASSWORD", "")),
-        (f"{get_env_file_path()}", env_file_values.get("QZCLI_PASSWORD", "")),
-        (f"{CONFIG_FILE}", config.get("password", "")),
-    ):
-        if value:
-            seen.append((label, fp(value)))
-
-    if len(seen) < 2 or len({f for _, f in seen}) < 2:
+    seen = credential_conflict()
+    if not seen:
         return ""
 
-    lines = ["⚠ 检测到多处存着**不一样**的密码，当前生效的是优先级最高的那个："]
+    lines = ["⚠ 检测到多处存着**不一样**的密码，优先级从高到低："]
     for i, (label, f) in enumerate(seen):
-        mark = "← 本次使用" if i == 0 else ""
+        mark = f"← {action}" if i == 0 else ""
         lines.append(f"    {label}  指纹 {f} {mark}")
     lines.append(
         "  如果你刚改过密码却还在报密码错误，多半是优先级更高的那处没更新。"
     )
-    lines.append("  环境变量通常来自 ~/.zshrc / ~/.bashrc，**已经启动的进程不会自动更新**。")
+    lines.append(
+        "  环境变量通常来自 ~/.zshrc / ~/.bashrc，**已经启动的进程不会自动更新** ——"
+    )
+    lines.append("  那些进程要重启才会拿到新密码，或者在它们里先 unset QZCLI_PASSWORD。")
     return "\n".join(lines)
+
+
+def get_credentials_from_source(source: str) -> tuple[str, str]:
+    """只认指定的那一处取凭据 —— **显式胜过猜优先级**。
+
+    给 ``qzcli login --source env|envfile|config`` 用：冲突被挡下来之后，
+    用户需要一个不含歧义的前进方式，而不是被迫去改 shell 或删文件。
+
+    用户名允许回退到常规优先级（指定的那处没写用户名时）—— 用户名弄错不会
+    烧锁定计数，密码才会，所以只对密码强制「只认这一处」。
+    """
+    for key, label, user, pw in _credential_slots():
+        if key != source:
+            continue
+        if not pw:
+            raise ValueError(f"{label} 里没有密码，--source {source} 无从取值")
+        if not user:
+            user = get_credentials_with_source()[0]
+        return user, pw
+    raise ValueError(
+        f"未知的凭据来源 {source!r}，可选: " + " / ".join(CREDENTIAL_SOURCE_KEYS)
+    )
 
 
 def get_credentials() -> tuple[str, str]:

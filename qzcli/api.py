@@ -21,9 +21,12 @@ from urllib.parse import urlencode
 import requests
 
 from . import __version__
+from . import opslog
 from .config import (
     CONFIG_DIR,
     clear_token_cache,
+    credential_conflict,
+    describe_credential_conflict,
     get_api_base_url,
     get_cookie,
     get_credentials,
@@ -389,6 +392,29 @@ _TAG_RE = re.compile(r"<[^>]+>")
 #: 这类失败**重试没有意义，而且有害** —— 每次重试都是一次新的失败尝试，
 #: 攒够次数 CAS 会把账号锁死。2026-08-12 真锁过一次。
 _CREDENTIAL_FAILURE_MARKERS = ("锁定", "密码错误", "用户名或密码", "账号不存在")
+
+
+def _credential_conflict_block(action: str) -> str:
+    """多处密码不一致时，返回该抛出的错误文案；一致（或只有一处）时返回空串。
+
+    **为什么必须在发请求之前挡住**：认证服务按失败次数锁账号。冲突意味着我们
+    压根不知道哪个密码是对的，而优先级最高的那处恰恰最容易是过期的 ——
+    典型情形是一条改密码之前就 ``export`` 过的 ``QZCLI_PASSWORD`` 留在长期
+    运行的进程里（编辑器、agent、tmux）。这时候「先发出去试试」不是乐观，
+    是**拿账号的锁定额度去赌**，而且每条命令赌一次。
+
+    自动重登比手敲 ``login`` 更危险：用户只是敲了一句 ``qzcli status``，
+    撞上过期 cookie 就静默去打一次认证 —— 全程没人看见。
+    """
+    if not credential_conflict():
+        return ""
+    return (
+        f"已阻止{action}：检测到多处存着不一样的密码，无法判断哪个是对的。\n"
+        + describe_credential_conflict(f"{action}会用")
+        + "\n  认证服务按失败次数锁账号，所以这里**不发请求**，而不是先试一下。\n"
+        "  确认用哪一处之后执行： qzcli login --source config"
+        "（或 env / envfile，也可以 --password-stdin 直接给）"
+    )
 
 
 def is_credential_failure(message: str) -> bool:
@@ -794,10 +820,32 @@ class QzAPI:
                     if propagate_errors:
                         raise QzAPIError(recent)
                     return None
+                # 冲突时**绝不发请求**。这里是自动重登，用户可能只是敲了
+                # 一句 `qzcli status` —— 拿他账号的锁定额度去赌哪个密码对，
+                # 而且全程无声，是这条路径上最坏的行为。
+                blocked = _credential_conflict_block("自动重新登录")
+                if blocked:
+                    # 记进冷却：否则并发的每个线程/进程都会各自再算一遍、
+                    # 各自报一次，噪声掩盖掉真正该做的那一件事。
+                    _record_relogin_failure(blocked)
+                    opslog.record(
+                        "relogin", outcome="error", err_class="credential-conflict"
+                    )
+                    if propagate_errors:
+                        raise QzAPIError(blocked)
+                    return None
                 try:
                     cookie = self.login_with_cas(self._username, self._password)
                 except QzAPIError as exc:
                     _record_relogin_failure(str(exc))
+                    # 自动重登失败必须留痕。它不经过 main() 的分发点，
+                    # 所以不写这一条的话操作日志里**一个字都不会有** ——
+                    # 排查时会看到"本机没登录过"，而平台侧审计记着一串失败。
+                    opslog.record(
+                        "relogin",
+                        outcome="error",
+                        err_class=exc.__class__.__name__,
+                    )
                     if propagate_errors:
                         raise
                     return None
@@ -822,6 +870,12 @@ class QzAPI:
             raise QzAPIError(
                 "未配置认证信息，请运行 qzcli init 或设置环境变量 QZCLI_USERNAME/QZCLI_PASSWORD"
             )
+
+        # 这条路径把密码**明文**发给 /auth/token，同样是一次凭据验证。
+        # 冲突时一样不许发 —— 错误的凭据在哪个端点上失败都是失败。
+        blocked = _credential_conflict_block("获取 Token")
+        if blocked:
+            raise QzAPIError(blocked)
 
         url = f"{self.base_url}/auth/token"
         response = _curl_post(

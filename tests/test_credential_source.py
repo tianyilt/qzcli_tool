@@ -154,43 +154,15 @@ class OpsLogFailureTests(unittest.TestCase):
                         raise ValueError("must propagate")
 
 
-class OpsLogIsolationTests(unittest.TestCase):
-    """测试跑完不许在用户真实的操作日志里留下痕迹。
+class CliMainIsolationLintTests(unittest.TestCase):
+    """走真 ``cli.main()`` 的用例，所在类必须自己把日志重定向掉。
 
-    2026-09-12 实测:``tests/test_create_interactive.py`` 里两条走真 ``cli.main()``
-    的用例，和本文件原先一条没隔离的用例，一起往 ``~/.qzcli/qzcli_ops.log``
-    写进了假记录（``argv=["python3 -m unittest", ...]`` 和
-    ``argv=["qzcli","create","-i"]``、``duration_ms=0``）。当时正在用这份日志
-    给「账号为什么反复被锁」取证，测试写的假条目直接污染了证据。
+    进程级隔离在 ``tests/test_opslog_isolation.py``；这条是额外一层 lint，
+    因为 ``cli.main()`` 会把**真实 argv** 写进记录，而那是最像真实操作、
+    最容易被当成用户行为误读的一种污染。
     """
 
-    def test_default_log_path_is_the_real_state_dir(self):
-        """没有 override 时日志落在状态目录里 —— 这就是被测试写脏的那个真实路径。
-
-        注意 ``CONFIG_DIR`` 在 import 时就绑定了，所以运行期改 ``QZCLI_HOME``
-        不会改变它;能在测试里隔离日志的唯一手段是 ``QZCLI_OPS_LOG``。
-        """
-        env = {k: v for k, v in os.environ.items() if k != "QZCLI_OPS_LOG"}
-        with mock.patch.dict(os.environ, env, clear=True):
-            self.assertEqual(
-                (Path(cfg.CONFIG_DIR) / opslog.LOG_NAME).resolve(),
-                opslog.log_path().resolve(),
-            )
-
-    def test_env_override_is_honoured(self):
-        """隔离手段本身必须有效，否则上面那条守门形同虚设。"""
-        with tempfile.TemporaryDirectory() as d:
-            target = Path(d) / "nested" / "ops.log"
-            with mock.patch.dict(os.environ, {"QZCLI_OPS_LOG": str(target)}):
-                opslog.record("login", outcome="ok")
-            self.assertTrue(target.exists(), "QZCLI_OPS_LOG 没被 opslog 采纳")
-
     def test_no_test_invokes_cli_main_without_isolating_the_log(self):
-        """走真 ``cli.main()`` 的用例，所在类必须自己把日志重定向掉。
-
-        判据刻意做得粗:凡是出现 ``cli.main()`` 的测试文件,同一个文件里就必须
-        出现 ``QZCLI_OPS_LOG``。以后谁再加一条裸的 ``cli.main()`` 用例,这条会红。
-        """
         tests_dir = Path(__file__).resolve().parent
         offenders = []
         for f in sorted(tests_dir.glob("test_*.py")):
@@ -199,7 +171,7 @@ class OpsLogIsolationTests(unittest.TestCase):
                 offenders.append(f.name)
         self.assertEqual(
             [], offenders,
-            "这些测试会往用户真实的 ~/.qzcli/qzcli_ops.log 里写记录，"
+            "这些测试会往操作日志里写带真实 argv 的记录，"
             "请在所在类的 setUp 里 patch QZCLI_OPS_LOG 到临时目录: "
             + ", ".join(offenders),
         )

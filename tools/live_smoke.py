@@ -22,6 +22,7 @@ import sys
 import time
 import traceback
 
+import re
 import requests
 from pathlib import Path
 from typing import Any, Callable, Dict, List
@@ -196,6 +197,20 @@ VERBOSE = False
 def assert_true(cond: bool, msg: str):
     if not cond:
         raise AssertionError(msg)
+
+
+def _hit_rate_limit(out: str) -> bool:
+    """输出里有没有**真的**限流。
+
+    不能按裸子串 ``429`` 判。踩过：任务总数长到 ``4294`` 那天，
+    ``总计: 4294 个任务`` 里的子串 ``429`` 让「usage 默认形态」在平台完全正常
+    的情况下报了失败（2026-09-12，v0.4.17 闸门）。一个会被十进制数字巧合触发的
+    判据，只会教人忽略闸门失败 —— 那比没有这条检查更糟。
+
+    真撞限流时 qzcli 打的是 ``触发平台限流（HTTP 429）``（见 api.py 的
+    ``QzRateLimitError``），所以按那个形状匹配。
+    """
+    return bool(re.search(r"HTTP\s*429|触发平台限流|Too Many Requests", out))
 
 
 def main() -> int:
@@ -609,7 +624,7 @@ def main() -> int:
         # rc 必须断言。以前只查输出关键词，命令 exit 1 但输出恰好没有 "429"
         # 就会算通过 —— 等于这条用例可以静默失效。
         assert_true(rc == 0, f"命令退出码 {rc}（非 0）：{out[-300:]}")
-        assert_true("429" not in out, "撞上限流 429 —— 并发放大没控制住")
+        assert_true(not _hit_rate_limit(out), "撞上限流 429 —— 并发放大没控制住")
         assert_true(
             "AccessForbidden" not in out,
             "已禁用/无权限的工作空间没被跳过，噪声会盖住真问题",
@@ -624,7 +639,7 @@ def main() -> int:
     def _cli_usage():
         rc, out = run_cli("usage")
         assert_true(rc == 0, f"命令退出码 {rc}（非 0）：{out[-300:]}")
-        assert_true("429" not in out, "撞上限流 429")
+        assert_true(not _hit_rate_limit(out), "撞上限流 429")
         assert_true("AccessForbidden" not in out, "权限噪声未清理")
         return "无 429、无权限噪声"
 
@@ -639,7 +654,7 @@ def main() -> int:
         for i in range(3):
             rc, out = run_cli("avail")
             assert_true(rc == 0, f"第 {i+1} 次退出码 {rc}：{out[-200:]}")
-            assert_true("429" not in out, f"第 {i+1} 次就撞上 429")
+            assert_true(not _hit_rate_limit(out), f"第 {i+1} 次就撞上 429")
         return "连跑 3 次无 429"
 
     _cli_repeat()
@@ -741,7 +756,7 @@ def main() -> int:
         限流看的是累计 QPS，不是并发度。"""
         rc, out = run_cli("hpc-usage")
         assert_true(rc == 0, f"命令退出码 {rc}（非 0）：{out[-300:]}")
-        assert_true("429" not in out, "撞上限流 429")
+        assert_true(not _hit_rate_limit(out), "撞上限流 429")
         assert_true("AccessForbidden" not in out, "权限噪声未清理")
         return "无 429、无权限噪声"
 
@@ -753,7 +768,7 @@ def main() -> int:
     def _cli_list_all():
         rc, out = run_cli("list", "-c", "--all-ws")
         assert_true(rc == 0, f"命令退出码 {rc}（非 0）：{out[-300:]}")
-        assert_true("429" not in out, "撞上限流 429")
+        assert_true(not _hit_rate_limit(out), "撞上限流 429")
         return "无 429"
 
     _cli_list_all()
@@ -769,7 +784,7 @@ def main() -> int:
         """
         rc, out = run_cli("res", "-u", timeout=1800)
         assert_true(rc == 0, f"命令退出码 {rc}（非 0）：{out[-300:]}")
-        assert_true("429" not in out, "8 线程扇出撞上限流 429")
+        assert_true(not _hit_rate_limit(out), "8 线程扇出撞上限流 429")
         assert_true("AccessForbidden" not in out, "权限噪声未清理")
         return "8 线程扇出无 429"
 

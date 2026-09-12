@@ -29,6 +29,7 @@ from .api import (
 from .config import (
     clear_cookie,
     CONFIG_DIR,
+    CREDENTIAL_SOURCE_KEYS,
     FALLBACK_DEFAULT_PRIORITY,
     find_resource_by_name,
     find_workspace_by_name,
@@ -8738,7 +8739,13 @@ def cmd_login(args):
 
     display = get_display()
     api = get_api()
-    from .config import get_credentials_with_source, describe_credential_conflict
+    from .config import (
+        credential_conflict,
+        describe_credential_conflict,
+        get_credentials_from_source,
+        get_credentials_with_source,
+        password_fingerprint,
+    )
 
     # 值仍然走 `get_credentials()` —— 它是既有契约，测试也在这一层打桩，
     # 不该为了加一句提示就把调用点换掉。来源标签单独取，取不到就降级成「未知」，
@@ -8750,6 +8757,20 @@ def cmd_login(args):
         _user_src = _pass_src = "未知"
     if not stored_password:
         _pass_src = "未设置"
+
+    # --source 指定了就**只认那一处**，优先级不再参与。
+    _explicit_source = getattr(args, "source", None)
+    if _explicit_source:
+        try:
+            stored_username, stored_password = get_credentials_from_source(
+                _explicit_source
+            )
+        except ValueError as exc:
+            display.print_error(str(exc))
+            return 1
+        _pass_src = f"--source {_explicit_source}"
+        if not (args.username or "").strip():
+            _user_src = f"--source {_explicit_source}"
 
 
     # fallback 顺序: CLI 参数 → 环境变量 QZCLI_USERNAME/QZCLI_PASSWORD → config.json → 交互式输入
@@ -8801,6 +8822,35 @@ def cmd_login(args):
     elif not stored_password:
         _pass_src = "交互式输入"
     display.print(f"[dim]凭据来源: 用户名={_user_src} | 密码={_pass_src}[/dim]")
+
+    # 冲突时**不发请求**。认证服务按失败次数锁账号，而冲突恰恰意味着我们不知道
+    # 哪个密码是对的 —— 「先试一下」等于拿锁定额度去赌。只有在密码来源已经没有
+    # 歧义时才放行：显式 -p / --password-stdin / --source，或用户明确 --force。
+    _password_is_unambiguous = bool(
+        args.password
+        or getattr(args, "password_stdin", False)
+        or _explicit_source
+        or not stored_password  # 交互式输入的，本来就是用户当场给的
+    )
+    if not _password_is_unambiguous and not getattr(args, "force", False):
+        _rows = credential_conflict()
+        # 收紧判据：只有当**即将发出去的这个密码**确实是那堆有歧义来源里优先级
+        # 最高的那个时才拦。否则（密码另有来路）冲突与本次请求无关，拦了就是
+        # 误报 —— 而误报会让人学会加 --force，那这道闸门就白装了。
+        if _rows and password_fingerprint(password) == _rows[0][1]:
+            display.print(describe_credential_conflict("本次会用"))
+            display.print_error(
+                "已阻止本次登录：多处密码不一致，用错的那个会白烧一次账号锁定次数。"
+            )
+            display.print(
+                "  说清用哪一处再来： [bold]qzcli login --source config[/bold]"
+                "（或 env / envfile）"
+            )
+            display.print(
+                "  也可以 [bold]--password-stdin[/bold] 直接给密码，"
+                "或 [bold]--force[/bold] 坚持按优先级来。"
+            )
+            return 1
 
     display.print("[dim]正在登录...[/dim]")
 
@@ -9085,6 +9135,18 @@ def main():
         "--password-stdin",
         action="store_true",
         help="从 stdin 读取密码（适合脚本: echo 'pass' | qzcli login -u user --password-stdin）",
+    )
+    login_parser.add_argument(
+        "--source",
+        choices=CREDENTIAL_SOURCE_KEYS,
+        help="只认这一处的密码：env（环境变量）/ envfile（~/.qzcli/.env）/ config"
+        "（~/.qzcli/config.json）。多处密码不一致时用它说清用哪个。",
+    )
+    login_parser.add_argument(
+        "--force",
+        action="store_true",
+        help="多处密码不一致时照按优先级登录。**会消耗账号锁定次数**，"
+        "优先用 --source 说清用哪一处。",
     )
     login_parser.add_argument("--workspace", "-w", help="默认工作空间 ID")
 
