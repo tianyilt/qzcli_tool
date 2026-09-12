@@ -148,17 +148,32 @@ class timed:
     def __init__(self, op: str, target: str = "", **extra):
         self.op, self.target, self.extra = op, target, extra
         self._t0 = 0.0
+        self._failed = ""
 
     def __enter__(self):
         self._t0 = time.time()
         return self
 
+    def mark_failed(self, err_class: str = "") -> None:
+        """没抛异常、但业务上失败了（典型是 ``cmd_*`` 返回非 0）时调用。
+
+        少了它，「捕获异常 → 打印错误 → return 1」这种最常见的失败写法
+        会被记成 ``outcome: ok``，日志从「缺失」退化成「说反话」。
+        """
+        self._failed = err_class or "failed"
+
     def __exit__(self, exc_type, exc, _tb):
+        if exc_type is not None:
+            outcome, err_class = "error", exc_type.__name__
+        elif self._failed:
+            outcome, err_class = "error", self._failed
+        else:
+            outcome, err_class = "ok", ""
         record(
             self.op,
-            outcome="ok" if exc_type is None else "error",
+            outcome=outcome,
             target=self.target,
-            err_class=exc_type.__name__ if exc_type else "",
+            err_class=err_class,
             duration_ms=int((time.time() - self._t0) * 1000),
             **self.extra,
         )

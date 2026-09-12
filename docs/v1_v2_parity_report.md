@@ -2,7 +2,7 @@
 
 - 扫描工作空间：**15**
 - 扫描端点：projects, jobs, notebooks, nodes, tasks, basic_info, overview
-- 发现差异：**3**（SCHEMA 0 / VALUE 2 / VOLUME 0 / ERROR 0 / SCHEMA_REVIEWED 1）
+- 发现差异：**2**（SCHEMA 0 / VALUE 1 / VOLUME 0 / ERROR 0 / SCHEMA_REVIEWED 1）
 
 > **判据分档**（混在一起看会淹没真问题）：
 > - `SCHEMA` 字段名不一致 —— **最危险**。v2 换字段名不会报错，只会静默返回空，代码照跑
@@ -14,12 +14,11 @@
 > 已核实无害、不再计入的差异：
 > - `brand_name` —— v2 补充中文品牌名（v1 为空串），代码不读该字段
 
-## VALUE（2）
+## VALUE（1）
 
 | 端点 | 工作空间 | 详情 |
 |---|---|---|
-| `projects` | （全局） | 10 条交集里字段值不一致：remain_budget×10, is_member×10, sub_project_list×1 |
-| `jobs` | 分布式训练空间 | 20 条交集里字段值不一致：node_infos×2, timeline×2, node_count×2 |
+| `projects` | （全局） | 10 条交集里字段值不一致：is_member×10, remain_budget×10, sub_project_list×1 |
 
 ## SCHEMA_REVIEWED（1）
 

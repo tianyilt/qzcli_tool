@@ -9,12 +9,6 @@
     "kind": "VALUE",
     "endpoint": "projects",
     "workspace": "（全局）",
-    "detail": "10 条交集里字段值不一致：remain_budget×10, is_member×10, sub_project_list×1"
-  },
-  {
-    "kind": "VALUE",
-    "endpoint": "jobs",
-    "workspace": "分布式训练空间",
-    "detail": "20 条交集里字段值不一致：node_infos×2, timeline×2, node_count×2"
+    "detail": "10 条交集里字段值不一致：is_member×10, remain_budget×10, sub_project_list×1"
   }
 ]

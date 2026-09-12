@@ -172,24 +172,92 @@ def load_env_file() -> Dict[str, str]:
     return values
 
 
-def get_credentials() -> tuple[str, str]:
-    """获取认证信息，优先使用环境变量，其次读取默认路径或指定路径的 .env 文件。"""
+#: 凭据的三个来源，**按优先级从高到低**。改这张表就是改优先级，别散到各处去写 or 链。
+#:
+#: 为什么要把来源显式化：环境变量优先级最高，而 shell 里一条**过期的** ``export``
+#: 会静默压过刚刚更新好的 ``config.json`` —— 用户改完密码、改完配置文件，命令照样用旧密码
+#: 登录失败，而错误信息只说「账号或密码错误」，没有任何线索指向那条 export。
+#: 2026-09-11 真踩过：改密后本机 login 连续失败，排查了几十分钟才发现是 shell 里的残留
+#: 环境变量；期间还白白消耗了 CAS 的锁定计数。
+CREDENTIAL_SOURCES = ("环境变量", ".env 文件", "config.json")
+
+
+def _pick(key: str, config_key: str, env_file_values, config):
+    """按优先级取一个凭据字段，**连同它来自哪里**一起返回。
+
+    返回 ``(值, 来源描述)``；取不到时来源是 ``"未设置"``。
+    """
+    v = os.environ.get(key)
+    if v:
+        return v, f"环境变量 {key}"
+    v = env_file_values.get(key)
+    if v:
+        return v, f"{get_env_file_path()}（{key}）"
+    v = config.get(config_key)
+    if v:
+        return v, f"{CONFIG_FILE}（{config_key}）"
+    return "", "未设置"
+
+
+def get_credentials_with_source() -> tuple[str, str, str, str]:
+    """同 :func:`get_credentials`，但额外返回用户名 / 密码**各自来自哪个来源**。
+
+    调用方拿它来在登录前后告诉用户「这次用的密码是从哪读的」——
+    这一句话能把「改了配置文件却还在用旧密码」从一场排查变成一眼看见。
+    """
+    config = load_config()
+    env_file_values = load_env_file()
+    username, user_src = _pick("QZCLI_USERNAME", "username", env_file_values, config)
+    password, pass_src = _pick("QZCLI_PASSWORD", "password", env_file_values, config)
+    return username, password, user_src, pass_src
+
+
+def describe_credential_conflict() -> str:
+    """**多个来源都有密码、且值不一样**时，返回一句能直接照着做的提示；否则返回空串。
+
+    这正是 2026-09-11 那次事故的形状：``config.json`` 已经是新密码，
+    shell 里的 ``QZCLI_PASSWORD`` 还是旧的，而环境变量优先级更高。
+    只报「密码错误」的话，用户会一直以为是自己密码记错了。
+
+    **不比较、也不回显任何密码明文** —— 只比较指纹。
+    """
+    import hashlib
+
     config = load_config()
     env_file_values = load_env_file()
 
-    username = (
-        os.environ.get("QZCLI_USERNAME")
-        or env_file_values.get("QZCLI_USERNAME")
-        or config.get("username")
-        or ""
-    )
-    password = (
-        os.environ.get("QZCLI_PASSWORD")
-        or env_file_values.get("QZCLI_PASSWORD")
-        or config.get("password")
-        or ""
-    )
+    def fp(v):
+        return hashlib.sha256(v.encode()).hexdigest()[:8] if v else ""
 
+    seen = []
+    for label, value in (
+        (f"环境变量 QZCLI_PASSWORD", os.environ.get("QZCLI_PASSWORD", "")),
+        (f"{get_env_file_path()}", env_file_values.get("QZCLI_PASSWORD", "")),
+        (f"{CONFIG_FILE}", config.get("password", "")),
+    ):
+        if value:
+            seen.append((label, fp(value)))
+
+    if len(seen) < 2 or len({f for _, f in seen}) < 2:
+        return ""
+
+    lines = ["⚠ 检测到多处存着**不一样**的密码，当前生效的是优先级最高的那个："]
+    for i, (label, f) in enumerate(seen):
+        mark = "← 本次使用" if i == 0 else ""
+        lines.append(f"    {label}  指纹 {f} {mark}")
+    lines.append(
+        "  如果你刚改过密码却还在报密码错误，多半是优先级更高的那处没更新。"
+    )
+    lines.append("  环境变量通常来自 ~/.zshrc / ~/.bashrc，**已经启动的进程不会自动更新**。")
+    return "\n".join(lines)
+
+
+def get_credentials() -> tuple[str, str]:
+    """获取认证信息，优先使用环境变量，其次读取默认路径或指定路径的 .env 文件。
+
+    优先级与来源见 :func:`get_credentials_with_source`（那个版本还会告诉你值是从哪来的）。
+    """
+    username, password, _, _ = get_credentials_with_source()
     return username, password
 
 
