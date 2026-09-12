@@ -48,6 +48,9 @@ RECORDED_OPS = frozenset(
         "hpc",
         "stop",
         "login",
+        # 自动重登。**必须在册**：它不经过 main() 的分发点，不记的话操作日志里
+        # 会一个字都没有,而它恰恰是最容易悄悄打认证、把账号锁掉的那条路径。
+        "relogin",
         "exec",
         "worker-exec",
         "res-update",

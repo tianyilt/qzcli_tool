@@ -18,7 +18,7 @@
 
 | 端点 | 工作空间 | 详情 |
 |---|---|---|
-| `projects` | （全局） | 10 条交集里字段值不一致：is_member×10, remain_budget×10, sub_project_list×1 |
+| `projects` | （全局） | 10 条交集里字段值不一致：remain_budget×10, is_member×10, sub_project_list×1 |
 
 ## SCHEMA_REVIEWED（1）
 

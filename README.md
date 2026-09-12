@@ -219,12 +219,29 @@ qzcli login -u 学工号 -p 密码
 # 脚本里从 stdin 读密码
 echo 'your_password' | qzcli login -u 学工号 --password-stdin
 
+# 多处存了不一样的密码时，说清用哪一处（不指定会被直接挡下、不发请求）
+qzcli login --source config     # 只认 ~/.qzcli/config.json
+qzcli login --source env        # 只认环境变量 QZCLI_PASSWORD
+qzcli login --source envfile    # 只认 ~/.qzcli/.env
+qzcli login --force             # 坚持按优先级来（会消耗账号锁定次数）
+
 # 查看当前 cookie
 qzcli cookie --show
 
 # 清除 cookie
 qzcli cookie --clear
 ```
+
+> **密码有多个来源时会被挡住,这是故意的。** 取值优先级是
+> `环境变量 QZCLI_PASSWORD` → `~/.qzcli/.env` → `~/.qzcli/config.json`。
+> 如果其中至少两处都存了密码**而且值不一样**,qzcli 会列出每一处的指纹
+> (sha256 前 8 位,不显示明文)然后**拒绝发认证请求** —— 认证服务按失败次数锁
+> 账号,而这种情况下谁对谁错是猜的。自动重登(cookie 过期时后台那次)同样会被挡。
+>
+> 最常见的成因:改密码**之前**就 `export` 过 `QZCLI_PASSWORD` 的进程
+> (编辑器、agent、tmux)。**已经启动的进程不会自动更新环境变量**,它们要重启,
+> 或者在里面先 `unset QZCLI_PASSWORD`。
+> 用 `--source` 指定用哪一处即可立即前进。
 
 ### 资源管理
 
