@@ -8738,7 +8738,19 @@ def cmd_login(args):
 
     display = get_display()
     api = get_api()
+    from .config import get_credentials_with_source, describe_credential_conflict
+
+    # 值仍然走 `get_credentials()` —— 它是既有契约，测试也在这一层打桩，
+    # 不该为了加一句提示就把调用点换掉。来源标签单独取，取不到就降级成「未知」，
+    # **绝不能因为一句诊断提示让登录本身失败**。
     stored_username, stored_password = get_credentials()
+    try:
+        _, _, _user_src, _pass_src = get_credentials_with_source()
+    except Exception:  # noqa: BLE001 —— 诊断信息拿不到不算错误
+        _user_src = _pass_src = "未知"
+    if not stored_password:
+        _pass_src = "未设置"
+
 
     # fallback 顺序: CLI 参数 → 环境变量 QZCLI_USERNAME/QZCLI_PASSWORD → config.json → 交互式输入
     username = (args.username or stored_username or "").strip()
@@ -8779,6 +8791,17 @@ def cmd_login(args):
         display.print_error("密码不能为空")
         return 1
 
+    # 把「这次用的密码从哪读的」明说出来。没有这一句，用户改完 config.json
+    # 却被 shell 里过期的 QZCLI_PASSWORD 压着用旧密码时，错误信息只有
+    # 「账号或密码错误」，完全指不到那条 export 上去。
+    if args.password:
+        _pass_src = "命令行 --password"
+    elif getattr(args, "password_stdin", False):
+        _pass_src = "标准输入"
+    elif not stored_password:
+        _pass_src = "交互式输入"
+    display.print(f"[dim]凭据来源: 用户名={_user_src} | 密码={_pass_src}[/dim]")
+
     display.print("[dim]正在登录...[/dim]")
 
     try:
@@ -8814,6 +8837,11 @@ def cmd_login(args):
 
     except QzAPIError as e:
         display.print_error(f"登录失败: {e}")
+        # 「密码错误」最常见的成因不是记错密码，而是多个来源里有一处没更新，
+        # 且它的优先级更高。把指纹摆出来，用户一眼就能看出是哪一处。
+        conflict = describe_credential_conflict()
+        if conflict:
+            display.print(conflict)
         return 1
 
 
@@ -9548,8 +9576,18 @@ def main():
             if op:
                 from . import opslog
 
-                with opslog.timed(op, target=_opslog_target(args)):
-                    return cmd_func(args)
+                # **失败也要记成失败。** cmd_* 约定用「返回非 0」表示失败，
+                # 而不是抛异常（`cmd_login` 捕获 QzAPIError 后 `return 1` 就是典型）。
+                # 而 `opslog.timed` 只看有没有抛异常 —— 于是一次登录失败被写成
+                # `outcome: ok`，日志比没有还坏：它在撒谎。
+                # 2026-09-11 排查账号频繁锁定时就被这个坑过：日志里 152 次登录全是
+                # 「成功」，而平台侧审计同期记着一串「密码错误」，两边对不上，
+                # 白白多花了时间才想到是日志在骗人。
+                with opslog.timed(op, target=_opslog_target(args)) as _span:
+                    rc = cmd_func(args)
+                    if isinstance(rc, int) and rc != 0:
+                        _span.mark_failed(f"exit={rc}")
+                    return rc
             return cmd_func(args)
         except KeyboardInterrupt:
             print("\n操作已取消")
