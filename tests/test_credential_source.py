@@ -38,22 +38,22 @@ class CredentialSourceTests(unittest.TestCase):
     def test_env_wins_and_says_so(self):
         """环境变量优先级最高 —— 而且必须**明说**是环境变量。"""
         p1, p2 = self._patch(
-            {"QZCLI_PASSWORD": "from-env"},
-            {"QZCLI_PASSWORD": "from-envfile"},
-            {"password": "from-config"},
+            {"QZCLI_PASSWORD": "fake-from-env"},
+            {"QZCLI_PASSWORD": "fake-from-envfile"},
+            {"password": "fake-from-config"},
         )
         with p1, p2:
             _, pw, _, src = cfg.get_credentials_with_source()
-        self.assertEqual(pw, "from-env")
+        self.assertEqual(pw, "fake-from-env")
         self.assertIn("环境变量", src)
 
     def test_config_source_is_named_when_it_is_the_one_used(self):
         """没有环境变量时落到 config.json，来源描述里要出现文件路径。"""
         with mock.patch.multiple(
-            cfg, load_config=lambda: {"password": "from-config"}, load_env_file=lambda: {}
+            cfg, load_config=lambda: {"password": "fake-from-config"}, load_env_file=lambda: {}
         ), mock.patch.dict(os.environ, {}, clear=True):
             _, pw, _, src = cfg.get_credentials_with_source()
-        self.assertEqual(pw, "from-config")
+        self.assertEqual(pw, "fake-from-config")
         self.assertIn("config.json", src)
 
     def test_get_credentials_keeps_old_two_tuple_shape(self):
@@ -70,14 +70,14 @@ class CredentialConflictTests(unittest.TestCase):
 
     def test_conflict_is_reported_with_fingerprints_only(self):
         with mock.patch.multiple(
-            cfg, load_config=lambda: {"password": "NEW-secret"}, load_env_file=lambda: {}
-        ), mock.patch.dict(os.environ, {"QZCLI_PASSWORD": "OLD-secret"}, clear=False):
+            cfg, load_config=lambda: {"password": "fake-new-password"}, load_env_file=lambda: {}
+        ), mock.patch.dict(os.environ, {"QZCLI_PASSWORD": "fake-old-password"}, clear=False):
             msg = cfg.describe_credential_conflict()
         self.assertTrue(msg, "两处密码不同却没有给出任何提示")
         self.assertIn("环境变量", msg)
         # 明文一个字都不许出现
-        self.assertNotIn("NEW-secret", msg)
-        self.assertNotIn("OLD-secret", msg)
+        self.assertNotIn("fake-new-password", msg)
+        self.assertNotIn("fake-old-password", msg)
 
     def test_no_noise_when_sources_agree(self):
         """值一样就别吵 —— 误报会让人学会忽略这条提示。"""

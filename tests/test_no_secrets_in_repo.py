@@ -42,8 +42,14 @@ _PATTERNS = {
     "平台 session cookie": re.compile(r"inspire-session=([A-Za-z0-9+/_-]{20,})"),
     # wandb key 泄漏可写他人实验数据
     "WandB API key": re.compile(r"(local-[0-9a-f]{24,}|\bWANDB_API_KEY=[0-9a-f]{40})"),
+    # 键名两侧的引号必须允许，否则 JSON / dict 字面量形式整类漏过 ——
+    # ``{"password": "……"}`` 里 password 后面先是引号再是冒号，旧正则
+    # ``password\s*[=:]`` 在那个引号上就断了。粘一段带密码的接口响应样例
+    # 进测试 fixture 正是这个形状，是最容易发生的泄漏方式之一。
+    # （2026-09-12 实锤：本仓测试 fixture 被 GitGuardian 按形状告警，
+    #   而这条本地闸门当时一声不响。）
     "明文密码赋值": re.compile(
-        r"(?:PASSWORD|password)\s*[=:]\s*['\"]([^'\"\s{}$<][^'\"\s]{5,})['\"]"
+        r"(?:PASSWORD|password)['\"]?\s*[=:]\s*['\"]([^'\"\s{}$<][^'\"\s]{5,})['\"]"
     ),
     # **最容易漏的一类**：把凭据抽成常量。真实事故就是这个形状 ——
     # `_TOKEN = "1f70d0dc-f1db-40e3-826d-8d84d160d440"`。
@@ -245,6 +251,51 @@ class NoInternalIdentifiersTests(unittest.TestCase):
             self.assertIsNotNone(
                 _FAKE_ID_RE.match(m.group(2)), f"{fake} 被误报成真 ID"
             )
+
+
+class PlaintextPasswordShapeTests(unittest.TestCase):
+    r"""自检「明文密码赋值」那条模式。
+
+    2026-09-12：GitGuardian 在 ``tests/test_credential_source.py`` 上报了
+    Generic Password，而这条本地闸门当时**一声不响**。真因是旧正则写作
+    ``password\s*[=:]``，碰上 ``{"password": "……"}`` 这种键名带引号的
+    JSON / dict 字面量，在键后面那个引号上就断了。粘一段带密码的接口响应
+    样例进 fixture 正是这个形状 —— 属于最容易发生、也最容易漏的一类。
+    """
+
+    _RX = _PATTERNS["明文密码赋值"]
+
+    def test_json_shaped_assignment_is_caught(self):
+        """键名带引号的形式必须抓到 —— 这是上次真漏掉的形状。"""
+        for sample in (
+            '{"password": "hunter2-not-real"}',
+            "{'password': 'hunter2-not-real'}",
+            '  "PASSWORD" : "hunter2-not-real",',
+        ):
+            with self.subTest(sample=sample):
+                m = self._RX.search(sample)
+                self.assertIsNotNone(m, f"JSON 形状的明文密码没被抓到: {sample}")
+                self.assertEqual("hunter2-not-real", m.group(1))
+
+    def test_bare_assignment_still_caught(self):
+        """老形状不能因为放宽正则而失守。"""
+        m = self._RX.search('password = "hunter2-not-real"')
+        self.assertIsNotNone(m)
+        self.assertEqual("hunter2-not-real", m.group(1))
+
+    def test_obviously_fake_values_are_allowed_through(self):
+        """占位值必须放行 —— 误报会让人学会忽略告警，那时真漏就没人看了。"""
+        for sample in (
+            '{"password": "fake-from-config"}',
+            '{"password": "placeholder-value"}',
+            '{"password": "${QZCLI_PASSWORD}"}',
+        ):
+            with self.subTest(sample=sample):
+                m = self._RX.search(sample)
+                allowed = m is None or any(
+                    k in m.group(1).lower() for k in _OBVIOUSLY_FAKE
+                )
+                self.assertTrue(allowed, f"占位值被误报: {sample}")
 
 
 if __name__ == "__main__":
