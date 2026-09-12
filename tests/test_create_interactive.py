@@ -1,6 +1,9 @@
 import argparse
+import os
 import sys
+import tempfile
 import unittest
+from pathlib import Path
 from unittest.mock import patch
 
 from qzcli import cli
@@ -692,6 +695,19 @@ def build_create_interactive_snapshot(api, cache):
 
 
 class CreateInteractiveTests(unittest.TestCase):
+    def setUp(self):
+        # 这个类里有两条用例走真 ``cli.main()``，而 main() 的分发点会记操作日志。
+        # 不隔离的话它们会往用户真实的 ~/.qzcli/qzcli_ops.log 里写假记录
+        # （实测留下过 argv=["qzcli","create","-i"] 的条目）。那份日志是排查
+        # 账号锁定时的取证来源，被测试写脏比没记更糟。
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        patcher = patch.dict(
+            os.environ, {"QZCLI_OPS_LOG": str(Path(tmp.name) / "ops.log")}
+        )
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
     def test_main_parses_create_interactive_short_flag(self):
         captured = {}
 
