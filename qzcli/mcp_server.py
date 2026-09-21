@@ -1297,9 +1297,14 @@ def qz_create_job(
         or spec_obj.get("gpu_count")
         or spec_obj.get("memory_gb")
     ):
+        # 刷新缓存救不了：规格按计算组绑定，这条规格多半属于别的计算组。
+        # 直接把目标组可用的规格列出来，让调用方照着改。
+        from qzcli.cli import _explain_spec_group_mismatch
+
         raise RuntimeError(
-            f"无法解析规格 '{spec_id}' 的 cpu/gpu/memory 信息，"
-            "请先调用 qz_refresh_resources 刷新缓存后再试。"
+            _explain_spec_group_mismatch(
+                api, workspace_id, "", compute_group_id, spec_id
+            )
         )
 
     spec_price = build_resource_spec_price(spec_obj, compute_group_id)

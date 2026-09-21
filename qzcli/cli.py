@@ -4824,16 +4824,107 @@ def _lookup_spec_for_payload(
         swallowed("create/规格预加载", exc)
 
     spec_obj = _read_normalized_spec(workspace_id, spec_id)
-    if not (
+    has_resource_fields = bool(
         spec_obj.get("cpu_count")
         or spec_obj.get("gpu_count")
         or spec_obj.get("memory_gb")
-    ):
+    )
+    # 两种失败都走同一条解释：
+    #   1. 刷新后缓存里还是没有这条规格 —— 不是缓存过期，是这条规格根本不在
+    #      目标计算组的规格表里（平台规格表按计算组绑定），刷多少次都不会出现。
+    #   2. 缓存里有，但归属是别的计算组 —— 以前这里直接放行，把别组的
+    #      quota_id 塞进 payload 让平台去拒（或更糟：排队等一种该组没有的卡）。
+    # 以前的文案「请运行 res -u 刷新缓存」在这两种情况下都是死路，用户照做
+    # 也解决不了。改成直接告诉用户：这条规格属于谁、目标组能用哪些、该改成什么。
+    if not has_resource_fields or not _belongs_to_target_group(spec_obj):
         raise QzAPIError(
-            f"无法解析规格 '{spec_id}' 的 cpu/gpu/memory 信息，"
-            "请运行 `qzcli res -w <workspace> -u` 刷新缓存后再试"
+            _explain_spec_group_mismatch(
+                api, workspace_id, ws_name, compute_group_id, spec_id
+            )
         )
     return spec_obj
+
+
+def _explain_spec_group_mismatch(
+    api,
+    workspace_id: str,
+    ws_name: str,
+    compute_group_id: str,
+    spec_id: str,
+    compute_group_display: str = "",
+) -> str:
+    """把「规格和计算组对不上」讲成用户照着改就能过的话。
+
+    典型现场：提交脚本里 ``SPEC`` 默认值是某个开发分区的规格，用户换了一个
+    新建的计算组去提交，规格没跟着换。此时无论报「无法解析规格」还是
+    「不属于当前计算组」，用户都不知道该填哪个 —— 而平台其实能直接回答
+    「这个计算组可用的规格是哪几条」。这里就把答案摆出来：
+
+    - 这条规格实际归属哪个计算组（缓存里有就说）
+    - 目标计算组可用的规格清单（活体问平台，退化到缓存）
+    - 该改成哪条 ``--spec``
+    - 明确说「刷新缓存救不了」，别让用户再绕一圈
+    """
+    cached = get_workspace_resources(workspace_id) or {}
+    cg_map = cached.get("compute_groups") or {}
+
+    def _cg_label(cg_id: str) -> str:
+        info = cg_map.get(cg_id) if isinstance(cg_map, dict) else None
+        name = (info or {}).get("name") if isinstance(info, dict) else ""
+        return f"{name} ({cg_id})" if name else cg_id
+
+    target = (
+        f"{compute_group_display} ({compute_group_id})"
+        if compute_group_display and compute_group_display != compute_group_id
+        else _cg_label(compute_group_id)
+    )
+
+    raw = (cached.get("specs") or {}).get(spec_id) or {}
+    owned = raw.get("logic_compute_group_ids") or (
+        [raw["logic_compute_group_id"]] if raw.get("logic_compute_group_id") else []
+    )
+    lines: List[str] = []
+    if owned and compute_group_id not in owned:
+        lines.append(f"规格 '{spec_id}' 不属于计算组 {target}。")
+        lines.append("  该规格归属: " + "、".join(_cg_label(x) for x in owned))
+    else:
+        lines.append(f"计算组 {target} 的规格表里没有规格 '{spec_id}'。")
+
+    options: List[Dict[str, Any]] = []
+    try:
+        options = (
+            _load_specs_for_create_result(
+                api,
+                workspace_id,
+                ws_name,
+                compute_group_id,
+                display=None,
+                emit_messages=False,
+            ).get("items")
+            or []
+        )
+    except Exception as exc:  # noqa: BLE001 - 解释性信息，拿不到就退化
+        swallowed("create/规格解释", exc)
+
+    if options:
+        lines.append(f"  计算组 {target} 可用规格:")
+        for opt in options:
+            lines.append("    " + _format_spec_option(opt))
+        suggestion = f"  改用 --spec {options[0].get('id', '')}"
+        if len(options) > 1:
+            suggestion += "（或上面列表里的另一条）"
+        lines.append(
+            suggestion + "；提交脚本一般用环境变量 SPEC=<id> 覆盖脚本里的默认规格。"
+        )
+    else:
+        lines.append(
+            "  平台没有返回这个计算组的规格清单（可能是登录态失效或该组还没配规格）。"
+            "用 `qzcli create -i` 交互选择，或 `qzcli res -w <workspace> -F` 全量刷新后再看。"
+        )
+    lines.append(
+        "  注意：`qzcli res -u` 解决不了这个问题 —— 规格按计算组绑定，换了计算组就必须换规格。"
+    )
+    return "\n".join(lines)
 
 
 def _auto_select_spec_for_compute_group(
@@ -6666,11 +6757,16 @@ def _run_create_interactive(args, display, api) -> int:
         )
         if spec_membership is False:
             display.print_error(
-                f"规格 '{args.spec}' 不属于当前计算组 '{compute_group_display or args.compute_group}'"
+                _explain_spec_group_mismatch(
+                    api,
+                    workspace_id,
+                    ws_display or "",
+                    args.compute_group,
+                    args.spec,
+                    compute_group_display or "",
+                )
             )
-            display.print(
-                "[dim]请重新选择规格，或重试 create -i 以刷新当前计算组快照[/dim]"
-            )
+            display.print("[dim]或重试 create -i 交互选择规格[/dim]")
             return 1
 
     if not args.spec:
@@ -7052,10 +7148,14 @@ def cmd_create(args):
             )
             if spec_membership is False:
                 display.print_error(
-                    f"规格 '{args.spec}' 不属于当前计算组 '{cg_display or compute_group_id}'"
-                )
-                display.print(
-                    "[dim]请先运行 qzcli res -w <workspace> -u 刷新缓存，或改用正确的 spec ID[/dim]"
+                    _explain_spec_group_mismatch(
+                        api,
+                        workspace_id,
+                        "",
+                        compute_group_id,
+                        spec_id,
+                        cg_display or "",
+                    )
                 )
                 return 1
     else:
@@ -7080,8 +7180,14 @@ def cmd_create(args):
         )
     except QzAPIError as e:
         if args.dry_run:
-            # 在 dry-run 下，缺规格字段不阻塞 payload 预览。
-            display.print(f"[dim]规格字段不完整 ({e})；dry-run 仍会输出 payload[/dim]")
+            # dry-run 不阻塞 payload 预览，但这个错误不能降级成一行灰字：
+            # 以前这里只 dim 提示一句，然后照样打印一份 cpu/gpu/mem 全 0 的
+            # payload，用户看到 payload 就以为规格没问题，真提交才被拒。
+            display.print_error(str(e))
+            display.print(
+                "[yellow]dry-run 继续输出 payload 供参考，但下面这份 payload "
+                "的 resource_spec_price 是空的，真提交会被平台拒绝。[/yellow]"
+            )
             spec_obj = {"id": spec_id}
         else:
             display.print_error(str(e))
