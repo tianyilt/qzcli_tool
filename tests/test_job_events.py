@@ -12,6 +12,7 @@ import io
 import json
 import unittest
 from contextlib import redirect_stdout
+from datetime import datetime, timezone
 from unittest import mock
 
 from qzcli import api, cli
@@ -53,12 +54,28 @@ _JOB_EVENTS = [
 ]
 
 
+def _dated_events(count):
+    base_ms = int(datetime(2026, 10, 9, 6, 0, tzinfo=timezone.utc).timestamp() * 1000)
+    return [
+        {
+            "type": "Warning", "reason": "FailedScheduling",
+            "message": f"queue diagnostic {i}",
+            "first_timestamp": str(base_ms + i * 1000),
+            "last_timestamp": str(base_ms + i * 1000),
+            "object_id": "job-x-worker-0",
+        }
+        for i in range(count)
+    ]
+
+
 class JobEventsAPITests(unittest.TestCase):
     def _api(self):
         with mock.patch.object(
             api, "get_api_base_url", return_value="https://qz.sii.edu.cn"
         ), mock.patch.object(api, "get_credentials", return_value=("u", "p")):
-            return api.QzAPI()
+            client = api.QzAPI()
+            client._auto_relogin = False
+            return client
 
     def test_job_events_hits_v2_first(self):
         """默认走 v2 ``train ListJobEvents``。"""
@@ -152,6 +169,139 @@ class JobEventsAPITests(unittest.TestCase):
             self.assertEqual(
                 [], self._api().get_job_events_with_cookie("job-x", "cookie-v")
             )
+
+    def test_cli_tail_includes_latest_event_beyond_first_200(self):
+        events = _dated_events(201)
+        events[-1]["message"] = "Parent GPU quota insufficient: 569 used, 8 requested, 570 limit"
+        pages = []
+
+        def fake_post(url, json=None, **kwargs):
+            pages.append(json["page_num"])
+            start = (json["page_num"] - 1) * json["page_size"]
+            return _FakeResp(200, {"Result": {"events": events[start:start + 200], "total": 201}})
+
+        stdout = io.StringIO()
+        with mock.patch.object(api, "_curl_post", side_effect=fake_post), \
+             mock.patch.object(cli, "get_api", return_value=self._api()), \
+             mock.patch.object(cli, "get_display", return_value=_FakeDisplay()), \
+             mock.patch.object(cli, "_get_cookie_value", return_value="cookie-v"), \
+             redirect_stdout(stdout):
+            rc = cli.cmd_events(_events_args(output_json=True, tail=1))
+        self.assertEqual(rc, 0)
+        self.assertEqual(pages, [1, 2])
+        self.assertEqual(json.loads(stdout.getvalue()), [events[-1]])
+
+    def test_v1_fallback_retains_total_and_reads_every_page(self):
+        events = _dated_events(3)
+        calls = []
+
+        def fake_post(url, json=None, **kwargs):
+            calls.append(("v2" if "/api/v2/" in url else "v1", json["page_num"]))
+            if "/api/v2/" in url:
+                return _FakeResp(404, text="not found", content_type="text/plain")
+            start = (json["page_num"] - 1) * 2
+            return _FakeResp(200, {"code": 0, "data": {"events": events[start:start + 2], "total": 3}})
+
+        with mock.patch.object(api, "_curl_post", side_effect=fake_post), \
+             mock.patch.object(api, "print"):
+            out = self._api().get_job_events_with_cookie("job-x", "cookie-v", page_size=2)
+        self.assertEqual(out, events)
+        self.assertEqual(calls, [("v2", 1), ("v1", 1), ("v2", 2), ("v1", 2)])
+
+    def test_instance_events_read_multiple_pages(self):
+        events = _dated_events(3)
+        client = self._api()
+        pages = []
+
+        def fake_post(url, json=None, **kwargs):
+            self.assertEqual(json["filter"], {"object_type": "instance", "object_ids": ["job-x-worker-0"]})
+            pages.append(json["page_num"])
+            start = (json["page_num"] - 1) * 2
+            return _FakeResp(200, {"Result": {"events": events[start:start + 2], "total": 3}})
+
+        with mock.patch.object(api, "_curl_post", side_effect=fake_post):
+            out = client.get_job_instance_events_with_cookie(
+                "job-x", "cookie-v", pod_names=["job-x-worker-0"], page_size=2,
+            )
+        self.assertEqual(out, events)
+        self.assertEqual(pages, [1, 2])
+
+    def test_total_prevents_short_page_from_truncating_results(self):
+        events = _dated_events(3)
+        responses = [_FakeResp(200, {"Result": {"events": [e], "total": 3}}) for e in events]
+        with mock.patch.object(api, "_curl_post", side_effect=responses) as post:
+            out = self._api().get_job_events_with_cookie("job-x", "cookie-v", page_size=200)
+        self.assertEqual(out, events)
+        self.assertEqual(post.call_count, 3)
+
+    def test_exact_page_multiple_stops_at_total(self):
+        events = _dated_events(4)
+        responses = [_FakeResp(200, {"Result": {"events": events[i:i + 2], "total": 4}}) for i in (0, 2)]
+        with mock.patch.object(api, "_curl_post", side_effect=responses) as post:
+            out = self._api().get_job_events_with_cookie("job-x", "cookie-v", page_size=2)
+        self.assertEqual(out, events)
+        self.assertEqual(post.call_count, 2)
+
+    def test_missing_total_reads_through_full_pages_to_empty(self):
+        events = _dated_events(4)
+        responses = [_FakeResp(200, {"Result": {"events": events[i:i + 2]}}) for i in (0, 2, 4)]
+        with mock.patch.object(api, "_curl_post", side_effect=responses) as post:
+            out = self._api().get_job_events_with_cookie("job-x", "cookie-v", page_size=2)
+        self.assertEqual(out, events)
+        self.assertEqual(post.call_count, 3)
+
+    def test_later_page_failure_does_not_return_partial_events_or_fall_back(self):
+        responses = [
+            _FakeResp(200, {"Result": {"events": _dated_events(2), "total": 3}}),
+            _FakeResp(401, text="unauthorized"),
+        ]
+        with mock.patch.object(api, "_curl_post", side_effect=responses) as post:
+            with self.assertRaises(api.QzAPIError):
+                self._api().get_job_events_with_cookie("job-x", "cookie-v", page_size=2)
+        self.assertEqual(post.call_count, 2)
+        self.assertTrue(all("/api/v2/" in call.args[0] for call in post.call_args_list))
+
+    def test_repeated_page_with_changing_age_is_an_explicit_error(self):
+        page = _dated_events(2)
+        responses = [
+            _FakeResp(200, {"Result": {"events": [dict(e, age=age) for e in page], "total": 4}})
+            for age in ("1h", "1h1m")
+        ]
+        with mock.patch.object(api, "_curl_post", side_effect=responses):
+            with self.assertRaisesRegex(api.QzAPIError, "重复返回分页"):
+                self._api().get_job_events_with_cookie("job-x", "cookie-v", page_size=2)
+
+    def test_empty_page_before_total_is_an_explicit_error(self):
+        responses = [
+            _FakeResp(200, {"Result": {"events": _dated_events(2), "total": 3}}),
+            _FakeResp(200, {"Result": {"events": [], "total": 3}}),
+        ]
+        with mock.patch.object(api, "_curl_post", side_effect=responses):
+            with self.assertRaisesRegex(api.QzAPIError, "分页提前结束"):
+                self._api().get_job_events_with_cookie("job-x", "cookie-v", page_size=2)
+
+    def test_nonpositive_page_size_fails_before_request(self):
+        with mock.patch.object(api, "_curl_post") as post:
+            for size in (0, -1, True, 1.5):
+                with self.assertRaises(ValueError):
+                    self._api().get_job_events_with_cookie("job-x", "cookie-v", page_size=size)
+        post.assert_not_called()
+
+    def test_invalid_total_is_an_explicit_error(self):
+        for total in (True, 1.5, -1, "not-an-integer"):
+            with self.subTest(total=total), mock.patch.object(
+                api, "_curl_post", return_value=_FakeResp(200, {"Result": {"events": [], "total": total}}),
+            ):
+                with self.assertRaisesRegex(api.QzAPIError, "total"):
+                    self._api().get_job_events_with_cookie("job-x", "cookie-v")
+
+    def test_malformed_empty_events_are_not_accepted_as_an_empty_list(self):
+        for events in ({}, "", 0, False):
+            with self.subTest(events=events), mock.patch.object(
+                api, "_curl_post", return_value=_FakeResp(200, {"Result": {"events": events, "total": 0}}),
+            ):
+                with self.assertRaisesRegex(api.QzAPIError, "events"):
+                    self._api().get_job_events_with_cookie("job-x", "cookie-v")
 
 
 # ---- helpers ----
