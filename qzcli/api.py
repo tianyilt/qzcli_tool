@@ -1180,32 +1180,70 @@ class QzAPI:
         优先 v2 ``train ListJobEvents``，路由不通时回落
         ``POST /api/v1/train_job/events/list``。两边请求体一致、返回都是
         ``events`` 列表（v2 在 ``Result.events``，v1 在 ``data.events``）。
+        读取所有分页后再交给 CLI 排序/截尾，避免长排队任务只显示早期事件。
         """
-        payload = {
-            "page_num": 1,
-            "page_size": page_size,
-            "filter": {"object_type": object_type, "object_ids": list(object_ids)},
-        }
-        return _v2_then_v1(
-            "train_job/events/list",
-            lambda: (
-                self._request_v2(
-                    "train",
-                    "ListJobEvents",
-                    payload,
-                    cookie=cookie,
+        if isinstance(page_size, bool) or not isinstance(page_size, int) or page_size <= 0:
+            raise ValueError("page_size must be a positive integer")
+        events = []
+        seen_pages = set()
+        page_num = 1
+        while True:
+            payload = {
+                "page_num": page_num,
+                "page_size": page_size,
+                "filter": {"object_type": object_type, "object_ids": list(object_ids)},
+            }
+            data = _v2_then_v1(
+                "train_job/events/list",
+                lambda: self._request_v2(
+                    "train", "ListJobEvents", payload, cookie=cookie,
                     referer_path=f"/jobs/distributedTrainingDetail/{job_id}",
-                ).get("events")
-                or []
-            ),
-            lambda: self._get_events_v1(job_id, cookie, payload),
-        )
+                ),
+                lambda: self._get_events_v1(job_id, cookie, payload),
+            )
+            if not isinstance(data, dict):
+                raise QzAPIError("事件分页响应不是对象")
+            page = data.get("events")
+            if page is None:
+                page = []
+            if not isinstance(page, list) or any(not isinstance(e, dict) for e in page):
+                raise QzAPIError("事件分页响应的 events 不是对象列表")
+            total = data.get("total")
+            if total is not None:
+                if isinstance(total, bool) or not isinstance(total, (int, str)):
+                    raise QzAPIError("事件分页响应的 total 不是整数")
+                try:
+                    total = int(total)
+                except (TypeError, ValueError):
+                    raise QzAPIError("事件分页响应的 total 不是整数")
+                if total < 0:
+                    raise QzAPIError("事件分页响应的 total 不能为负数")
+            if page:
+                # age 每次查询都会变化，不能用它判断服务器是否重复返回第一页。
+                fingerprint = _json.dumps(
+                    [{k: v for k, v in e.items() if k != "age"} for e in page],
+                    sort_keys=True, ensure_ascii=False,
+                )
+                if fingerprint in seen_pages:
+                    raise QzAPIError(f"事件接口重复返回分页 {page_num}，无法确认完整结果")
+                seen_pages.add(fingerprint)
+                events.extend(page)
+            if total is not None:
+                if len(events) >= total:
+                    return events
+                if not page:
+                    raise QzAPIError(
+                        f"事件分页提前结束：已读取 {len(events)} 条，平台报告 {total} 条"
+                    )
+            elif len(page) < page_size:
+                return events
+            page_num += 1
 
     @with_auth_retry
     def _get_events_v1(
         self, job_id: str, cookie: str, payload: Dict[str, Any]
-    ) -> List[Dict[str, Any]]:
-        """遗留路径 ``POST /api/v1/train_job/events/list``。"""
+    ) -> Dict[str, Any]:
+        """遗留路径的一页，保留 events 和 total 供完整性校验。"""
         url = f"{self.base_url}/api/v1/train_job/events/list"
         response = _curl_post(
             url, json=payload, headers=self._events_headers(job_id, cookie), timeout=60
@@ -1232,8 +1270,9 @@ class QzAPI:
                 result.get("code"),
             )
         data = result.get("data") or {}
-        events = data.get("events")
-        return events if isinstance(events, list) else []
+        if not isinstance(data, dict):
+            raise QzAPIError("事件分页响应的 data 不是对象")
+        return data
 
     def get_job_events_with_cookie(
         self, job_id: str, cookie: str, page_size: int = 200

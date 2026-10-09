@@ -1,6 +1,6 @@
 """规格和计算组对不上时，报错必须说清楚该改成哪个 spec。
 
-现场（2026-09-21）：提交脚本里 ``SPEC`` 默认值是 infra-debug 分区的规格，
+现场（2026-09-21）：提交脚本里 ``SPEC`` 默认值是源计算组的规格，
 用户换到新建的 MOVA-2.0 计算组提交，qzcli 报
 「无法解析规格 '...' 的 cpu/gpu/memory 信息，请运行 qzcli res -w <ws> -u 刷新缓存」。
 照做刷了三次缓存，一样报错 —— 因为这条规格根本不属于目标计算组，
@@ -36,7 +36,7 @@ def _cache(with_infra_spec: bool):
         "name": "CI",
         "projects": {},
         "compute_groups": {
-            INFRA: {"id": INFRA, "name": "infra-debug"},
+            INFRA: {"id": INFRA, "name": "source-group"},
             MOVA: {"id": MOVA, "name": "MOVA-2.0"},
         },
         "specs": specs,
@@ -69,7 +69,7 @@ class ExplainSpecGroupMismatchTest(unittest.TestCase):
                 _api_listing_mova_spec(), WS, "CI", MOVA, INFRA_SPEC
             )
         self.assertIn("不属于计算组 MOVA-2.0 (lcg-mova)", msg)
-        self.assertIn("归属: infra-debug (lcg-infra)", msg)
+        self.assertIn("归属: source-group (lcg-infra)", msg)
         self.assertIn(f"--spec {MOVA_SPEC}", msg)
         self.assertIn("150 CPU", msg)
         # 明确告诉用户刷缓存没用，别再绕
