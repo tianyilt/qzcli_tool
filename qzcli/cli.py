@@ -54,6 +54,7 @@ from .config import (
 )
 from . import priority as _priority
 from .diag import last_reason, swallowed
+from .auth_diag import AuthDiagnostic, format_exception, has_auth_diagnostic
 from .display import get_display
 from .store import JobRecord, get_store
 
@@ -138,6 +139,8 @@ def _image_type_from_platform(api, cookie, image):
             referer_path="/jobs/images",
         )
     except Exception as exc:  # noqa: BLE001 —— 这只是加分项，不能拖垮主流程
+        if has_auth_diagnostic(exc):
+            raise
         swallowed("create/查镜像可见性", exc)
         return None
     for item in (result or {}).get("images") or (result or {}).get("items") or []:
@@ -163,6 +166,8 @@ def _image_from_history(api, cookie, workspace_id, want_image=None):
         jobs = api.list_jobs_with_cookie(workspace_id, cookie, page_size=100)
         rows = (jobs.get("jobs") if isinstance(jobs, dict) else jobs) or []
     except Exception as exc:  # noqa: BLE001
+        if has_auth_diagnostic(exc):
+            raise
         swallowed("create/反推历史镜像", exc)
         return None, None
     for job in rows:
@@ -173,6 +178,8 @@ def _image_from_history(api, cookie, workspace_id, want_image=None):
         try:
             detail = api._get_job_detail_v2(job["job_id"], cookie) or {}
         except Exception as exc:  # noqa: BLE001
+            if has_auth_diagnostic(exc):
+                raise
             swallowed("create/反推历史镜像", exc)
             continue
         for fc in detail.get("framework_config") or []:
@@ -488,7 +495,9 @@ def cmd_list_cookie(args):
                     save_config(config)
                 # 找不到匹配就不写 —— 宁可让 filter 退化成"看全部 notebook"，
                 # 也不要把别人 id 当成自己缓存（bug ekon@6ee33c6 的根因）
-            except QzAPIError:
+            except QzAPIError as _auth_exc:
+                if has_auth_diagnostic(_auth_exc):
+                    raise
                 pass
 
     for workspace_id, ws_name in workspace_ids:
@@ -539,6 +548,8 @@ def cmd_list_cookie(args):
                         )
                         all_jobs.append(job)
                 except QzAPIError as e:
+                    if has_auth_diagnostic(e):
+                        raise
                     if only_interactive:
                         raise
                     display.print_warning(
@@ -546,6 +557,8 @@ def cmd_list_cookie(args):
                     )
 
         except QzAPIError as e:
+            if has_auth_diagnostic(e):
+                raise
             if "401" in str(e) or "过期" in str(e):
                 display.print_error(
                     "Cookie 已过期，请重新设置: qzcli cookie -f <cookie_file>"
@@ -644,6 +657,8 @@ def cmd_list(args):
                     if "error" not in data:
                         store.update_from_api(job_id, data)
             except QzAPIError as e:
+                if has_auth_diagnostic(e):
+                    raise
                 display.print_warning(f"部分任务状态更新失败: {e}")
 
         # 重新获取更新后的列表
@@ -748,6 +763,8 @@ def _events_for_notebook(api, cookie, target, display, args):
     try:
         events = api.get_notebook_events(nb_id, cookie)
     except QzAPIError as exc:
+        if has_auth_diagnostic(exc):
+            raise
         display.print_error(f"拉开发机事件失败：{exc}")
         return 1
 
@@ -903,6 +920,8 @@ def cmd_events(args):
                 source[id(e)] = "pod"
             events += iev
     except QzAPIError as e:
+        if has_auth_diagnostic(e):
+            raise
         display.print_error(f"查询事件失败: {e}")
         return 1
 
@@ -976,6 +995,8 @@ def cmd_status(args):
                         display.print(f"[yellow]排队原因[/yellow]: {r} — {m}")
             except (QzAPIError, requests.RequestException) as exc:
                 # 诊断是附加信息，绝不打断 status 主流程；但原因要留痕。
+                if has_auth_diagnostic(exc):
+                    raise
                 swallowed("status/排队原因诊断", exc)
 
         if args.json:
@@ -985,6 +1006,8 @@ def cmd_status(args):
 
         return 0
     except QzAPIError as e:
+        if has_auth_diagnostic(e):
+            raise
         display.print_error(f"查询失败: {e}")
         return 1
 
@@ -1014,6 +1037,8 @@ def cmd_stop(args):
             display.print_error("停止任务失败")
             return 1
     except QzAPIError as e:
+        if has_auth_diagnostic(e):
+            raise
         display.print_error(f"停止任务失败: {e}")
         return 1
 
@@ -1068,6 +1093,8 @@ def cmd_logs(args):
     try:
         first = _fetch(start_ms, sort="descend")
     except QzAPIError as e:
+        if has_auth_diagnostic(e):
+            raise
         display.print_error(f"拉取日志失败: {e}")
         return 1
 
@@ -1094,6 +1121,8 @@ def cmd_logs(args):
             try:
                 batch = _fetch(str(last_ms + 1) if last_ms else None)
             except QzAPIError as e:
+                if has_auth_diagnostic(e):
+                    raise
                 display.print_error(f"轮询失败: {e}")
                 return 1
             new = []
@@ -1142,7 +1171,9 @@ def cmd_watch(args):
                     for job_id, data in results.items():
                         if "error" not in data:
                             store.update_from_api(job_id, data)
-                except QzAPIError:
+                except QzAPIError as _auth_exc:
+                    if has_auth_diagnostic(_auth_exc):
+                        raise
                     pass
 
             # 清屏并显示
@@ -1184,8 +1215,10 @@ def cmd_track(args):
     try:
         api_data = api.get_job_detail(job_id)
         job = JobRecord.from_api_response(api_data, source=args.source or "")
-    except QzAPIError:
+    except QzAPIError as _auth_exc:
         # API 失败时创建最小记录
+        if has_auth_diagnostic(_auth_exc):
+            raise
         job = JobRecord(
             job_id=job_id,
             name=args.name or "",
@@ -1239,6 +1272,8 @@ def cmd_import(args):
                         updated += 1
                 display.print_success(f"已更新 {updated} 个任务状态")
             except QzAPIError as e:
+                if has_auth_diagnostic(e):
+                    raise
                 display.print_warning(f"状态更新失败: {e}")
 
     return 0
@@ -1347,6 +1382,8 @@ def cmd_cookie(args):
             total = result.get("total", 0)
             display.print_success(f"Cookie 有效！工作空间内有 {total} 个任务")
         except QzAPIError as e:
+            if has_auth_diagnostic(e):
+                raise
             display.print_error(f"Cookie 无效: {e}")
             return 1
 
@@ -1449,6 +1486,8 @@ def cmd_workspaces(args):
                         "jobs_count": jobs_count_,
                     }
                 except Exception as e:
+                    if has_auth_diagnostic(e):
+                        raise
                     return {
                         "ok": False,
                         "ws_id": ws_id_,
@@ -1516,6 +1555,8 @@ def cmd_workspaces(args):
             return 0
 
         except QzAPIError as e:
+            if has_auth_diagnostic(e):
+                raise
             if "401" in str(e) or "过期" in str(e):
                 display.print_error("Cookie 已过期，请重新登录: qzcli login")
             else:
@@ -1626,6 +1667,8 @@ def cmd_workspaces(args):
             specs = resources.get("specs", [])
 
         except QzAPIError as e:
+            if has_auth_diagnostic(e):
+                raise
             if "401" in str(e) or "过期" in str(e):
                 display.print_error(
                     "Cookie 已过期，请重新设置: qzcli cookie -f <cookie_file>"
@@ -1726,6 +1769,8 @@ def cmd_avail(args):
             )
         )
     except QzAPIError as e:
+        if has_auth_diagnostic(e):
+            raise
         if _is_auth_related_error(e) or "未设置 cookie" in str(e):
             display.print_error("未设置有效 cookie，请先运行: qzcli login")
         else:
@@ -1821,6 +1866,8 @@ def cmd_avail(args):
                     api, display, workspace_id, ws_name
                 )
             except QzAPIError as e:
+                if has_auth_diagnostic(e):
+                    raise
                 if cached_resources:
                     display.print(
                         f"[dim]{ws_name} 的资源刷新失败，继续使用缓存资源: {e}[/dim]"
@@ -1924,7 +1971,9 @@ def cmd_avail(args):
                             node_low_priority_gpu[node_name] += (
                                 gpu_per_node if len(nodes_occupied) > 1 else gpu_total
                             )
-            except QzAPIError:
+            except QzAPIError as _auth_exc:
+                if has_auth_diagnostic(_auth_exc):
+                    raise
                 pass  # 获取任务数据失败不影响主要功能
             finally:
                 if progress and progress_task_id is not None:
@@ -2001,6 +2050,8 @@ def cmd_avail(args):
             if progress and progress_task_id is not None:
                 progress.advance(progress_task_id)
         except QzAPIError as e:
+            if has_auth_diagnostic(e):
+                raise
             if progress and progress_task_id is not None:
                 progress.advance(progress_task_id, len(compute_groups))
             if _note_workspace_unavailable(workspace_id, e):
@@ -2130,6 +2181,8 @@ def cmd_avail(args):
                 try:
                     _, workspace_results, warning = future.result()
                 except QzAPIError as e:
+                    if has_auth_diagnostic(e):
+                        raise
                     display.print_warning(f"查询节点数据失败: {e}")
                     continue
                 if warning:
@@ -2495,6 +2548,8 @@ def cmd_avail(args):
             )
         except (QzAPIError, requests.RequestException) as exc:
             # 单个空间取不到不该拖垮整张表，但要让人看见少了谁。
+            if has_auth_diagnostic(exc):
+                raise
             swallowed("avail/HPC 节点取数", exc)
             display.print(
                 f"  [dim]{ws_label}: 节点利用率取数失败"
@@ -2855,7 +2910,9 @@ def cmd_usage(args):
                         display.print(
                             f"[dim]发现 {new_cg_count} 个新计算组，已更新到本地缓存[/dim]"
                         )
-            except QzAPIError:
+            except QzAPIError as _auth_exc:
+                if has_auth_diagnostic(_auth_exc):
+                    raise
                 pass  # 忽略节点查询失败，不影响主要功能
 
             all_stats.append(
@@ -2874,6 +2931,8 @@ def cmd_usage(args):
             )
 
         except QzAPIError as e:
+            if has_auth_diagnostic(e):
+                raise
             if "401" in str(e) or "过期" in str(e):
                 display.print_error("Cookie 已过期，请重新设置: qzcli login")
                 return 1
@@ -2994,6 +3053,8 @@ def cmd_workspace(args):
             else:
                 display.print_error("未找到可访问的工作空间")
         except QzAPIError as e:
+            if has_auth_diagnostic(e):
+                raise
             display.print_error(f"获取工作空间列表失败: {e}")
         return 1
 
@@ -3080,6 +3141,8 @@ def cmd_workspace(args):
         return 0
 
     except QzAPIError as e:
+        if has_auth_diagnostic(e):
+            raise
         if "401" in str(e) or "过期" in str(e):
             display.print_error(
                 "Cookie 已过期，请重新设置: qzcli cookie -f <cookie_file> -w <workspace_id>"
@@ -3351,7 +3414,9 @@ def _project_belongs_to_workspace_on_platform(api, workspace_id, project_id):
     """
     try:
         items = api.list_projects_raw()
-    except QzAPIError:
+    except QzAPIError as _auth_exc:
+        if has_auth_diagnostic(_auth_exc):
+            raise
         return None
     if not items:
         return None
@@ -3386,7 +3451,9 @@ def _compute_group_exists_on_platform(
             {"filter": {"workspace_id": workspace_id}, "page_num": 1, "page_size": 200},
             referer_path=f"/jobs/spacesOverview?spaceId={workspace_id}",
         )
-    except QzAPIError:
+    except QzAPIError as _auth_exc:
+        if has_auth_diagnostic(_auth_exc):
+            raise
         return None
     groups = r.get("logic_compute_groups") or []
     if not groups:
@@ -3822,6 +3889,8 @@ def _collect_workspace_resources_from_live_apis(
             # 「这个空间真没项目」和「我根本没拉到」，再往下就把空结果写回缓存，
             # 把好数据冲掉（2026-08-16 真发生过）。现在至少留痕，
             # 调用方也改成「拉到空就不覆盖非空缓存」。
+            if has_auth_diagnostic(exc):
+                raise
             swallowed("res/拉取任务维度项目", exc)
 
     cluster_info_failed = False
@@ -3853,7 +3922,9 @@ def _collect_workspace_resources_from_live_apis(
             resources.get("compute_groups", []),
             compute_groups_from_api,
         )
-    except QzAPIError:
+    except QzAPIError as _auth_exc:
+        if has_auth_diagnostic(_auth_exc):
+            raise
         cluster_info_failed = True
 
     if cluster_info_failed or not resources.get("compute_groups"):
@@ -3878,7 +3949,9 @@ def _collect_workspace_resources_from_live_apis(
                 resources.get("compute_groups", []),
                 compute_groups_from_nodes,
             )
-        except QzAPIError:
+        except QzAPIError as _auth_exc:
+            if has_auth_diagnostic(_auth_exc):
+                raise
             pass
 
     return resources, len(jobs)
@@ -3922,7 +3995,9 @@ def _load_compute_group_usage_snapshot(
                     workspace_id=workspace_id,
                 )
                 usage_by_filter[filter_key] = _summarize_node_capacity(nodes)
-            except QzAPIError:
+            except QzAPIError as _auth_exc:
+                if has_auth_diagnostic(_auth_exc):
+                    raise
                 usage_by_filter[filter_key] = {}
 
         usage = dict(usage_by_filter.get(filter_key, {}))
@@ -4299,6 +4374,8 @@ def _prefetch_create_interactive_snapshot(
                 or {}
             )
         except QzAPIError as e:
+            if has_auth_diagnostic(e):
+                raise
             ws_resources = get_workspace_resources(ws_id) or {}
             if ws_resources:
                 display.print(
@@ -4323,6 +4400,8 @@ def _prefetch_create_interactive_snapshot(
                 workspace_usage_snapshot=workspace_option.get("_usage_snapshot"),
             )
         except QzAPIError as e:
+            if has_auth_diagnostic(e):
+                raise
             display.print(
                 f"[dim]{ws_name} 的计算组占用刷新失败，继续使用缓存快照: {e}[/dim]"
             )
@@ -4451,6 +4530,8 @@ def _list_available_workspaces(
                     if usage_snapshot.get("compute_groups"):
                         ws["_usage_snapshot"] = usage_snapshot
                 except QzAPIError as e:
+                    if has_auth_diagnostic(e):
+                        raise
                     if not _is_auth_related_error(e):
                         display.print(
                             f"[dim]{ws_name or ws_id} 的实时占用获取失败，使用缓存列表: {e}[/dim]"
@@ -4460,6 +4541,8 @@ def _list_available_workspaces(
         if progress:
             progress.stop()
     except QzAPIError as e:
+        if has_auth_diagnostic(e):
+            raise
         cached = list_cached_workspaces()
         if cached:
             if not _is_auth_related_error(e):
@@ -4504,7 +4587,9 @@ def _resolve_workspace_value(
                 if ws_id:
                     set_workspace_name(ws_id, ws_name)
                     return ws_id, ws_name or ws_id
-    except QzAPIError:
+    except QzAPIError as _auth_exc:
+        if has_auth_diagnostic(_auth_exc):
+            raise
         pass
 
     return None, ""
@@ -4525,7 +4610,9 @@ def _refresh_workspace_resources_for_create(
             ),
             workspace_id=workspace_id,
         )
-    except QzAPIError:
+    except QzAPIError as _auth_exc:
+        if has_auth_diagnostic(_auth_exc):
+            raise
         if cached_resources:
             return cached_resources
         raise
@@ -4581,7 +4668,9 @@ def _refresh_workspace_resources_for_avail(
                             "workspace_id": workspace_id,
                         }
                     )
-        except QzAPIError:
+        except QzAPIError as _auth_exc:
+            if has_auth_diagnostic(_auth_exc):
+                raise
             compute_groups_from_api = []
 
         if compute_groups_from_api:
@@ -4725,6 +4814,8 @@ def _load_specs_for_create_result(
             result["items"] = []
             result["status"] = "empty"
     except Exception as e:
+        if has_auth_diagnostic(e):
+            raise
         if _is_unsupported_spec_listing_error(e):
             result["error"] = None
             result["items"] = list(cached_specs)
@@ -4821,6 +4912,8 @@ def _lookup_spec_for_payload(
     except (QzAPIError, requests.RequestException) as exc:
         # 预加载失败不致命：下面读缓存还有机会命中。但真拿不到规格时的报错
         # 要能回溯到这里，别只剩一句「找不到规格」。
+        if has_auth_diagnostic(exc):
+            raise
         swallowed("create/规格预加载", exc)
 
     spec_obj = _read_normalized_spec(workspace_id, spec_id)
@@ -4904,6 +4997,8 @@ def _explain_spec_group_mismatch(
             or []
         )
     except Exception as exc:  # noqa: BLE001 - 解释性信息，拿不到就退化
+        if has_auth_diagnostic(exc):
+            raise
         swallowed("create/规格解释", exc)
 
     if options:
@@ -4962,7 +5057,9 @@ def _auto_select_spec_for_compute_group(
                 for normalized in [_normalize_spec_item(spec, compute_group_id)]
                 if normalized
             ]
-        except QzAPIError:
+        except QzAPIError as _auth_exc:
+            if has_auth_diagnostic(_auth_exc):
+                raise
             platform_specs = []
         if platform_specs:
             scoped_specs = sorted(
@@ -6055,6 +6152,8 @@ def _run_resource_hierarchy_tui(
                 _load_level_payload(level)
             )
         except QzAPIError as e:
+            if has_auth_diagnostic(e):
+                raise
             current_title = "资源选择失败"
             current_options = []
             current_context_lines = []
@@ -7179,6 +7278,8 @@ def cmd_create(args):
             display=display,
         )
     except QzAPIError as e:
+        if has_auth_diagnostic(e):
+            raise
         if args.dry_run:
             # dry-run 不阻塞 payload 预览，但这个错误不能降级成一行灰字：
             # 以前这里只 dim 提示一句，然后照样打印一份 cpu/gpu/mem 全 0 的
@@ -7374,6 +7475,8 @@ def cmd_create(args):
     except QzAPIError as e:
         # 「优先级不在该资源规格允许的范围内」原样抛给用户等于没说 —— 他不知道
         # 该改什么。翻译成下一步，并记住这次拒绝供下次提前拦。
+        if has_auth_diagnostic(e):
+            raise
         if _priority.is_priority_rejection(str(e)):
             _priority.remember_rejection(
                 workspace_id, spec_id, args.priority, _spec_gpu_count(spec_id)
@@ -7850,6 +7953,8 @@ def cmd_hpc(args):
             priority=args.priority,
         )
     except QzAPIError as e:
+        if has_auth_diagnostic(e):
+            raise
         display.print_error(f"任务创建失败: {e}")
         return 1
 
@@ -7998,6 +8103,8 @@ def cmd_hpc_usage(args):
                     )
 
         except QzAPIError as e:
+            if has_auth_diagnostic(e):
+                raise
             if "401" in str(e) or "过期" in str(e):
                 display.print_error("Cookie 已过期，请重新设置: qzcli login")
                 return 1
@@ -8225,7 +8332,9 @@ def _resolve_notebook_id_by_name(target, cookie, display):
                 user_ids=[],
                 status=["RUNNING"],
             )
-        except QzAPIError:
+        except QzAPIError as _auth_exc:
+            if has_auth_diagnostic(_auth_exc):
+                raise
             continue
         notebooks.extend(nb_result.get("list", []))
 
@@ -8279,9 +8388,13 @@ def _get_jupyter_info(notebook_id, cookie, display):
     """
     try:
         urls = get_api().get_notebook_access_url(notebook_id, cookie)
-    except QzAPIError:
+    except QzAPIError as _auth_exc:
+        if has_auth_diagnostic(_auth_exc):
+            raise
         raise
     except Exception as e:
+        if has_auth_diagnostic(e):
+            raise
         display.print_error(f"请求失败: {e}")
         return None
 
@@ -8853,14 +8966,8 @@ def cmd_login(args):
         password_fingerprint,
     )
 
-    # 值仍然走 `get_credentials()` —— 它是既有契约，测试也在这一层打桩，
-    # 不该为了加一句提示就把调用点换掉。来源标签单独取，取不到就降级成「未知」，
-    # **绝不能因为一句诊断提示让登录本身失败**。
     stored_username, stored_password = get_credentials()
-    try:
-        _, _, _user_src, _pass_src = get_credentials_with_source()
-    except Exception:  # noqa: BLE001 —— 诊断信息拿不到不算错误
-        _user_src = _pass_src = "未知"
+    _, _, _user_src, _pass_src = get_credentials_with_source()
     if not stored_password:
         _pass_src = "未设置"
 
@@ -8877,7 +8984,6 @@ def cmd_login(args):
         _pass_src = f"--source {_explicit_source}"
         if not (args.username or "").strip():
             _user_src = f"--source {_explicit_source}"
-
 
     # fallback 顺序: CLI 参数 → 环境变量 QZCLI_USERNAME/QZCLI_PASSWORD → config.json → 交互式输入
     username = (args.username or stored_username or "").strip()
@@ -8921,6 +9027,10 @@ def cmd_login(args):
     # 把「这次用的密码从哪读的」明说出来。没有这一句，用户改完 config.json
     # 却被 shell 里过期的 QZCLI_PASSWORD 压着用旧密码时，错误信息只有
     # 「账号或密码错误」，完全指不到那条 export 上去。
+    if (args.username or "").strip():
+        _user_src = "命令行 --username"
+    elif not stored_username:
+        _user_src = "交互式输入"
     if args.password:
         _pass_src = "命令行 --password"
     elif getattr(args, "password_stdin", False):
@@ -8968,37 +9078,31 @@ def cmd_login(args):
         before = (get_cookie() or {}).get("cookie")
         with _relogin_file_lock():
             fresh = (get_cookie() or {}).get("cookie")
-            if fresh and fresh != before:
-                display.print("[dim]另一个进程刚刚登录过，直接复用其 cookie[/dim]")
+            if fresh and fresh != before and api.verify_cookie(fresh, username):
+                display.print("[dim]已验证并复用另一个进程的新会话[/dim]")
                 cookie = fresh
             else:
                 cookie = api.login_with_cas(username, password)
 
-        # 保存 cookie
-        save_cookie(cookie, workspace_id=args.workspace)
-        # 登录成功就清掉失败冷却，与 api._relogin 的收尾一致。少了这一步，手工
-        # `qzcli login` 成功之后的 60s 内，自动重登仍会被上一次失败的冷却挡着。
-        _clear_relogin_failure()
+            # 保存 cookie
+            save_cookie(cookie, workspace_id=args.workspace)
+            # 登录成功就清掉失败冷却，与 api._relogin 的收尾一致。少了这一步，手工
+            # `qzcli login` 成功之后的 60s 内，自动重登仍会被上一次失败的冷却挡着。
+            _clear_relogin_failure()
 
         display.print_success("登录成功！Cookie 已保存")
-
-        # 显示 cookie 前几个字符
-        cookie_preview = cookie[:50] + "..." if len(cookie) > 50 else cookie
-        display.print(f"[dim]Cookie: {cookie_preview}[/dim]")
 
         if args.workspace:
             display.print(f"[dim]默认工作空间: {args.workspace}[/dim]")
 
         return 0
 
-    except QzAPIError as e:
-        display.print_error(f"登录失败: {e}")
-        # 「密码错误」最常见的成因不是记错密码，而是多个来源里有一处没更新，
-        # 且它的优先级更高。把指纹摆出来，用户一眼就能看出是哪一处。
-        conflict = describe_credential_conflict()
-        if conflict:
-            display.print(conflict)
-        return 1
+    except Exception as exc:
+        trace = getattr(exc, "diagnostic", None) or AuthDiagnostic(stage="login")
+        trace.remember(password)
+        trace.credential_sources = f"凭据来源: 用户名={_user_src} | 密码={_pass_src}"
+        exc.diagnostic = trace
+        raise
 
 
 def _rewrite_legacy_create_short_flags(argv: List[str]) -> List[str]:
@@ -9761,8 +9865,7 @@ def main():
             print("\n操作已取消")
             return 130
         except Exception as e:
-            display = get_display()
-            display.print_error(str(e))
+            print(format_exception(e), file=sys.stderr)
             return 1
     else:
         parser.print_help()

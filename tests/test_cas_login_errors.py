@@ -1,29 +1,15 @@
-"""CAS 登录失败时报出来的原因必须是真的。
+"""Only errors in the password form describe the failed authentication.
 
-## 背景
-
-用户报「``qzcli login`` 用正确密码却说需要输入验证码」，跑去浏览器一看根本没有
-验证码可过。查下来判据是：
-
-    if "验证码" in resp.text:
-        raise QzAPIError("需要输入验证码，请在浏览器中登录后手动获取 cookie")
-
-而 CAS 登录页 **永远** 含"验证码"三个字 —— 抓下来数过，整整 5 处，全部来自旁边
-那个「短信验证码登录」标签页的固定文案。其中那个图形验证码 ``<img>`` 指向的还是
-``mapp.suda.edu.cn``（苏州大学），是模板里没清干净的死代码。
-
-于是**任何**退回登录页的失败都被翻译成"需要输入验证码"。真实原因（多半是短时间
-内登录过于频繁被 CAS 挡回）完全没被说出来，反而诱导用户反复重试 —— 而重试正是
-让情况变糟的动作。
-
-下面 fixture 里那 5 处"验证码"是照抄真实页面的，就是为了钉死这个误报。
+The legacy SMS-tab fixture deliberately contains captcha labels and an image.
+Those static elements cannot establish why CAS rejected a password request.
+The server's form-error text must remain visible without inferred causes.
 """
 
 import unittest
 
 from qzcli.api import _describe_cas_login_failure
 
-#: 真实登录页里那 5 处"验证码"，一字不改地抄下来。任何判据都不能被它们触发。
+#: Historical template markup, kept to prevent matching static captcha labels.
 _BENIGN_SMS_TAB_MARKUP = """
 <li class="auth_ul_li2"><h3>验证码登录</h3></li>
 <input class="auth_input paw_input" type="text" placeholder="验证码">
@@ -53,31 +39,24 @@ class CasLoginFailureMessageTests(unittest.TestCase):
         self.assertNotIn("需要输入验证码", message)
 
     def test_no_error_text_says_so_honestly(self):
-        """页面没给原因时要如实说读不到，并给出可执行的下一步 —— 不许编。"""
+        """页面没给原因时要如实说读不到，不推断触发原因。"""
         message = _describe_cas_login_failure(_page())
-        self.assertIn("未给出具体原因", message)
-        self.assertIn("qzcli cookie", message, "要告诉用户手工设 cookie 这条路")
-        self.assertIn("频繁", message, "要点出最常见的真实原因")
+        self.assertIn("未提供错误说明", message)
+        self.assertNotIn("频繁", message)
+        self.assertNotIn("自行恢复", message)
 
     def test_real_captcha_error_is_reported(self):
-        """真的要验证码时（错误容器里明确写了）必须报出来，并带上原文。
-
-        真实抓到的文案就是"验证码信息无效" —— CAS 平时不要验证码，是短时间内
-        登录失败几次后才临时打开的。
-        """
+        """Pass through the captcha error without asserting its trigger policy."""
         message = _describe_cas_login_failure(_page("验证码信息无效。"))
         self.assertIn("验证码", message)
         self.assertIn("验证码信息无效", message, "原文要带上")
 
-    def test_captcha_advice_leads_with_waiting_not_manual_cookie(self):
-        """验证码是临时限流，第一建议必须是"等一会儿"。
-
-        以前这里直接叫用户去浏览器手工取 cookie —— 那等于承认密码登录坏了，
-        而它并没有坏；何况已保存的 cookie 多半还有效，压根不用重新登录。
-        """
+    def test_captcha_error_does_not_invent_a_cause_or_recovery_time(self):
         message = _describe_cas_login_failure(_page("验证码信息无效。"))
-        self.assertIn("等几分钟", message)
-        self.assertIn("无需重新登录", message)
+        self.assertIn("CAS 返回：验证码信息无效。", message)
+        self.assertNotIn("等几分钟", message)
+        self.assertNotIn("无需重新登录", message)
+        self.assertNotIn("暂时", message)
 
     def test_password_error_is_reported(self):
         message = _describe_cas_login_failure(_page("用户名或密码错误"))

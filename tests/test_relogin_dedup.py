@@ -66,6 +66,11 @@ class _CountingAPI(QzAPI):
         self.unauthorized_calls = 0
         self._lock = threading.Lock()
 
+    def verify_cookie(self, cookie, username):
+        # Authentication validation is tested through the transport fixtures;
+        # this client models the shared fresh cookie for lock/dedup tests.
+        return cookie in {"inspire-session=already-fresh"} or cookie.startswith("inspire-session=fresh-")
+
     def login_with_cas(self, username, password):
         with self._lock:
             self.cas_calls += 1
