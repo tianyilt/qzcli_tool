@@ -58,7 +58,7 @@ class LoginProxyPreservationTests(unittest.TestCase):
         with patch.object(api, "get_api_base_url", return_value="https://qz.sii.edu.cn"), \
                 patch.object(api, "get_proxy", return_value=proxy_value), \
                 patch.object(api.requests, "Session", _session_factory):
-            client = api.QzAPI(username="u", password="p")
+            client = api.QzAPI(username="u", password="p", auth_mode="legacy")
             # login_with_cas retries transient errors internally, so it may
             # raise QzTransientError after several attempts (each builds a
             # fresh session). We assert on every session created.

@@ -13,7 +13,7 @@
 
 ## 特性
 
-- **一键登录**: `qzcli login` 通过 CAS 认证自动获取 cookie，无需手动复制
+- **官方登录**: `qzcli login` 通过官方 qz 网页授权，直接复用其 access/refresh token；密码认证显式使用 legacy
 - **资源发现**: `qzcli res -u` 调 `cluster_info` / `task_dimension` 聚合工作空间、计算组、项目并本地缓存（默认 quick 模式秒级返回；需要更新 specs 时加 `--full` 走全量历史任务扫描）
 - **节点查询**: `qzcli avail` 查询各计算组空余节点，支持低优任务统计和 cookie 失效自动刷新
 - **可视化看板**: `qzcli dashboard` 用 treemap 按「计算组→优先级→项目→用户→任务」逐层下钻 GPU 占用（需 `pip install 'qzcli[dashboard]'`）
@@ -27,7 +27,7 @@
 快速查看资源：
 
 ```bash
-qzcli login -u 用户名 -p 密码 && qzcli avail
+qzcli login && qzcli avail
 ```
 ```
 分布式
@@ -50,8 +50,9 @@ pip install -e .
 ## 快速开始
 
 ```bash
-# 1. 登录（自动获取 cookie）
-qzcli login
+# 1. 已安装官方 qz 后初始化；已有有效授权会直接复用
+qzcli init
+qzcli auth status --check
 
 # 2. 更新资源缓存（首次使用强烈建议执行，自动发现所有可访问的工作空间）
 #    默认 quick 模式秒级返回；如需更新 specs（资源规格），加 --full 走全量历史任务扫描
@@ -65,6 +66,8 @@ qzcli ls -c -r -w <工作空间名称或ID>
 qzcli ls -c -r --all-ws
 ```
 
+下面的密码配置仅供显式 `legacy` 模式使用。官方模式不会读取这些密码。
+
 如果没有显式设置 `QZCLI_ENV_FILE`，`qzcli` 会默认尝试从 `~/.qzcli/.env` 读取 CAS 凭据；如果你的凭据文件在别处，先导出 `QZCLI_ENV_FILE=/path/to/.env`：
 
 ```bash
@@ -73,7 +76,7 @@ QZCLI_USERNAME="your_username"
 QZCLI_PASSWORD='your_password'
 EOF
 
-qzcli login
+qzcli --auth-mode legacy login
 ```
 
 > **重要**: 
@@ -206,30 +209,36 @@ qzcli ls -c -w 分布式 -r
 
 | 命令 | 说明 | 示例 |
 |------|------|------|
-| `login` | CAS 登录获取 cookie | `qzcli login` |
-| `cookie` | 手动设置 cookie | `qzcli cookie -f cookies.txt` |
+| `init` | 验证官方依赖、配置和身份，成功后保存绑定 | `qzcli init` |
+| `login` | 官方 qz 网页授权 | `qzcli login` |
+| `auth status` | 分别显示两枚 token 的到期状态，不显示凭据 | `qzcli auth status --check` |
+| `cookie` | legacy 手动 Cookie | `qzcli --auth-mode legacy cookie -f cookies.txt` |
+
+官方 `qz` 安装方式见平台的 Inspire-CLI 用户手册。默认认证目录为 `~/.config/inspire-cli`，由 `QZ_CLI_CONFIG_DIR` 或根参数 `--qz-config-dir` 指定。`QZCLI_HOME` 只隔离 qzcli 的配置、资源和任务记录，不会隔离同一官方目录内的 refresh 链。每台机器应独立授权，不复制刷新令牌链。
 
 ```bash
-# 交互式登录
-qzcli login
+qzcli init
+qzcli auth status --check
+qzcli login                    # 打印官方授权网址与验证码，等待浏览器批准
+qzcli --qz-config-dir /path/to/official-config login
+```
 
-# 带参数登录
-qzcli login -u 学工号 -p 密码
+访问令牌未过期时直接使用，即使刷新令牌已过期或缺失。访问令牌失效但刷新令牌可用时，调用官方 `qz user GetUserDetail` 续期并重新读取两枚凭据；不能续期时提示重新网页登录。未知到期时间不等于过期，以真实接口验证。401 最多一次协调刷新和一次业务重试；403 是权限拒绝，网络错误保留原文，不删除凭据、不自动登录。
 
-# 脚本里从 stdin 读密码
-echo 'your_password' | qzcli login -u 学工号 --password-stdin
+业务 API 仍由 Python 直连，请求携带 `Authorization: Bearer …` 和 `X-Inspire-Client-Source: inspire-cli/qzcli-<version>`。qzcli 只读取官方加密凭据，登录、刷新和凭据写入均由官方 qz 负责。首次需要安装 `cryptography` 和 `PyYAML`（已列为依赖）。`INSPIRE_TOKEN` 是独立的静态覆盖，不能续期；网页登录前需移除它。官方子进程、HTTP 与 WebSocket 采用相同代理配置和 `NO_PROXY` 规则。
 
-# 多处存了不一样的密码时，说清用哪一处（不指定会被直接挡下、不发请求）
-qzcli login --source config     # 只认 ~/.qzcli/config.json
-qzcli login --source env        # 只认环境变量 QZCLI_PASSWORD
-qzcli login --source envfile    # 只认 ~/.qzcli/.env
-qzcli login --force             # 坚持按优先级来（会消耗账号锁定次数）
+#### legacy 备用认证
 
-# 查看当前 cookie
-qzcli cookie --show
+通过根参数或 `QZCLI_AUTH_MODE=legacy` 显式选用。不会因官方认证失败而自动切换。
 
-# 清除 cookie
-qzcli cookie --clear
+```bash
+qzcli --auth-mode legacy login -u 学工号 -p 密码
+echo 'your_password' | qzcli --auth-mode legacy login -u 学工号 --password-stdin
+qzcli --auth-mode legacy login --source config
+qzcli --auth-mode legacy login --source env
+qzcli --auth-mode legacy login --source envfile
+qzcli --auth-mode legacy cookie --show
+qzcli --auth-mode legacy avail
 ```
 
 登录失败时，stderr 默认保留认证阶段、凭据来源、HTTP 状态、重定向响应、完整响应正文和异常链；密码、cookie、token、认证票据会被脱敏。原始错误不会再被改写成“登录频繁，等几分钟恢复”。密码提交后遇到超时会报告“结果未知”，不自动重放密码请求。
@@ -295,7 +304,7 @@ qzcli avail -n 4
 qzcli avail -n 4 -e
 ```
 
-如果本地 cookie 已过期，但你已经通过 shell 环境变量、`QZCLI_ENV_FILE` 指向的 `.env`（默认 `~/.qzcli/.env`）或 `~/.qzcli/config.json` 保存了 CAS 凭据，`qzcli avail` 会自动刷新 cookie 后继续查询。
+在显式 legacy 模式下，如果本地 cookie 已过期，但你已经通过 shell 环境变量、`QZCLI_ENV_FILE` 指向的 `.env`（默认 `~/.qzcli/.env`）或 `~/.qzcli/config.json` 保存了 CAS 凭据，`qzcli avail` 会自动刷新 cookie 后继续查询。
 
 ### 可视化看板
 
@@ -306,7 +315,7 @@ qzcli avail -n 4 -e
 ```bash
 pip install 'qzcli[dashboard]'      # 安装 streamlit / plotly / pandas
 
-qzcli login                          # 看板走 cookie 认证
+qzcli login                          # 使用所选认证模式
 qzcli dashboard                      # 默认「分布式」，端口 8520，自动开浏览器
 qzcli dashboard -w 分布式 --port 8600  # 指定工作空间和端口
 qzcli dashboard --no-browser         # headless（远端/无 GUI 场景）
@@ -338,7 +347,7 @@ qzcli ls --no-refresh       # 不刷新状态
 | 命令 | 别名 | 说明 |
 |------|------|------|
 | `create` | `create-job` | 创建并提交 GPU 分布式训练任务 |
-| `hpc` | | 提交 HPC/CPU 任务（Slurm，需 cookie 认证） |
+| `hpc` | | 提交 HPC/CPU 任务（Slurm） |
 | `batch` | | 从 JSON 配置文件批量提交任务 |
 
 ```bash
@@ -404,11 +413,11 @@ qzcli create --name test --command "echo hi" --workspace "我的工作空间" --
 
 兼容性说明：历史脚本中的 `qzcli create -i <image>` 仍可用，CLI 会自动按旧语义解析为 `--image`。
 
-> **提示**: `qzcli create -i` 在 TTY 终端下会先进入单实例全屏的层级式选择菜单，按 `workspace -> project -> compute_group -> spec` 的顺序逐级选择，`Enter/→` 进入下一层，`←` 返回上一层重新选择，界面会直接覆盖刷新而不是连续堆叠多个表格。`compute_group` 选项里会展示 `GPU类型 / 占用口径 / 规格状态 / 空节点 / 空GPU / GPU利用率`，其中 `共享池` 表示该数值来自底层物理 compute group 的共享资源池实时占用，`规格状态` 会标识该计算组的 spec 列表是否来自实时接口、缓存或异常分支。若某个计算组的实时 spec 查询失败，界面不会退出 TUI，而是在同一屏内给出告警，并支持 `m` 手动输入 spec ID、`r` 重试拉取、`←` 返回上一级更换计算组。完成资源选择后，再按原来的方式输入任务名称、执行命令、Docker 镜像等参数。若当前环境不是 TTY，或缺少 `prompt_toolkit`，CLI 会自动回退到原来的文本交互模式。若本地 cookie 已失效且已配置 CAS 账号密码，CLI 会自动刷新 cookie 后重试；若本地没有可复用的交互快照，`create -i` 会按需预加载当前可访问 workspace 的资源快照，并将结果保存到 `~/.qzcli/create_interactive_snapshot.json` 供后续复用。已经显式传入的参数会直接跳过。非交互模式下，`--project`、`--compute-group`、`--spec` 省略时仍会自动从 `qzcli res` 缓存中选取第一个。首次使用前建议先运行 `qzcli login && qzcli res -u`。
+> **提示**: `qzcli create -i` 在 TTY 终端下会先进入单实例全屏的层级式选择菜单，按 `workspace -> project -> compute_group -> spec` 的顺序逐级选择，`Enter/→` 进入下一层，`←` 返回上一层重新选择，界面会直接覆盖刷新而不是连续堆叠多个表格。`compute_group` 选项里会展示 `GPU类型 / 占用口径 / 规格状态 / 空节点 / 空GPU / GPU利用率`，其中 `共享池` 表示该数值来自底层物理 compute group 的共享资源池实时占用，`规格状态` 会标识该计算组的 spec 列表是否来自实时接口、缓存或异常分支。若某个计算组的实时 spec 查询失败，界面不会退出 TUI，而是在同一屏内给出告警，并支持 `m` 手动输入 spec ID、`r` 重试拉取、`←` 返回上一级更换计算组。完成资源选择后，再按原来的方式输入任务名称、执行命令、Docker 镜像等参数。若当前环境不是 TTY，或缺少 `prompt_toolkit`，CLI 会自动回退到原来的文本交互模式。在显式 legacy 模式下，若本地 cookie 已失效且已配置 CAS 账号密码，CLI 会自动刷新 cookie 后重试；若本地没有可复用的交互快照，`create -i` 会按需预加载当前可访问 workspace 的资源快照，并将结果保存到 `~/.qzcli/create_interactive_snapshot.json` 供后续复用。已经显式传入的参数会直接跳过。非交互模式下，`--project`、`--compute-group`、`--spec` 省略时仍会自动从 `qzcli res` 缓存中选取第一个。首次使用前建议先运行 `qzcli login && qzcli res -u`。
 
 ### 提交 HPC/CPU 任务
 
-> HPC 任务使用 Slurm 调度，通过 `/api/v1/hpc_jobs` 接口提交，需要 cookie 认证（先运行 `qzcli login`）。
+> HPC 任务使用 Slurm 调度，通过 `/api/v2/hpc?Action=CreateJobConsole` 接口提交，使用当前选择的认证（先运行 `qzcli init`）。
 
 ```bash
 qzcli hpc \

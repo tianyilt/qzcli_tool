@@ -37,10 +37,10 @@ proxy，走的是完全不同的通道，所以单开 ``qzcli worker exec``。
 import re
 import ssl
 import time
-from typing import Dict, List, Optional, Tuple
-from urllib.parse import urlencode, urlparse
+from typing import List, Optional, Tuple
+from urllib.parse import urlencode
 
-from .config import get_cookie, get_proxy
+from .config import get_cookie, websocket_proxy_options
 from .diag import swallowed
 
 #: 分布式训练 worker 的 PTY 通道。hpc/ray/inference 各有自己的 ``instances/exec``，
@@ -82,46 +82,75 @@ def _connect(job_id: str, instance_name: str, timeout: int = 30):
             "缺少 websocket-client 依赖：pip install websocket-client"
         ) from exc
 
-    cookie = (get_cookie() or {}).get("cookie")
-    if not cookie:
-        raise WorkerExecError("没有登录态，请先运行 `qzcli login`")
+    from .api import get_api, QZ_CLIENT_SOURCE, _CurlResponse
+    from .auth_diag import AuthDiagnostic
 
-    base = "wss://qz.sii.edu.cn"
+    api = get_api()
+    server = api.base_url.rstrip("/")
+    official = getattr(api, "auth_mode", None) == "qz"
+    token, cookie = "", ""
+    if official:
+        token = api._official_token()
+    else:
+        cookie = (get_cookie() or {}).get("cookie")
+        if not cookie:
+            raise WorkerExecError("没有登录态，请先运行 `qzcli login`")
+
+    base = server.replace("https://", "wss://", 1).replace("http://", "ws://", 1)
     url = f"{base}{_TRAIN_REMOTE_CMD}?" + urlencode(
         {"job_id": job_id, "instance_name": instance_name}
     )
-    headers = [
-        f"Cookie: {cookie}",
-        "Origin: https://qz.sii.edu.cn",
-        f"User-Agent: {_UA}",
-    ]
 
-    # 代理：本机（macOS + clash）只能靠代理解析 qz.sii.edu.cn，直连会 DNS 失败。
-    # get_proxy 会按 NO_PROXY 判断，不该走代理时返回空串。
-    proxy_kwargs: Dict[str, object] = {}
-    proxy = (get_proxy("https://qz.sii.edu.cn") or "").strip()
-    if proxy:
-        parsed = urlparse(proxy if "://" in proxy else f"http://{proxy}")
-        if parsed.hostname and parsed.port:
-            proxy_kwargs = {
-                "http_proxy_host": parsed.hostname,
-                "http_proxy_port": parsed.port,
-                "proxy_type": "http",
-            }
-
-    try:
-        return websocket.create_connection(
-            url,
-            header=headers,
-            timeout=timeout,
-            sslopt={"cert_reqs": ssl.CERT_NONE},
-            **proxy_kwargs,
+    trace = AuthDiagnostic(stage="worker WebSocket", authentication=False)
+    trace.remember_cookie(cookie)
+    for attempt in range(2):
+        trace.remember(token)
+        headers = [f"Origin: {server}", f"User-Agent: {_UA}"]
+        headers.extend(
+            [
+                f"Authorization: Bearer {token}",
+                f"X-Inspire-Client-Source: {QZ_CLIENT_SOURCE}",
+            ]
+            if official
+            else [f"Cookie: {cookie}"]
         )
-    except Exception as exc:  # noqa: BLE001 —— 底层异常类型很杂，统一成本模块的错
-        raise WorkerExecError(
-            f"连不上 worker 容器（{instance_name}）：{type(exc).__name__}: {exc}\n"
-            "  常见原因：任务不在运行中 / 实例名不对 / 登录态过期"
-        ) from exc
+        try:
+            return websocket.create_connection(
+                url,
+                header=headers,
+                timeout=timeout,
+                sslopt={"cert_reqs": ssl.CERT_NONE},
+                **websocket_proxy_options(server),
+            )
+        except Exception as exc:
+            status = getattr(exc, "status_code", None)
+            if status:
+                body = getattr(exc, "resp_body", "") or ""
+                if isinstance(body, bytes):
+                    body = body.decode("utf-8", errors="replace")
+                trace.authentication = status == 401
+                trace.record(
+                    _CurlResponse(
+                        status, body, url, getattr(exc, "resp_headers", None)
+                    ),
+                    "GET",
+                    url,
+                )
+            if official and status == 401 and attempt == 0:
+                try:
+                    token = api._official_token(force_refresh=True, failing_token=token)
+                except Exception as renewal:
+                    renewal.diagnostic = trace
+                    raise
+                continue
+            error = WorkerExecError(
+                trace.redact(
+                    f"连不上 worker 容器（{instance_name}）：{type(exc).__name__}: {exc}"
+                )
+                + ("\n" + trace.render() if trace.responses else "")
+            )
+            error.diagnostic = trace
+            raise error from exc
 
 
 def _drain(ws, seconds: float) -> str:

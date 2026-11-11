@@ -20,6 +20,7 @@ import requests
 
 from . import __version__
 from .api import (
+    _proxies_for,
     QzAPIError,
     _clear_relogin_failure,
     _relogin_file_lock,
@@ -382,9 +383,66 @@ def _note_workspace_unavailable(workspace_id, exc):
 _UNAVAILABLE_API_CODES = {"AccessForbidden", "Forbidden", "PermissionDenied"}
 
 
+def _is_qz_mode(api=None):
+    return getattr(api if api is not None else get_api(), "auth_mode", None) == "qz"
+
+
+def _auth_state():
+    """Select the provider; an empty cookie never stands for a Bearer credential."""
+    if _is_qz_mode():
+        from .config import load_config
+
+        return {
+            "auth_mode": "qz",
+            "cookie": "",
+            "workspace_id": load_config().get("default_workspace_id", ""),
+        }
+    return get_cookie()
+
+
+def _has_auth_context(state):
+    return bool(state and (state.get("auth_mode") == "qz" or state.get("cookie")))
+
+
+def cmd_auth(args):
+    import json
+
+    print(
+        json.dumps(
+            get_api().auth_status(check=args.check), ensure_ascii=False, indent=2
+        )
+    )
+    return 0
+
+
 def cmd_init(args):
     """初始化配置"""
     display = get_display()
+
+    api = get_api()
+    if getattr(api, "auth_mode", None) == "qz":
+        if args.username or args.password:
+            raise QzAPIError("用户名和密码初始化请显式使用 --auth-mode legacy")
+        from .config import load_config, save_config
+        from .qz_auth import OfficialAuthError
+
+        api._official_auth._binary()
+        display.print(f"官方配置目录: {api._official_auth.directory}")
+        display.print(f"业务服务地址: {api.base_url}")
+        try:
+            api._official_auth.token()
+        except OfficialAuthError as exc:
+            if not exc.action_required:
+                raise
+            api._official_auth.login()
+        status = api.auth_status(check=True)
+        config = load_config()
+        config.update(auth_mode="qz", qz_config_dir=str(api._official_auth.directory))
+        save_config(config)
+        display.print_success(
+            f"初始化成功：{status['user'].get('name') or status['user']['id']}"
+        )
+        return 0
 
     username = args.username
     password = args.password
@@ -420,8 +478,8 @@ def cmd_list_cookie(args):
     api = get_api()
 
     # 获取 cookie
-    cookie_data = get_cookie()
-    if not cookie_data or not cookie_data.get("cookie"):
+    cookie_data = _auth_state()
+    if not _has_auth_context(cookie_data):
         display.print_error("未设置 cookie，请先运行: qzcli login")
         return 1
 
@@ -838,11 +896,17 @@ def _events_for_nodes(api, cookie, node_names, display, args):
         exclude = _ne.should_exclude(diag)
         if exclude:
             bad_nodes.append(name)
-        mark = "[red]✗[/red]" if exclude else ("[yellow]![/yellow]" if diag["problems"] else "[green]✓[/green]")
+        mark = (
+            "[red]✗[/red]"
+            if exclude
+            else ("[yellow]![/yellow]" if diag["problems"] else "[green]✓[/green]")
+        )
         display.print(f"\n{mark} [bold]{name}[/bold]  ({len(mine)} 条事件)")
         if not mine:
-            display.print("  [dim]查不到事件记录 —— 可能是节点名写错了，"
-                          "也可能这台确实一直没出过状况[/dim]")
+            display.print(
+                "  [dim]查不到事件记录 —— 可能是节点名写错了，"
+                "也可能这台确实一直没出过状况[/dim]"
+            )
             continue
         display.print(f"  {_ne.verdict(diag)}")
         for p in diag["problems"]:
@@ -861,9 +925,7 @@ def _events_for_nodes(api, cookie, node_names, display, args):
                     "**不据此建议排除**，真撞上失败再回来看这条。[/dim]"
                 )
             else:
-                display.print(
-                    f"  [red]· {p['title']}[/red]（{p['reason']}，{when}）"
-                )
+                display.print(f"  [red]· {p['title']}[/red]（{p['reason']}，{when}）")
                 display.print(f"    {p['advice']}")
         if diag["recovered"]:
             names = "、".join(f"{r['title']}" for r in diag["recovered"])
@@ -887,7 +949,7 @@ def cmd_events(args):
     job_id = args.job_id
 
     cookie = _get_cookie_value()
-    if not cookie:
+    if not cookie and not _is_qz_mode():
         display.print_error("未找到有效 cookie，请先 `qzcli login`")
         return 1
 
@@ -987,7 +1049,7 @@ def cmd_status(args):
         if _status_is_waiting(api_data.get("status")):
             try:
                 cookie = _get_cookie_value()
-                if cookie:
+                if cookie or _is_qz_mode(api):
                     events = api.get_job_events_with_cookie(job_id, cookie)
                     sched = _pick_scheduling_reason(events)
                     if sched:
@@ -1323,6 +1385,8 @@ def cmd_clear(args):
 
 
 def cmd_cookie(args):
+    if _is_qz_mode():
+        raise QzAPIError("Cookie 管理请显式使用 --auth-mode legacy")
     """设置浏览器 cookie"""
     display = get_display()
 
@@ -1445,11 +1509,11 @@ def cmd_workspaces(args):
 
     # 解析 workspace 参数（支持名称或 ID）
     workspace_input = args.workspace
-    cookie_data = get_cookie()
+    cookie_data = _auth_state()
 
     # 如果使用 -u 但没有指定工作空间，自动发现所有可访问的工作空间
     if args.update and not workspace_input:
-        if not cookie_data or not cookie_data.get("cookie"):
+        if not _has_auth_context(cookie_data):
             display.print_error("未设置 cookie，请先运行: qzcli login")
             return 1
 
@@ -1610,7 +1674,7 @@ def cmd_workspaces(args):
         specs = list(cached_resources.get("specs", {}).values())
     else:
         # 从 API 获取
-        if not cookie_data or not cookie_data.get("cookie"):
+        if not _has_auth_context(cookie_data):
             display.print_error("未设置 cookie，请先运行: qzcli cookie -f cookies.txt")
             display.print("[dim]提示: 从浏览器 F12 获取 cookie[/dim]")
             return 1
@@ -2777,8 +2841,8 @@ def cmd_usage(args):
     api = get_api()
 
     # 获取 cookie
-    cookie_data = get_cookie()
-    if not cookie_data or not cookie_data.get("cookie"):
+    cookie_data = _auth_state()
+    if not _has_auth_context(cookie_data):
         display.print_error("未设置 cookie，请先运行: qzcli login")
         return 1
 
@@ -3014,8 +3078,8 @@ def cmd_workspace(args):
     api = get_api()
 
     # 获取 cookie
-    cookie_data = get_cookie()
-    if not cookie_data or not cookie_data.get("cookie"):
+    cookie_data = _auth_state()
+    if not _has_auth_context(cookie_data):
         display.print_error("未设置 cookie，请先运行: qzcli cookie -f cookies.txt")
         display.print("[dim]提示: 从浏览器 F12 获取 cookie[/dim]")
         return 1
@@ -3513,8 +3577,10 @@ def _validate_cached_spec_membership(
     return any(item["id"] == spec_id for item in scoped_specs)
 
 
-def _get_cookie_value() -> str:
+def _get_cookie_value(api=None) -> str:
     """返回已保存的 cookie 值。"""
+    if _is_qz_mode(api):
+        return ""
     cookie_data = get_cookie()
     return (cookie_data or {}).get("cookie", "")
 
@@ -3551,6 +3617,10 @@ def _refresh_cookie_for_interactive(api, display, workspace_id: str = "") -> str
     """
     global _refresh_notice_shown
 
+    if _is_qz_mode(api):
+        api.ensure_authenticated(probe=False)
+        return ""
+
     relogin = getattr(api, "_relogin", None)
     if relogin is None:
         # 测试里的假 API 可能没有 _relogin，退回老路径（单线程场景不会放大）
@@ -3582,7 +3652,10 @@ def _refresh_cookie_for_interactive(api, display, workspace_id: str = "") -> str
 
 def _with_live_cookie(api, display, fn, workspace_id: str = ""):
     """执行依赖 cookie 的请求，必要时自动刷新 cookie 后重试一次。"""
-    cookie = _get_cookie_value()
+    if _is_qz_mode(api):
+        api.ensure_authenticated(probe=False)
+        return fn("")
+    cookie = _get_cookie_value(api)
     refreshed = False
 
     while True:
@@ -7030,6 +7103,10 @@ def cmd_dashboard(args):
         cmd += ["--server.headless", "true"]
 
     env = dict(os.environ, QZCLI_DASHBOARD_WS=ws_id)
+    from .config import get_auth_mode, get_qz_config_dir
+
+    env["QZCLI_AUTH_MODE"] = get_auth_mode()
+    env["QZ_CLI_CONFIG_DIR"] = str(get_qz_config_dir())
     display.print(
         f"[dim]启动看板：workspace={ws_input} 端口={args.port}（Ctrl+C 退出）[/dim]"
     )
@@ -7037,7 +7114,6 @@ def cmd_dashboard(args):
         return subprocess.run(cmd, env=env).returncode
     except KeyboardInterrupt:
         return 0
-
 
 
 def _spec_gpu_count(spec_id):
@@ -7305,7 +7381,7 @@ def cmd_create(args):
     try:
         args.image, args.image_type = resolve_create_image(
             api,
-            (get_cookie() or {}).get("cookie", ""),
+            (_auth_state() or {}).get("cookie", ""),
             workspace_id,
             args.image,
             args.image_type,
@@ -7467,8 +7543,8 @@ def cmd_create(args):
             return 1
 
     try:
-        cookie_data = get_cookie()
-        if cookie_data and cookie_data.get("cookie"):
+        cookie_data = _auth_state()
+        if _has_auth_context(cookie_data):
             result = api.create_job_v2(cookie_data["cookie"], payload)
         else:
             result = api.create_job(payload)
@@ -7553,19 +7629,25 @@ def cmd_ops(args):
     from . import opslog
 
     display = get_display()
-    rows = opslog.read(op=getattr(args, "op", None), since_hours=getattr(args, "since", None))
+    rows = opslog.read(
+        op=getattr(args, "op", None), since_hours=getattr(args, "since", None)
+    )
     seen_paths = [str(opslog.log_path())]
     for extra in getattr(args, "merge", []) or []:
         p = Path(extra).expanduser()
         if p.is_dir():
             p = p / opslog.LOG_NAME
-        rows += opslog.read(p, op=getattr(args, "op", None), since_hours=getattr(args, "since", None))
+        rows += opslog.read(
+            p, op=getattr(args, "op", None), since_hours=getattr(args, "since", None)
+        )
         seen_paths.append(str(p))
 
     rows.sort(key=lambda r: r.get("ts_utc", ""))
     if not rows:
         display.print(f"没有记录。日志位置: {'、'.join(seen_paths)}")
-        display.print("[dim]只读命令（list/status/avail/usage）刻意不记，所以空是正常的[/dim]")
+        display.print(
+            "[dim]只读命令（list/status/avail/usage）刻意不记，所以空是正常的[/dim]"
+        )
         return 0
 
     display.print(f"共 {len(rows)} 条（来自 {len(seen_paths)} 份日志）\n")
@@ -7640,7 +7722,11 @@ def _devbox_render(display, report, dry_run=False):
                 line += f"  ✗ {item['error']}"
             display.print(line)
 
-        conflicts = [i for i in report["items"] if i.get("conflict") or (i.get("merge") or {}).get("conflicts")]
+        conflicts = [
+            i
+            for i in report["items"]
+            if i.get("conflict") or (i.get("merge") or {}).get("conflicts")
+        ]
         if conflicts:
             display.print_warning(
                 f"有冲突文件已备份到 {report.get('conflict_dir','')}，"
@@ -7891,12 +7977,12 @@ def cmd_hpc(args):
     api = get_api()
     store = get_store()
 
-    cookie_data = get_cookie()
+    cookie_data = _auth_state()
     if not cookie_data:
         display.print_error("未找到 cookie，请先运行: qzcli login")
         return 1
     cookie = cookie_data.get("cookie", "")
-    if not cookie:
+    if not cookie and not _is_qz_mode():
         display.print_error("cookie 为空，请先运行: qzcli login")
         return 1
 
@@ -8006,8 +8092,8 @@ def cmd_hpc_usage(args):
     display = get_display()
     api = get_api()
 
-    cookie_data = get_cookie()
-    if not cookie_data or not cookie_data.get("cookie"):
+    cookie_data = _auth_state()
+    if not _has_auth_context(cookie_data):
         display.print_error("未设置 cookie，请先运行: qzcli login")
         return 1
     cookie = cookie_data["cookie"]
@@ -8427,8 +8513,8 @@ def _find_notebook_jupyter_info(target, display):
 
     Returns: dict with {base_url, token, notebook_id} or None
     """
-    cookie_data = get_cookie()
-    if not cookie_data or not cookie_data.get("cookie"):
+    cookie_data = _auth_state()
+    if not _has_auth_context(cookie_data):
         display.print_error("未登录，请先 qzcli login")
         return None
 
@@ -8447,6 +8533,8 @@ def _find_notebook_jupyter_info(target, display):
     try:
         info = _get_jupyter_info(notebook_id, cookie, display)
     except QzAPIError as exc:
+        if _is_qz_mode():
+            raise
         if exc.code != 401:
             display.print_error(str(exc))
             return None
@@ -8560,6 +8648,7 @@ def _exec_launch(jupyter_info, cmd_str, display, job_id=None):
         return None
 
     import requests as _requests
+    from .config import websocket_proxy_options
 
     base_http = jupyter_info["base_url"]
     base_ws = base_http.replace("https://", "wss://")
@@ -8603,7 +8692,7 @@ def _exec_launch(jupyter_info, cmd_str, display, job_id=None):
     # 用 setsid 把命令从这个终端会话里摘出去：终端一关（我们随后会主动删掉它），
     # 命令仍在服务端跑完。没有 setsid 的镜像回退到 nohup。
     inner = (
-        f"( {cmd_str} ) > {tmp_dir}/{job_id}_out 2>&1; "
+        f"(\n{cmd_str}\n) > {tmp_dir}/{job_id}_out 2>&1; "
         f"echo $? > {tmp_dir}/{job_id}_exit"
     )
     # symlink 用 `ln -sfn` 幂等重建，**不再先 rm -rf**：原来的
@@ -8652,13 +8741,17 @@ def _exec_launch(jupyter_info, cmd_str, display, job_id=None):
             # 交错，还会直接往别人开着的交互式会话里打字（实测有开发机上躺着
             # 4 个两天前的人工终端，exec 会挑中第一个）。
             resp_t = _requests.post(
-                f"{base_http}/api/terminals", headers=headers, timeout=10
+                f"{base_http}/api/terminals",
+                headers=headers,
+                timeout=10,
+                proxies=_proxies_for(f"{base_http}/api/terminals"),
             )
             term_name = resp_t.json()["name"]
 
             ws = websocket.create_connection(
                 f"{base_ws}/terminals/websocket/{term_name}?token={token}",
                 timeout=10,
+                **websocket_proxy_options(base_http),
             )
             _time.sleep(0.3)
             while True:
@@ -8697,7 +8790,9 @@ def _exec_launch(jupyter_info, cmd_str, display, job_id=None):
                 display.print_warning(f"连接失败，重试中... ({attempt + 1}/3)")
                 _time.sleep(2)
             else:
-                display.print_error(f"启动命令失败: {e}")
+                from .auth_diag import AuthDiagnostic
+
+                display.print_error(AuthDiagnostic().redact(f"启动命令失败: {e}"))
                 return None
 
     return None
@@ -8716,7 +8811,10 @@ def _delete_terminal(base_http, headers, term_name):
 
     try:
         _requests.delete(
-            f"{base_http}/api/terminals/{term_name}", headers=headers, timeout=10
+            f"{base_http}/api/terminals/{term_name}",
+            headers=headers,
+            timeout=10,
+            proxies=_proxies_for(f"{base_http}/api/terminals/{term_name}"),
         )
     except _requests.RequestException as exc:
         swallowed("exec/关闭 terminal", exc)
@@ -8744,7 +8842,10 @@ def _exec_poll(jupyter_info, job_id, display, timeout=120, cleanup_on_done=True)
         for fname in [api_out, api_exit]:
             try:
                 _requests.delete(
-                    f"{base_http}/api/contents/{fname}", headers=headers, timeout=5
+                    f"{base_http}/api/contents/{fname}",
+                    headers=headers,
+                    timeout=5,
+                    proxies=_proxies_for(f"{base_http}/api/contents/{fname}"),
                 )
             except _requests.RequestException as exc:
                 swallowed("exec/清理临时文件", exc)
@@ -8761,6 +8862,7 @@ def _exec_poll(jupyter_info, job_id, display, timeout=120, cleanup_on_done=True)
                 f"{base_http}/api/contents/{api_exit}",
                 headers=headers,
                 timeout=10,
+                proxies=_proxies_for(f"{base_http}/api/contents/{api_exit}"),
             )
             if resp_exit.status_code == 200:
                 exit_str = resp_exit.json().get("content", "").strip()
@@ -8770,6 +8872,7 @@ def _exec_poll(jupyter_info, job_id, display, timeout=120, cleanup_on_done=True)
                     f"{base_http}/api/contents/{api_out}",
                     headers=headers,
                     timeout=10,
+                    proxies=_proxies_for(f"{base_http}/api/contents/{api_out}"),
                 )
                 if resp_out.status_code == 200:
                     output = resp_out.json().get("content", "").rstrip()
@@ -8823,7 +8926,10 @@ def _exec_list(jupyter_info, display, show_all=False):
     def ls(path):
         try:
             r = _requests.get(
-                f"{base_http}/api/contents/{path}", headers=headers, timeout=15
+                f"{base_http}/api/contents/{path}",
+                headers=headers,
+                timeout=15,
+                proxies=_proxies_for(f"{base_http}/api/contents/{path}"),
             )
             if r.status_code != 200:
                 return []
@@ -8958,6 +9064,28 @@ def cmd_login(args):
 
     display = get_display()
     api = get_api()
+    if _is_qz_mode(api):
+        if (
+            args.username
+            or args.password
+            or getattr(args, "password_stdin", False)
+            or getattr(args, "source", None)
+            or getattr(args, "force", False)
+        ):
+            raise QzAPIError("密码登录参数需要显式选择 --auth-mode legacy")
+        from .config import load_config, save_config
+
+        api._official_auth.login()
+        status = api.auth_status(check=True)
+        config = load_config()
+        config.update(auth_mode="qz", qz_config_dir=str(api._official_auth.directory))
+        if args.workspace:
+            config["default_workspace_id"] = args.workspace
+        save_config(config)
+        display.print_success(
+            f"官方登录成功：{status['user'].get('name') or status['user']['id']}"
+        )
+        return 0
     from .config import (
         credential_conflict,
         describe_credential_conflict,
@@ -9145,8 +9273,20 @@ def main():
     parser.add_argument(
         "--version", "-V", action="version", version=f"qzcli {__version__}"
     )
+    parser.add_argument(
+        "--auth-mode", choices=("qz", "legacy"), help="认证模式（默认官方 qz）"
+    )
+    parser.add_argument("--qz-config-dir", help="官方 qz 配置目录")
 
     subparsers = parser.add_subparsers(dest="command", help="子命令")
+    auth_parser = subparsers.add_parser("auth", help="查看认证状态（不显示凭据）")
+    auth_sub = auth_parser.add_subparsers(dest="auth_command", required=True)
+    auth_status = auth_sub.add_parser(
+        "status", help="显示 access/refresh token 到期状态"
+    )
+    auth_status.add_argument(
+        "--check", action="store_true", help="实际验证身份，需要时刷新"
+    )
 
     # init 命令
     init_parser = subparsers.add_parser("init", help="初始化配置")
@@ -9678,12 +9818,16 @@ def main():
         "target", nargs="?", help="开发机：名称 / notebook_id / URL；不传则查本机"
     )
 
-    _db_init = devbox_sub.add_parser("init", help="持久化（可重复跑，重启后再跑会合并）")
+    _db_init = devbox_sub.add_parser(
+        "init", help="持久化（可重复跑，重启后再跑会合并）"
+    )
     _db_init.add_argument(
         "target", nargs="?", help="开发机：名称 / notebook_id / URL；不传则操作本机"
     )
     _db_init.add_argument("--dry-run", action="store_true", help="只打印要做什么")
-    _db_init.add_argument("--only", help="只处理这些项，逗号分隔（如 claude,zsh_history）")
+    _db_init.add_argument(
+        "--only", help="只处理这些项，逗号分隔（如 claude,zsh_history）"
+    )
     _db_init.add_argument("--target-dir", help="持久盘目录；不传则自动探测")
     _db_init.add_argument(
         "--include-ssh",
@@ -9791,6 +9935,9 @@ def main():
 
     argv = _rewrite_legacy_create_short_flags(sys.argv)
     args = parser.parse_args(argv[1:])
+    from .config import select_auth
+
+    select_auth(args.auth_mode, args.qz_config_dir)
 
     if not args.command:
         parser.print_help()
@@ -9798,6 +9945,7 @@ def main():
 
     # 命令分发
     commands = {
+        "auth": cmd_auth,
         "init": cmd_init,
         "list": cmd_list,
         "ls": cmd_list,

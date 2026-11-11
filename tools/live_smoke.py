@@ -263,8 +263,9 @@ def main() -> int:
     args = ap.parse_args()
     VERBOSE = args.verbose
 
-    cookie = (get_cookie() or {}).get("cookie")
-    if not cookie:
+    a = get_api()
+    cookie = (get_cookie() or {}).get("cookie", "")
+    if a.auth_mode == "legacy" and not cookie:
         print("✗ 无 cookie，先 `qzcli login`", file=sys.stderr)
         return 1
 
@@ -273,7 +274,6 @@ def main() -> int:
         resolved = find_workspace_by_name(ws)
         assert resolved, f"未找到工作空间 {ws}"
         ws = resolved
-    a = get_api()
     print(f"→ workspace={ws}\n")
 
     state: Dict[str, Any] = {}
@@ -597,7 +597,10 @@ def main() -> int:
 
     def run_cli(*args, timeout=900):
         proc = subprocess.run(
-            ["qzcli", *args], capture_output=True, text=True, timeout=timeout
+            # Use the same installed Python environment as the API checks.
+            # A global qzcli on PATH can otherwise test a different release.
+            [sys.executable, "-m", "qzcli.cli", *args],
+            capture_output=True, text=True, timeout=timeout,
         )
         return proc.returncode, proc.stdout + proc.stderr
 

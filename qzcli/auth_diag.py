@@ -31,6 +31,7 @@ class AuthDiagnostic:
     responses: list = field(default_factory=list)
     attempts: list = field(default_factory=list)
     secrets: set = field(default_factory=set, repr=False)
+    authentication: bool = True
 
     def remember(self, value):
         if isinstance(value, str) and value:
@@ -47,6 +48,10 @@ class AuthDiagnostic:
 
     def redact(self, text):
         text = str(text)
+        # Notebook access tokens also appear in URL path segments, including
+        # requests/WebSocket exception messages (not just query parameters).
+        for match in re.finditer(r"/jupyter/[^/\s]+/([^/?#\s'\"<>)]+)", text):
+            self.remember(match[1])
         # Learn dynamic values before formatting exception strings and URLs.
         for match in re.finditer(r"<input\b[^>]*>", text, re.I | re.S):
             attrs = _attributes(match[0])
@@ -84,6 +89,7 @@ class AuthDiagnostic:
             r"\1[REDACTED]",
             text,
         )
+        text = re.sub(r"://[^/@\s]+:[^/@\s]+@", "://[REDACTED]@", text)
         for secret in sorted(self.secrets, key=len, reverse=True):
             # Short values are masked at their field; replacing every letter of a
             # one-character test password would destroy the rest of the evidence.
@@ -152,7 +158,8 @@ def has_auth_diagnostic(exc):
     seen = set()
     while exc is not None and id(exc) not in seen:
         seen.add(id(exc))
-        if getattr(exc, "diagnostic", None) is not None:
+        diagnostic = getattr(exc, "diagnostic", None)
+        if diagnostic is not None and getattr(diagnostic, "authentication", True):
             return True
         exc = exc.__cause__ or exc.__context__
     return False

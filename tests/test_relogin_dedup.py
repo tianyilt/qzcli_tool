@@ -54,6 +54,7 @@ _SANDBOX = {
 
 
 class _CountingAPI(QzAPI):
+    auth_mode = "legacy"
     """真 QzAPI（锁 / 去重 / 冷却都在），只把 CAS 登录换成计数桩。"""
 
     def __init__(self):
@@ -103,6 +104,7 @@ def _reset():
     cli._refresh_notice_shown = False
 
 
+@patch.dict(os.environ, {"QZCLI_AUTH_MODE": "legacy"})
 class PaginationReloginTests(unittest.TestCase):
     """分页循环：整轮只能有一次 CAS 登录。"""
 

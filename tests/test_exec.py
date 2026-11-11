@@ -3,6 +3,7 @@
 import argparse
 import io
 import unittest
+import os
 from contextlib import redirect_stdout
 from unittest.mock import MagicMock, patch
 
@@ -310,6 +311,7 @@ class CmdExecTimeoutTests(unittest.TestCase):
         mock_exec.assert_not_called()
 
 
+@patch.dict(os.environ, {"QZCLI_AUTH_MODE": "legacy"})
 class FindNotebookJupyterInfoTests(unittest.TestCase):
     """Integration: UUID/URL should skip name lookup entirely."""
 
@@ -326,7 +328,7 @@ class FindNotebookJupyterInfoTests(unittest.TestCase):
             result = _find_notebook_jupyter_info(UUID_REAL, display)
         self.assertEqual(result["notebook_id"], UUID_REAL)
         # 关键断言：UUID 路径下根本不该调 list_notebooks_with_cookie
-        get_api.assert_not_called()
+        get_api.return_value.list_notebooks_with_cookie.assert_not_called()
 
     def test_url_skips_list_notebooks(self):
         from qzcli.cli import _find_notebook_jupyter_info
@@ -341,7 +343,7 @@ class FindNotebookJupyterInfoTests(unittest.TestCase):
             display = MagicMock()
             result = _find_notebook_jupyter_info(url, display)
         self.assertEqual(result["notebook_id"], UUID_REAL)
-        get_api.assert_not_called()
+        get_api.return_value.list_notebooks_with_cookie.assert_not_called()
 
     def test_name_uses_list_notebooks(self):
         from qzcli.cli import _find_notebook_jupyter_info
@@ -580,7 +582,7 @@ class SessionPathTests(unittest.TestCase):
 class ExecShellCommandTests(unittest.TestCase):
     """下发到远端终端的那条 shell 命令的形状。"""
 
-    def _sent(self, session="sess1"):
+    def _sent(self, session="sess1", command="echo hi"):
         from qzcli import cli
 
         sent = []
@@ -642,7 +644,7 @@ class ExecShellCommandTests(unittest.TestCase):
         ):
             cli._exec_launch(
                 {"base_url": "https://nb.example/x", "token": "tk"},
-                "echo hi",
+                command,
                 MagicMock(),
             )
         return _real_cmd(sent)
@@ -669,6 +671,17 @@ class ExecShellCommandTests(unittest.TestCase):
         payload = self._sent()
         self.assertIn("setsid", payload)
         self.assertIn("nohup", payload)
+
+    def test_heredoc_command_is_valid_bash(self):
+        import re
+        import shlex
+        import subprocess
+
+        payload = self._sent(command="cat <<'FAKE_END'\nhello\nFAKE_END")
+        quoted = re.search(r"setsid bash -c (.*?) \|\| nohup", payload, re.S)[1]
+        inner = shlex.split(quoted)[0]
+        result = subprocess.run(["bash", "-n"], input=inner, capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
 
 
 if __name__ == "__main__":

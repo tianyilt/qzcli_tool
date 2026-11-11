@@ -59,7 +59,9 @@ def swallowed(where: str, exc: BaseException) -> None:
         where: 现场标识，形如 ``"exec/轮询"``。前缀用于 :func:`last_reason` 回捞。
         exc: 捕获到的异常。
     """
-    reason = f"{type(exc).__name__}: {exc}"[:300]
+    from .auth_diag import AuthDiagnostic
+
+    reason = AuthDiagnostic().redact(f"{type(exc).__name__}: {exc}")[:300]
     _RING.append((where, reason))
     if debug_enabled():
         print(f"[qzcli:debug] {where} 忽略了 {reason}", file=sys.stderr)
