@@ -7,7 +7,7 @@ from setuptools import find_packages, setup
 
 setup(
     name="qzcli",
-    version="0.5.0.dev0",
+    version="0.5.0",
     description="启智平台任务管理 CLI 工具",
     author="openveo3",
     packages=find_packages(),
@@ -21,6 +21,7 @@ setup(
         "cryptography>=41.0",
         "PyYAML>=6.0",
         "python-socks>=2.0",
+        "websocket-client>=1.6",
     ],
     extras_require={
         # 可视化看板（qzcli dashboard）依赖，不进核心 install_requires
