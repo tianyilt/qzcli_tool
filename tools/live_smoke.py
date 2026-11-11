@@ -597,7 +597,10 @@ def main() -> int:
 
     def run_cli(*args, timeout=900):
         proc = subprocess.run(
-            ["qzcli", *args], capture_output=True, text=True, timeout=timeout
+            # Use the same installed Python environment as the API checks.
+            # A global qzcli on PATH can otherwise test a different release.
+            [sys.executable, "-m", "qzcli.cli", *args],
+            capture_output=True, text=True, timeout=timeout,
         )
         return proc.returncode, proc.stdout + proc.stderr
 
