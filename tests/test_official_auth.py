@@ -6,7 +6,6 @@ import json
 import os
 import subprocess
 import tempfile
-import threading
 import unittest
 from datetime import datetime, timezone
 from pathlib import Path
@@ -98,8 +97,9 @@ class OfficialAuthTests(unittest.TestCase):
 
     def test_expired_pair_rotates_using_official_probe_and_rereads(self):
         write_store(self.root, fake_token(NOW - 1), fake_token(NOW + 7200))
-        access, refresh = fake_token(NOW + 3600, "new-access"), fake_token(
-            NOW + 7200, "new-refresh"
+        access, refresh = (
+            fake_token(NOW + 3600, "new-access"),
+            fake_token(NOW + 7200, "new-refresh"),
         )
         self.runner.side_effect = lambda *a, **kw: (
             write_store(self.root, access, refresh)
@@ -263,11 +263,14 @@ class OfficialApiTests(unittest.TestCase):
         )
 
     def test_bearer_header_and_result_contract_without_cookie_or_cas(self):
-        with patch.object(
-            api,
-            "_curl_post",
-            return_value=self.response(200, {"Result": {"id": "fake-user"}}),
-        ) as request, patch.object(self.client, "login_with_cas") as cas:
+        with (
+            patch.object(
+                api,
+                "_curl_post",
+                return_value=self.response(200, {"Result": {"id": "fake-user"}}),
+            ) as request,
+            patch.object(self.client, "login_with_cas") as cas,
+        ):
             self.assertEqual(self.client.get_user_detail(), {"id": "fake-user"})
         headers = request.call_args.kwargs["headers"]
         self.assertEqual(headers["authorization"], "Bearer fake-access")
@@ -351,11 +354,14 @@ class OfficialApiTests(unittest.TestCase):
         self.provider.token.assert_called_once_with()
 
     def test_new_mode_never_falls_back_to_password_or_v1(self):
-        with patch.object(
-            self.client,
-            "_request_v2",
-            side_effect=api.QzAPIError("no such action", 404),
-        ), patch.object(self.client, "_get_job_detail_v1") as legacy:
+        with (
+            patch.object(
+                self.client,
+                "_request_v2",
+                side_effect=api.QzAPIError("no such action", 404),
+            ),
+            patch.object(self.client, "_get_job_detail_v1") as legacy,
+        ):
             with self.assertRaises(api.QzAPIError):
                 self.client.get_job_detail("job-fake")
         legacy.assert_not_called()
@@ -384,12 +390,18 @@ class OfficialApiTests(unittest.TestCase):
                 "Error": {"Code": "AccessForbidden", "Message": "admin only"}
             }
         }
-        with patch.object(
-            api, "_curl_post", return_value=self.response(200, forbidden)
-        ), patch.object(
-            self.client, "_specs_from_job_history", return_value=[{"id": "fake-spec"}]
-        ) as history, patch.object(
-            self.client, "_get_token", side_effect=AssertionError("legacy token path")
+        with (
+            patch.object(api, "_curl_post", return_value=self.response(200, forbidden)),
+            patch.object(
+                self.client,
+                "_specs_from_job_history",
+                return_value=[{"id": "fake-spec"}],
+            ) as history,
+            patch.object(
+                self.client,
+                "_get_token",
+                side_effect=AssertionError("legacy token path"),
+            ),
         ):
             self.assertEqual(
                 self.client.list_specs("lcg-fake", "ws-fake"), [{"id": "fake-spec"}]
@@ -415,6 +427,30 @@ class OfficialApiTests(unittest.TestCase):
             request.call_args.args[:2], ("train", "GetTrainScheduleConfig")
         )
 
+    def test_hpc_console_preserves_priority_and_sbatch_limits(self):
+        with patch.object(
+            self.client, "_request_v2", return_value={"job_id": "hpc-job-fake"}
+        ) as request:
+            result = self.client.create_hpc_job(
+                "",
+                "fake-name",
+                "ws-fake",
+                "project-fake",
+                "lcg-fake",
+                "echo fake",
+                "fake-image",
+                "fake-quota",
+                4,
+                16,
+                max_running_time_minutes=5,
+            )
+        self.assertEqual(result["job_id"], "hpc-job-fake")
+        self.assertEqual(request.call_args.args[:2], ("hpc", "CreateJobConsole"))
+        body = request.call_args.args[2]
+        self.assertEqual(body["priority"], 1)
+        self.assertEqual(body["slurm_cluster_spec"]["predef_quota_id"], "fake-quota")
+        self.assertEqual(body["sbatch_script"]["max_running_time_minutes"], 5)
+
 
 class OfficialInitializationTests(unittest.TestCase):
     def test_dashboard_propagates_selected_provider_to_child(self):
@@ -424,12 +460,14 @@ class OfficialInitializationTests(unittest.TestCase):
         old = config._auth_mode_override, config._qz_dir_override
         try:
             config.select_auth("legacy", "/tmp/fake-official-config")
-            with patch.dict(
-                "sys.modules",
-                {name: Mock() for name in ("streamlit", "plotly", "pandas")},
-            ), patch.object(cli, "get_display"), patch(
-                "subprocess.run", return_value=Mock(returncode=0)
-            ) as run:
+            with (
+                patch.dict(
+                    "sys.modules",
+                    {name: Mock() for name in ("streamlit", "plotly", "pandas")},
+                ),
+                patch.object(cli, "get_display"),
+                patch("subprocess.run", return_value=Mock(returncode=0)) as run,
+            ):
                 cli.cmd_dashboard(
                     argparse.Namespace(workspace="ws-fake", port=8765, no_browser=True)
                 )
@@ -446,9 +484,11 @@ class OfficialInitializationTests(unittest.TestCase):
         import argparse
         from qzcli import cli
 
-        with tempfile.TemporaryDirectory() as d, patch.object(
-            config, "CONFIG_DIR", Path(d)
-        ), patch.object(config, "CONFIG_FILE", Path(d) / "config.json"):
+        with (
+            tempfile.TemporaryDirectory() as d,
+            patch.object(config, "CONFIG_DIR", Path(d)),
+            patch.object(config, "CONFIG_FILE", Path(d) / "config.json"),
+        ):
             config.save_config(
                 {
                     "custom": "keep",
@@ -462,8 +502,9 @@ class OfficialInitializationTests(unittest.TestCase):
             client.auth_status.return_value = {
                 "user": {"id": "fake-user", "name": "fake-name"}
             }
-            with patch.object(cli, "get_api", return_value=client), patch.object(
-                cli, "get_display"
+            with (
+                patch.object(cli, "get_api", return_value=client),
+                patch.object(cli, "get_display"),
             ):
                 for _ in range(2):
                     self.assertEqual(
@@ -483,9 +524,11 @@ class OfficialInitializationTests(unittest.TestCase):
 
         client = Mock(auth_mode="qz")
         client._official_auth.token.side_effect = OfficialAuthError("DNS ORIGINAL_END")
-        with patch.object(cli, "get_api", return_value=client), patch.object(
-            cli, "get_display"
-        ), patch.object(config, "save_config") as save:
+        with (
+            patch.object(cli, "get_api", return_value=client),
+            patch.object(cli, "get_display"),
+            patch.object(config, "save_config") as save,
+        ):
             with self.assertRaisesRegex(OfficialAuthError, "DNS ORIGINAL_END"):
                 cli.cmd_init(argparse.Namespace(username="", password=""))
         save.assert_not_called()
@@ -518,8 +561,13 @@ class OfficialInitializationTests(unittest.TestCase):
         from qzcli import mcp_server
 
         client = Mock(auth_mode="qz")
-        with patch.object(mcp_server, "get_api", return_value=client), patch.object(
-            mcp_server, "get_cookie", side_effect=AssertionError("legacy Cookie read")
+        with (
+            patch.object(mcp_server, "get_api", return_value=client),
+            patch.object(
+                mcp_server,
+                "get_cookie",
+                side_effect=AssertionError("legacy Cookie read"),
+            ),
         ):
             cookie, state = mcp_server._require_cookie()
         self.assertEqual(cookie, "")
@@ -527,7 +575,6 @@ class OfficialInitializationTests(unittest.TestCase):
         client.ensure_authenticated.assert_called_once_with(probe=False)
 
     def test_proxy_and_notebook_token_redaction(self):
-        from qzcli.auth_diag import AuthDiagnostic
         from qzcli import diag
 
         # Synthetic data derived from the test name, never a service credential.
@@ -547,6 +594,84 @@ class OfficialInitializationTests(unittest.TestCase):
         self.assertIn("TLS error", redacted)
         diag.swallowed("fake-test/redaction", RuntimeError(raw))
         self.assertNotIn("fake-sensitive-value", diag.last_reason("fake-test/"))
+
+
+class OfficialWorkerTests(unittest.TestCase):
+    def client(self):
+        client = Mock(auth_mode="qz", base_url="https://example.invalid")
+        client._official_token.side_effect = ["fake-access-old", "fake-access-new"]
+        return client
+
+    def test_websocket_401_has_one_coordinated_refresh(self):
+        import websocket
+        from qzcli.worker_exec import _connect
+
+        client = self.client()
+        denied = websocket.WebSocketBadStatusException(
+            "Unauthorized",
+            401,
+            resp_headers={"X-Trace-ID": "fake-trace"},
+            resp_body="ORIGINAL_401_END",
+        )
+        with (
+            patch.object(api, "get_api", return_value=client),
+            patch("qzcli.worker_exec.websocket_proxy_options", return_value={}),
+            patch.object(
+                websocket, "create_connection", side_effect=[denied, "fake-connection"]
+            ) as connect,
+        ):
+            self.assertEqual(_connect("job-fake", "worker-fake"), "fake-connection")
+        self.assertEqual(connect.call_count, 2)
+        self.assertIn(
+            "Authorization: Bearer fake-access-new", connect.call_args.kwargs["header"]
+        )
+        client._official_token.assert_called_with(
+            force_refresh=True, failing_token="fake-access-old"
+        )
+
+    def test_websocket_403_preserves_response_without_refresh(self):
+        import websocket
+        from qzcli.worker_exec import _connect, WorkerExecError
+
+        client = self.client()
+        denied = websocket.WebSocketBadStatusException(
+            "Forbidden",
+            403,
+            resp_headers={
+                "X-Trace-ID": "fake-trace",
+                "Set-Cookie": "inspire-session=fake-private-session-value",
+            },
+            resp_body="ORIGINAL_403_END",
+        )
+        with (
+            patch.object(api, "get_api", return_value=client),
+            patch("qzcli.worker_exec.websocket_proxy_options", return_value={}),
+            patch.object(websocket, "create_connection", side_effect=denied) as connect,
+        ):
+            with self.assertRaises(WorkerExecError) as ctx:
+                _connect("job-fake", "worker-fake")
+        self.assertEqual(connect.call_count, 1)
+        client._official_token.assert_called_once_with()
+        self.assertIn("ORIGINAL_403_END", str(ctx.exception))
+        self.assertIn("fake-trace", str(ctx.exception))
+        self.assertNotIn("fake-private-session-value", str(ctx.exception))
+
+    def test_websocket_network_error_is_not_replayed(self):
+        import websocket
+        from qzcli.worker_exec import _connect, WorkerExecError
+
+        client = self.client()
+        with (
+            patch.object(api, "get_api", return_value=client),
+            patch("qzcli.worker_exec.websocket_proxy_options", return_value={}),
+            patch.object(
+                websocket, "create_connection", side_effect=OSError("DNS ORIGINAL_END")
+            ) as connect,
+        ):
+            with self.assertRaisesRegex(WorkerExecError, "DNS ORIGINAL_END"):
+                _connect("job-fake", "worker-fake")
+        self.assertEqual(connect.call_count, 1)
+        client._official_token.assert_called_once_with()
 
 
 if __name__ == "__main__":

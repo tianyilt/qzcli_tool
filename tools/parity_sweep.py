@@ -405,8 +405,8 @@ def main() -> int:
     ap.add_argument("--sleep", type=float, default=0.3, help="每对之间间隔秒（防限流）")
     args = ap.parse_args()
 
-    cookie = (get_cookie() or {}).get("cookie")
-    if not cookie:
+    cookie = (get_cookie() or {}).get("cookie", "")
+    if get_api().auth_mode == "legacy" and not cookie:
         print("✗ 没有 cookie —— 先 `qzcli login`", file=sys.stderr)
         return 1
 

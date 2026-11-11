@@ -417,7 +417,7 @@ qzcli create --name test --command "echo hi" --workspace "我的工作空间" --
 
 ### 提交 HPC/CPU 任务
 
-> HPC 任务使用 Slurm 调度，通过 `/api/v1/hpc_jobs` 接口提交，使用当前选择的认证（先运行 `qzcli init`）。
+> HPC 任务使用 Slurm 调度，通过 `/api/v2/hpc?Action=CreateJobConsole` 接口提交，使用当前选择的认证（先运行 `qzcli init`）。
 
 ```bash
 qzcli hpc \

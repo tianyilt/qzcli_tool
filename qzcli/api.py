@@ -1928,7 +1928,7 @@ class QzAPI:
         priority: int = 1,
     ) -> Dict[str, Any]:
         """
-        提交 HPC/CPU 任务（使用 cookie 认证，POST /api/v1/hpc_jobs）
+        提交 HPC/CPU 任务（v2 hpc.CreateJobConsole，使用所选认证）
 
         ``priority`` 是**必填**：平台后来加了这个校验，不传直接被拒
         （``API 请求失败: priority must be set``），导致 `qzcli hpc` 整个不可用。
@@ -1958,7 +1958,6 @@ class QzAPI:
         Returns:
             API 响应 data 字段（含 job_id 等）
         """
-        url = f"{self.base_url}/api/v1/hpc_jobs"
         payload = {
             "job_name": job_name,
             "workspace_id": workspace_id,
@@ -1995,44 +1994,15 @@ class QzAPI:
                 },
             },
         }
-        if self.auth_mode == "qz":
-            return self._request_official(
-                url,
-                payload,
-                f"/jobs/hpc?spaceId={workspace_id}",
-                label="create_hpc_job",
-            )
-        headers = {
-            "accept": "application/json, text/plain, */*",
-            "content-type": "application/json",
-            "cookie": cookie,
-            "origin": self.base_url,
-            "referer": f"{self.base_url}/jobs/hpc?spaceId={workspace_id}",
-            "user-agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36",
-        }
-        response = _curl_post(url, json=payload, headers=headers, timeout=60)
-        if response.status_code == 401:
-            raise QzAPIError("Cookie 已过期或无效，请重新获取", 401)
-        if response.status_code == 429:
-            raise QzRateLimitError(
-                "触发平台限流（HTTP 429）",
-                429,
-                retry_after=_parse_retry_after(response.headers.get("Retry-After")),
-            )
-        if response.status_code != 200:
-            raise QzAPIError(
-                f"请求失败: HTTP {response.status_code}", response.status_code
-            )
-        try:
-            result = response.json()
-        except Exception:
-            raise QzAPIError("响应不是有效的 JSON")
-        if result.get("code") != 0:
-            raise QzAPIError(
-                f"API 请求失败: {result.get('message', '未知错误')}",
-                result.get("code"),
-            )
-        return result.get("data", {})
+        # The former REST endpoint returns 404. Console preserves the exact
+        # existing payload, including priority and sbatch maximum running time.
+        return self._request_v2(
+            "hpc",
+            "CreateJobConsole",
+            payload,
+            cookie=cookie,
+            referer_path=f"/jobs/hpc?spaceId={workspace_id}",
+        )
 
     def list_hpc_jobs(
         self,

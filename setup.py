@@ -20,6 +20,7 @@ setup(
         "PySocks>=1.7",
         "cryptography>=41.0",
         "PyYAML>=6.0",
+        "python-socks>=2.0",
     ],
     extras_require={
         # 可视化看板（qzcli dashboard）依赖，不进核心 install_requires
