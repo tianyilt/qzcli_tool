@@ -7101,6 +7101,10 @@ def cmd_dashboard(args):
         cmd += ["--server.headless", "true"]
 
     env = dict(os.environ, QZCLI_DASHBOARD_WS=ws_id)
+    from .config import get_auth_mode, get_qz_config_dir
+
+    env["QZCLI_AUTH_MODE"] = get_auth_mode()
+    env["QZ_CLI_CONFIG_DIR"] = str(get_qz_config_dir())
     display.print(
         f"[dim]启动看板：workspace={ws_input} 端口={args.port}（Ctrl+C 退出）[/dim]"
     )

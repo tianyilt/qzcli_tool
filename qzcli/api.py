@@ -83,6 +83,17 @@ class QzAPIError(Exception):
         self.api_code = api_code
         self.diagnostic = diagnostic
 
+    def __str__(self):
+        message = super().__str__()
+        if self.diagnostic is not None and not getattr(
+            self.diagnostic, "authentication", True
+        ):
+            # Existing CLI/MCP handlers print str(error). Preserve response headers,
+            # trace IDs and the complete body there without calling a permission
+            # denial an authentication failure (which would block spec fallback).
+            return f"{message}\n\n{self.diagnostic.render()}"
+        return message
+
 
 class QzRateLimitError(QzAPIError):
     """触发平台限流（HTTP 429）。
@@ -1215,10 +1226,20 @@ class QzAPI:
 
     def auth_status(self, check=False):
         if self.auth_mode == "legacy":
-            return {
+            status = {
                 "auth_mode": "legacy",
                 "cookie_present": bool((get_cookie() or {}).get("cookie")),
             }
+            if check:
+                # A status check must not submit a password behind the user's back.
+                probe = QzAPI(auth_mode="legacy")
+                probe._auto_relogin = False
+                user = probe.get_user_detail()
+                status.update(
+                    authenticated=True,
+                    user={"id": user.get("id"), "name": user.get("name")},
+                )
+            return status
         status = self._official_auth.status()
         if check:
             user = self.get_user_detail()
@@ -2580,7 +2601,11 @@ class QzAPI:
     ) -> List[Dict[str, Any]]:
         """获取计算组可用的规格列表。
 
-        这是整个迁移里最麻烦的一个：**v2 没有任何 action 返回 spec_id**。
+        官方模式优先使用用户可访问的 ``train GetTrainScheduleConfig``，读取
+        ``predef_train_spec``；管理员级的 workspace 配置被拒不代表规格不可查询。
+        以下旧迁移背景保留用于说明历史任务及 legacy 兜底的来源。
+
+        早期的 schema 中没有规格清单：
         把 144 个 action 的 schema 全 grep 过 —— ``spec_id`` 只作为**请求**字段
         存在（``train.CreateJob.framework_config[]`` / ``hpc.CreateJob`` /
         ``inference-serving.CreateServing``）。``workspace GetWorkspaceNodeSpecs``
@@ -2655,8 +2680,12 @@ class QzAPI:
         """
         try:
             cfg = self._request_v2(
-                "workspace",
-                "GetScheduleConfig",
+                "train" if self.auth_mode == "qz" else "workspace",
+                (
+                    "GetTrainScheduleConfig"
+                    if self.auth_mode == "qz"
+                    else "GetScheduleConfig"
+                ),
                 {"workspace_id": workspace_id},
                 referer_path=f"/jobs/spacesOverview?spaceId={workspace_id}",
             )
@@ -2665,7 +2694,11 @@ class QzAPI:
                 raise
             return []
 
-        raw = ((cfg or {}).get("schedule_config") or {}).get("predef_train_spec")
+        raw = (
+            (cfg or {}).get("predef_train_spec")
+            if self.auth_mode == "qz"
+            else ((cfg or {}).get("schedule_config") or {}).get("predef_train_spec")
+        )
         if not raw:
             return []
         try:

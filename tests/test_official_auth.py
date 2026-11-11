@@ -329,6 +329,18 @@ class OfficialApiTests(unittest.TestCase):
             self.provider.token.assert_called_once_with()
             self.assertIn("ORIGINAL_", format_exception(ctx.exception))
 
+    def test_printed_permission_error_includes_headers_trace_and_full_body(self):
+        response = api._CurlResponse(
+            403, "FULL_BODY_END", headers={"X-Trace-ID": "fake-request-id"}
+        )
+        with patch.object(api, "_curl_post", return_value=response):
+            with self.assertRaises(api.QzAPIError) as ctx:
+                self.client.get_user_detail()
+        text = str(ctx.exception)
+        self.assertIn("X-Trace-ID: fake-request-id", text)
+        self.assertIn("FULL_BODY_END", text)
+        self.assertFalse(has_auth_diagnostic(ctx.exception))
+
     def test_transport_error_does_not_refresh_or_replay_create(self):
         with patch.object(
             api, "_curl_post", side_effect=OSError("TLS EOF ORIGINAL_END")
@@ -385,8 +397,51 @@ class OfficialApiTests(unittest.TestCase):
         history.assert_called_once_with("lcg-fake", "ws-fake")
         self.provider.token.assert_called_once_with()
 
+    def test_predefined_specs_use_user_training_metadata(self):
+        spec = {
+            "id": "fake-spec",
+            "gpu_type": "FAKE_GPU",
+            "logic_compute_group_ids": ["lcg-fake"],
+            "gpu_count": 1,
+        }
+        with patch.object(
+            self.client,
+            "_request_v2",
+            return_value={"predef_train_spec": json.dumps([spec])},
+        ) as request:
+            result = self.client.list_specs("lcg-fake", "ws-fake")
+        self.assertEqual(result[0]["id"], "fake-spec")
+        self.assertEqual(
+            request.call_args.args[:2], ("train", "GetTrainScheduleConfig")
+        )
+
 
 class OfficialInitializationTests(unittest.TestCase):
+    def test_dashboard_propagates_selected_provider_to_child(self):
+        import argparse
+        from qzcli import cli
+
+        old = config._auth_mode_override, config._qz_dir_override
+        try:
+            config.select_auth("legacy", "/tmp/fake-official-config")
+            with patch.dict(
+                "sys.modules",
+                {name: Mock() for name in ("streamlit", "plotly", "pandas")},
+            ), patch.object(cli, "get_display"), patch(
+                "subprocess.run", return_value=Mock(returncode=0)
+            ) as run:
+                cli.cmd_dashboard(
+                    argparse.Namespace(workspace="ws-fake", port=8765, no_browser=True)
+                )
+            env = run.call_args.kwargs["env"]
+            self.assertEqual(env["QZCLI_AUTH_MODE"], "legacy")
+            self.assertEqual(
+                Path(env["QZ_CLI_CONFIG_DIR"]),
+                Path("/tmp/fake-official-config").resolve(),
+            )
+        finally:
+            config.select_auth(*old)
+
     def test_init_is_idempotent_and_preserves_existing_state(self):
         import argparse
         from qzcli import cli
