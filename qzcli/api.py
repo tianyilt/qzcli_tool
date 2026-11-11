@@ -487,7 +487,17 @@ def is_credential_failure(message: str) -> bool:
 
 def _describe_cas_login_failure(html: str) -> str:
     detail = CasPage(html).error
-    return f"CAS 返回：{detail}" if detail else "CAS 返回登录页，但未提供错误说明。"
+    if not detail:
+        return "CAS 返回登录页，但未提供错误说明。"
+    message = f"CAS 返回：{detail}"
+    if "验证码" in detail:
+        # Platform maintainer policy confirmed by the user on 2026-11-11.
+        message += (
+            "\n提示（平台已确认）：CAS 按 IP 和 User-Agent 记录，连续登录失败 3 次"
+            "触发图形验证码；验证成功或缓存 30 分钟过期后解除。"
+            "\n当前密码登录方式尚不支持图形验证码输入。"
+        )
+    return message
 
 
 _RELOGIN_LOCK_TIMEOUT_S = 60
@@ -496,8 +506,8 @@ _RELOGIN_LOCK_TIMEOUT_S = 60
 #:
 #: 光有互斥锁挡不住失败路径：登录失败时没有新 cookie 落盘，于是每个等在锁上的
 #: 线程/进程重读后都发现"还是旧的"，就各自再打一次 CAS。一条并发命令能打出十几次
-#: **失败**尝试 —— 而 CAS 正是按失败次数判定异常并延长验证码锁定的。
-#: 结果是自动重登把自己锁死，用户只能去浏览器手工取 cookie。
+#: **失败**尝试，可能达到 CAS 按 IP 和 User-Agent 记录的连续失败 3 次阈值。
+#: 这里的 60 秒是本地重试去重时间；平台验证码缓存为 30 分钟。
 _RELOGIN_COOLDOWN_S = 60
 _RELOGIN_COOLDOWN_FILE = ".relogin.cooldown"
 

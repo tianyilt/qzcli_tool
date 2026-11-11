@@ -231,6 +231,14 @@ class LoginEvidenceTests(unittest.TestCase):
                     self.assertIn("Traceback (most recent call last)", err)
                     self.assertNotIn("等几分钟", out + err)
                     self.assertNotIn("暂时要求验证码", out + err)
+                    if scenario in {"captcha", "initial_captcha"}:
+                        self.assertIn("提示（平台已确认）", err)
+                        self.assertIn("IP 和 User-Agent", err)
+                        self.assertIn("连续登录失败 3 次", err)
+                        self.assertIn("验证成功或缓存 30 分钟过期后解除", err)
+                        self.assertIn("尚不支持图形验证码输入", err)
+                    else:
+                        self.assertNotIn("提示（平台已确认）", err)
                     self.assertNotIn("RAW_RESPONSE_END", out)
                     self.assertNotIn(_BAD, out + err)
                     self.assertIn(

@@ -46,21 +46,27 @@ class CasLoginFailureMessageTests(unittest.TestCase):
         self.assertNotIn("自行恢复", message)
 
     def test_real_captcha_error_is_reported(self):
-        """Pass through the captcha error without asserting its trigger policy."""
+        """Keep the server's captcha error intact."""
         message = _describe_cas_login_failure(_page("验证码信息无效。"))
         self.assertIn("验证码", message)
         self.assertIn("验证码信息无效", message, "原文要带上")
 
-    def test_captcha_error_does_not_invent_a_cause_or_recovery_time(self):
+    def test_captcha_error_includes_separately_labeled_confirmed_policy(self):
         message = _describe_cas_login_failure(_page("验证码信息无效。"))
-        self.assertIn("CAS 返回：验证码信息无效。", message)
+        server_error, _, guidance = message.partition("\n")
+        self.assertEqual("CAS 返回：验证码信息无效。", server_error)
+        self.assertIn("提示（平台已确认）", guidance)
+        self.assertIn("IP 和 User-Agent", guidance)
+        self.assertIn("连续登录失败 3 次", guidance)
+        self.assertIn("验证成功或缓存 30 分钟过期后解除", guidance)
+        self.assertIn("尚不支持图形验证码输入", guidance)
         self.assertNotIn("等几分钟", message)
         self.assertNotIn("无需重新登录", message)
         self.assertNotIn("暂时", message)
 
     def test_password_error_is_reported(self):
         message = _describe_cas_login_failure(_page("用户名或密码错误"))
-        self.assertIn("用户名或密码错误", message)
+        self.assertEqual("CAS 返回：用户名或密码错误", message)
 
     def test_account_locked_error_is_passed_through(self):
         """没预料到的错误也要原样透出，而不是套一句泛化文案。
