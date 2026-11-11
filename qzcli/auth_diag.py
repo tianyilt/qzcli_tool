@@ -31,6 +31,7 @@ class AuthDiagnostic:
     responses: list = field(default_factory=list)
     attempts: list = field(default_factory=list)
     secrets: set = field(default_factory=set, repr=False)
+    authentication: bool = True
 
     def remember(self, value):
         if isinstance(value, str) and value:
@@ -157,7 +158,8 @@ def has_auth_diagnostic(exc):
     seen = set()
     while exc is not None and id(exc) not in seen:
         seen.add(id(exc))
-        if getattr(exc, "diagnostic", None) is not None:
+        diagnostic = getattr(exc, "diagnostic", None)
+        if diagnostic is not None and getattr(diagnostic, "authentication", True):
             return True
         exc = exc.__cause__ or exc.__context__
     return False

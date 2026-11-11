@@ -1169,7 +1169,10 @@ class QzAPI:
                 },
                 timeout=60,
             )
-            trace = AuthDiagnostic(stage=f"platform API {label}")
+            trace = AuthDiagnostic(
+                stage=f"platform API {label}",
+                authentication=response.status_code == 401,
+            )
             trace.remember(token)
             trace.record(response, "POST", url)
             if response.status_code == 401 and attempt == 0:

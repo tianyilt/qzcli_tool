@@ -15,7 +15,7 @@ from unittest.mock import Mock, patch
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 
 from qzcli import api, config
-from qzcli.auth_diag import format_exception
+from qzcli.auth_diag import AuthDiagnostic, format_exception, has_auth_diagnostic
 from qzcli.qz_auth import LoginRequired, OfficialAuth, OfficialAuthError, Token
 
 NOW = datetime(2026, 11, 11, 8, tzinfo=timezone.utc).timestamp()
@@ -365,6 +365,25 @@ class OfficialApiTests(unittest.TestCase):
         self.assertEqual(body["scope"], "TASK_LIST_SCOPE_ALL")
         self.assertEqual(body["created_by"], "user-fake")
         self.assertEqual(body["page_num"], 2)
+
+    def test_denied_admin_metadata_preserves_error_and_uses_history(self):
+        forbidden = {
+            "ResponseMetadata": {
+                "Error": {"Code": "AccessForbidden", "Message": "admin only"}
+            }
+        }
+        with patch.object(
+            api, "_curl_post", return_value=self.response(200, forbidden)
+        ), patch.object(
+            self.client, "_specs_from_job_history", return_value=[{"id": "fake-spec"}]
+        ) as history, patch.object(
+            self.client, "_get_token", side_effect=AssertionError("legacy token path")
+        ):
+            self.assertEqual(
+                self.client.list_specs("lcg-fake", "ws-fake"), [{"id": "fake-spec"}]
+            )
+        history.assert_called_once_with("lcg-fake", "ws-fake")
+        self.provider.token.assert_called_once_with()
 
 
 class OfficialInitializationTests(unittest.TestCase):
