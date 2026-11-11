@@ -50,6 +50,11 @@ class _CountingAPI(QzAPI):
         self._fail_with = fail_with
         self._delay = delay
 
+    def verify_cookie(self, cookie, username):
+        # Authentication validation is tested through the transport fixtures;
+        # this client models the shared fresh cookie for lock/dedup tests.
+        return bool(cookie) and cookie.startswith("inspire-session=fresh")
+
     def login_with_cas(self, username, password):
         with self._call_lock:
             self.cas_calls += 1
@@ -331,9 +336,7 @@ class AvailWithExpiredCookieTests(unittest.TestCase):
         api = _ExpiredAPI(fail_with=QzAPIError("CAS 要求验证码"))
         display = _SilentDisplay()
         with sandbox_home(**_STALE):
-            try:
+            with self.assertRaisesRegex(QzAPIError, "验证码") as caught:
                 self._run_avail(api, display)
-            except QzAPIError:
-                pass
-        joined = "\n".join(display.lines)
-        self.assertIn("验证码", joined, "用户看不到验证码提示就不知道下一步做什么")
+        from qzcli.auth_diag import format_exception
+        self.assertIn("验证码", format_exception(caught.exception))

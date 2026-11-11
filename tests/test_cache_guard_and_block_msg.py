@@ -82,7 +82,10 @@ class CredentialBlockMessageTests(unittest.TestCase):
     def test_includes_when_it_was_recorded(self):
         """带上记录时间，用户才能判断「这是刚才的还是上周的」。"""
         self.cd.write_text("1787000000.0\n账号被锁定", encoding="utf-8")
-        self.assertIn("记于", api_mod.describe_credential_block())
+        text = api_mod._format_cached_failure("账号被锁定")
+        self.assertIn("2026-", text)
+        self.assertIn("历史响应", text)
+        self.assertIn("本次未向认证服务提交密码", text)
 
     def test_no_record_file_still_produces_usable_message(self):
         """记录文件读不到时也不能崩，恢复指引照样要给全。"""

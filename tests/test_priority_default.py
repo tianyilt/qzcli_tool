@@ -90,21 +90,22 @@ class PriorityDefaultTests(unittest.TestCase):
         只写「默认 10」而不说 10 是最高优，用户不看代码根本判断不了 ——
         我自己就照着这句话把方向理解反了。
         """
-        parser = cli.build_parser() if hasattr(cli, "build_parser") else None
-        if parser is None:
-            self.skipTest("拿不到 parser")
         import io
+        import os
+        import sys
+        import tempfile
         from contextlib import redirect_stdout
+        from unittest import mock
 
         buf = io.StringIO()
-        try:
-            with redirect_stdout(buf):
-                parser.parse_args(["create", "--help"])
-        except SystemExit:
-            pass
+        with tempfile.TemporaryDirectory() as directory, mock.patch.dict(
+            os.environ, {"QZCLI_OPS_LOG": directory + "/ops.log"}
+        ), mock.patch.object(sys, "argv", ["qzcli", "create", "--help"]):
+            with redirect_stdout(buf), self.assertRaises(SystemExit) as stopped:
+                cli.main()
+            self.assertEqual(0, stopped.exception.code)
         text = buf.getvalue()
-        if "--priority" not in text:
-            self.skipTest("help 输出里没有 --priority")
+        self.assertIn("--priority", text)
         self.assertTrue(
             any(k in text for k in ("越小", "越低", "LOW")),
             "--priority 的 help 没说清数字方向",

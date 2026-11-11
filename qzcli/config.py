@@ -107,20 +107,22 @@ def ensure_config_dir() -> Path:
     return CONFIG_DIR
 
 
+class ConfigError(ValueError):
+    """An existing configuration could not be read; defaults would hide the error."""
+
+
 def load_config() -> Dict[str, Any]:
-    """加载配置文件"""
     ensure_config_dir()
-
-    if CONFIG_FILE.exists():
-        try:
-            with open(CONFIG_FILE, "r", encoding="utf-8") as f:
-                config = json.load(f)
-                # 合并默认配置
-                return {**DEFAULT_CONFIG, **config}
-        except (json.JSONDecodeError, IOError):
-            pass
-
-    return DEFAULT_CONFIG.copy()
+    try:
+        with open(CONFIG_FILE, "r", encoding="utf-8") as f:
+            config = json.load(f)
+    except FileNotFoundError:
+        return DEFAULT_CONFIG.copy()
+    except (ValueError, OSError) as exc:
+        raise ConfigError(f"读取配置失败：{CONFIG_FILE}") from exc
+    if not isinstance(config, dict):
+        raise ConfigError(f"配置必须为 JSON 对象：{CONFIG_FILE}")
+    return {**DEFAULT_CONFIG, **config}
 
 
 def save_config(config: Dict[str, Any]) -> None:
@@ -166,8 +168,8 @@ def load_env_file() -> Dict[str, str]:
                 if len(value) >= 2 and value[0] == value[-1] and value[0] in {"'", '"'}:
                     value = value[1:-1]
                 values[key] = value
-    except IOError:
-        return {}
+    except OSError as exc:
+        raise ConfigError(f"读取凭据文件失败：{env_file}") from exc
 
     return values
 

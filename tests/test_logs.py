@@ -139,6 +139,7 @@ class RequestV2HeadersTests(unittest.TestCase):
         with patch("qzcli.api.get_api_base_url", return_value="https://qz.test"), \
              patch("qzcli.api.get_credentials", return_value=("u", "p")):
             self.api = QzAPI("u", "p")
+        self.api._auto_relogin = False
 
     def test_post_body_and_headers(self):
         fake_resp = MagicMock()

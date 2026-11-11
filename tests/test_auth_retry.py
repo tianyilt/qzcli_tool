@@ -118,7 +118,7 @@ class ReloginTests(unittest.TestCase):
             self.assertIsNone(api._relogin())
         mock_login.assert_not_called()
 
-    def test_relogin_returns_none_on_login_failure(self):
+    def test_relogin_preserves_login_failure(self):
         api = QzAPI(username="u", password="p")
         with patch.object(
             api, "login_with_cas", side_effect=QzAPIError("nope")
@@ -127,7 +127,8 @@ class ReloginTests(unittest.TestCase):
         ), patch.object(
             qz_api, "save_cookie"
         ):
-            self.assertIsNone(api._relogin())
+            with self.assertRaisesRegex(QzAPIError, "nope"):
+                api._relogin()
 
 
 class LoginRetryTests(unittest.TestCase):
@@ -308,11 +309,12 @@ class CrossProcessReloginLockTests(unittest.TestCase):
 
         with patch.object(_api, "_relogin_file_lock", lock), patch.object(
             _api, "get_cookie", side_effect=lambda: next(reads)
-        ), patch.object(_api, "save_cookie"):
+        ), patch.object(_api, "save_cookie"), patch.object(_api.QzAPI, "verify_cookie", return_value=True) as verified:
             got = self._client(fake_login)._relogin()
 
         self.assertEqual(got, "inspire-session=FROM-OTHER-PROC")
         self.assertEqual(calls, [], "别的进程已经登好了，不该再撞一次 CAS")
+        verified.assert_called_once_with("inspire-session=FROM-OTHER-PROC", "u")
 
     def test_lock_helper_yields_and_releases(self):
         from qzcli.api import _relogin_file_lock
