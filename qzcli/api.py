@@ -750,6 +750,9 @@ class QzAPI:
             self._token = None
             self._auto_relogin = False
             self._relogin_lock = threading.Lock()
+            self._opaque_lock = threading.RLock()
+            self._opaque_check_active = False
+            self._validated_opaque_token = None
             return
         self.base_url = get_api_base_url()
 
@@ -1132,11 +1135,30 @@ class QzAPI:
             )
         return result if raw else _unwrap_v2_result(result)
 
-    def _official_token(self, **kwargs):
-        from .qz_auth import OfficialAuthError
+    def _official_token(self, *, _identity_request=False, **kwargs):
+        from .qz_auth import OfficialAuthError, Token
 
         try:
-            return self._official_auth.token(**kwargs)
+            token = self._official_auth.token(**kwargs)
+            if _identity_request or Token.parse(token).expires_at is not None:
+                return token
+            # Opaque/malformed-exp tokens are neither expired nor authenticated
+            # locally. Verify identity before a business call, including writes.
+            # RLock permits the identity request to obtain its own auth header.
+            with self._opaque_lock:
+                if self._opaque_check_active or token == self._validated_opaque_token:
+                    return token
+                self._opaque_check_active = True
+                try:
+                    user = self.get_user_detail()
+                    if not isinstance(user, dict) or not user.get("id"):
+                        raise QzAPIError("官方身份响应缺少用户 ID，未发送业务请求")
+                    # The identity request may itself have renewed the pair.
+                    token = self._official_auth.token()
+                    self._validated_opaque_token = token
+                    return token
+                finally:
+                    self._opaque_check_active = False
         except OfficialAuthError as exc:
             error = QzAPIError(str(exc), 401 if exc.action_required else None)
             error.action_required = exc.action_required
@@ -1163,7 +1185,10 @@ class QzAPI:
         params=None,
         label="platform API",
     ):
-        token = self._official_token()
+        identity_request = url == f"{self.base_url}/api/v2/user" and params == {
+            "Action": "GetUserDetail"
+        }
+        token = self._official_token(_identity_request=identity_request)
         for attempt in range(2):
             response = _curl_post(
                 url,
@@ -1189,7 +1214,9 @@ class QzAPI:
             if response.status_code == 401 and attempt == 0:
                 try:
                     token = self._official_token(
-                        force_refresh=True, failing_token=token
+                        force_refresh=True,
+                        failing_token=token,
+                        _identity_request=identity_request,
                     )
                 except QzAPIError as exc:
                     exc.diagnostic = trace

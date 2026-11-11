@@ -251,7 +251,8 @@ class OfficialApiTests(unittest.TestCase):
         self.client = api.QzAPI(auth_mode="qz", qz_config_dir=self.tmp.name)
         self.provider = Mock()
         self.provider.server = "https://qz.sii.edu.cn"
-        self.provider.token.return_value = "fake-access"
+        self.access = fake_token(NOW + 3600)
+        self.provider.token.return_value = self.access
         self.provider.redact.side_effect = lambda text: str(text).replace(
             "fake-access", "[REDACTED]"
         )
@@ -273,7 +274,7 @@ class OfficialApiTests(unittest.TestCase):
         ):
             self.assertEqual(self.client.get_user_detail(), {"id": "fake-user"})
         headers = request.call_args.kwargs["headers"]
-        self.assertEqual(headers["authorization"], "Bearer fake-access")
+        self.assertEqual(headers["authorization"], "Bearer " + self.access)
         self.assertTrue(
             headers["x-inspire-client-source"].startswith("inspire-cli/qzcli-")
         )
@@ -352,6 +353,75 @@ class OfficialApiTests(unittest.TestCase):
                 self.client.create_job({"name": "fake-test"})
         self.assertEqual(request.call_count, 1)
         self.provider.token.assert_called_once_with()
+
+    def test_unknown_exp_verifies_identity_before_create_and_reuses_verification(self):
+        self.provider.token.return_value = "fake-opaque-access"
+        with patch.object(
+            api,
+            "_curl_post",
+            side_effect=[
+                self.response(200, {"Result": {"id": "fake-user"}}),
+                self.response(200, {"Result": {"job_id": "job-fake-one"}}),
+                self.response(200, {"Result": {"job_id": "job-fake-two"}}),
+            ],
+        ) as request:
+            self.client.create_job({"name": "fake-first"})
+            self.client.create_job({"name": "fake-second"})
+        self.assertEqual(request.call_count, 3)
+        self.assertEqual(
+            request.call_args_list[0].kwargs["params"], {"Action": "GetUserDetail"}
+        )
+        self.assertEqual(
+            request.call_args_list[1].kwargs["params"], {"Action": "CreateJobConsole"}
+        )
+        self.assertEqual(
+            request.call_args_list[2].kwargs["params"], {"Action": "CreateJobConsole"}
+        )
+
+    def test_unknown_exp_identity_denial_blocks_business_write(self):
+        self.provider.token.return_value = "fake-opaque-access"
+        with patch.object(
+            api,
+            "_curl_post",
+            return_value=self.response(403, "ORIGINAL_IDENTITY_DENIED"),
+        ) as request:
+            with self.assertRaisesRegex(api.QzAPIError, "ORIGINAL_IDENTITY_DENIED"):
+                self.client.create_job({"name": "fake-never-created"})
+        self.assertEqual(request.call_count, 1)
+        self.assertEqual(
+            request.call_args.kwargs["params"], {"Action": "GetUserDetail"}
+        )
+        self.provider.token.assert_called_with()
+
+    def test_unknown_exp_identity_renewal_uses_current_pair_for_business(self):
+        self.provider.token.side_effect = [
+            "fake-opaque-old",
+            "fake-opaque-old",
+            "fake-opaque-new",
+            "fake-opaque-new",
+        ]
+        with patch.object(
+            api,
+            "_curl_post",
+            side_effect=[
+                self.response(401, "ORIGINAL_IDENTITY_401"),
+                self.response(200, {"Result": {"id": "fake-user"}}),
+                self.response(200, {"Result": {"job_id": "job-fake"}}),
+            ],
+        ) as request:
+            self.client.create_job({"name": "fake-renewed"})
+        self.assertEqual(request.call_count, 3)
+        self.assertEqual(
+            request.call_args.kwargs["headers"]["authorization"],
+            "Bearer fake-opaque-new",
+        )
+        self.assertEqual(
+            sum(
+                bool(c.kwargs.get("force_refresh"))
+                for c in self.provider.token.call_args_list
+            ),
+            1,
+        )
 
     def test_new_mode_never_falls_back_to_password_or_v1(self):
         with (
