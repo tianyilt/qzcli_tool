@@ -47,6 +47,10 @@ class AuthDiagnostic:
 
     def redact(self, text):
         text = str(text)
+        # Notebook access tokens also appear in URL path segments, including
+        # requests/WebSocket exception messages (not just query parameters).
+        for match in re.finditer(r"/jupyter/[^/\s]+/([^/?#\s'\"<>)]+)", text):
+            self.remember(match[1])
         # Learn dynamic values before formatting exception strings and URLs.
         for match in re.finditer(r"<input\b[^>]*>", text, re.I | re.S):
             attrs = _attributes(match[0])
@@ -84,6 +88,7 @@ class AuthDiagnostic:
             r"\1[REDACTED]",
             text,
         )
+        text = re.sub(r"://[^/@\s]+:[^/@\s]+@", "://[REDACTED]@", text)
         for secret in sorted(self.secrets, key=len, reverse=True):
             # Short values are masked at their field; replacing every letter of a
             # one-character test password would destroy the rest of the evidence.

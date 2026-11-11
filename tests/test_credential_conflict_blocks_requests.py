@@ -103,6 +103,7 @@ class ReloginMustNotSendOnConflictTests(unittest.TestCase):
     def _api_in_conflict(self):
         """造一个「两处密码不一致」的环境，并把所有落盘/网络副作用掐掉。"""
         api = api_mod.QzAPI.__new__(api_mod.QzAPI)
+        api.auth_mode = "legacy"
         api._username = "fake-user"
         api._password = _PW_A
         import threading
@@ -222,6 +223,7 @@ class TokenPathMustNotSendOnConflictTests(unittest.TestCase):
 
     def test_get_token_raises_before_posting(self):
         api = api_mod.QzAPI.__new__(api_mod.QzAPI)
+        api.auth_mode = "legacy"
         api._username = "fake-user"
         api._password = _PW_A
         api._token = ""

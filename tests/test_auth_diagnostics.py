@@ -192,7 +192,7 @@ class LoginEvidenceTests(unittest.TestCase):
             ), mock.patch.object(api, "_api_instance", None), mock.patch.object(
                 api, "encrypt_password", wraps=api.encrypt_password
             ) as encrypt, mock.patch.object(
-                sys, "argv", ["qzcli", "login", *args]
+                sys, "argv", ["qzcli", "--auth-mode", "legacy", "login", *args]
             ), contextlib.redirect_stdout(
                 out
             ), contextlib.redirect_stderr(
@@ -353,7 +353,7 @@ class LoginEvidenceTests(unittest.TestCase):
             ), mock.patch.object(api, "_api_instance", None), mock.patch.object(
                 api, "_curl_post", return_value=response
             ), mock.patch.object(
-                sys, "argv", ["qzcli", "ws"]
+                sys, "argv", ["qzcli", "--auth-mode", "legacy", "ws"]
             ), contextlib.redirect_stdout(
                 out
             ), contextlib.redirect_stderr(
@@ -435,6 +435,7 @@ fake-plain-secret#"""
 
     def test_probe_programming_error_is_not_turned_into_false(self):
         client = api.QzAPI.__new__(api.QzAPI)
+        client.auth_mode = "legacy"
         client.base_url = "https://qz.sii.edu.cn"
         session = mock.Mock()
         session.cookies = []
@@ -467,7 +468,7 @@ fake-plain-secret#"""
         with sandbox_home(), mock.patch.object(
             api, "_recent_relogin_failure", return_value=None
         ):
-            client = api.QzAPI(username=_USER, password=_GOOD)
+            client = api.QzAPI(username=_USER, password=_GOOD, auth_mode="legacy")
             with mock.patch.object(
                 client, "get_user_detail", side_effect=ValueError("bad JSON")
             ):

@@ -73,7 +73,7 @@ class JobEventsAPITests(unittest.TestCase):
         with mock.patch.object(
             api, "get_api_base_url", return_value="https://qz.sii.edu.cn"
         ), mock.patch.object(api, "get_credentials", return_value=("u", "p")):
-            client = api.QzAPI()
+            client = api.QzAPI(auth_mode="legacy")
             client._auto_relogin = False
             return client
 

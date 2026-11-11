@@ -49,7 +49,7 @@ _JUPYTER_URL = f"{_PREFIX}/lab?token={_TOKEN}"
 
 class ApiAccessUrlTests(unittest.TestCase):
     def _api(self):
-        api = QzAPI(username="u", password="p")
+        api = QzAPI(username="u", password="p", auth_mode="legacy")
         return api
 
     def test_v2_is_used_when_available(self):

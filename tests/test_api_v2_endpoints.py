@@ -25,6 +25,7 @@ class _Resp:
 
 def _client():
     a = api.QzAPI.__new__(api.QzAPI)
+    a.auth_mode = "legacy"
     a.base_url = "https://qz.example"
     a._username = None
     a._password = None

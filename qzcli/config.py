@@ -7,6 +7,7 @@ import json
 import os
 import re
 import uuid
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -17,6 +18,8 @@ DEFAULT_CONFIG = {
     "password": "",
     "token_cache_enabled": True,
     "proxy": "",
+    "auth_mode": "qz",
+    "qz_config_dir": "",
 }
 
 
@@ -73,6 +76,36 @@ def get_proxy(url: str = "") -> str:
     return proxy
 
 
+def websocket_proxy_options(url):
+    """Use the same configured proxy/NO_PROXY policy for WebSocket connections."""
+    from urllib.parse import urlparse, unquote
+
+    parsed_url = urlparse(
+        url.replace("wss://", "https://", 1).replace("ws://", "http://", 1)
+    )
+    proxy = get_proxy(parsed_url.geturl())
+    if not proxy:
+        return {"http_no_proxy": ["*"]}
+    parsed = urlparse(proxy if "://" in proxy else f"http://{proxy}")
+    if not parsed.hostname:
+        raise ConfigError("WebSocket 代理缺少主机名")
+    kind = parsed.scheme.lower()
+    if kind not in ("http", "socks4", "socks4a", "socks5", "socks5h"):
+        raise ConfigError(f"WebSocket 不支持代理协议：{kind}")
+    options = {
+        "http_proxy_host": parsed.hostname,
+        "http_proxy_port": parsed.port or (80 if kind == "http" else 1080),
+        "proxy_type": kind,
+        "http_no_proxy": [],
+    }
+    if parsed.username is not None:
+        options["http_proxy_auth"] = (
+            unquote(parsed.username),
+            unquote(parsed.password or ""),
+        )
+    return options
+
+
 # 配置目录。``QZCLI_HOME`` 可以把**整个状态目录**搬走（config.json / .cookie /
 # jobs.json / resources.json / .relogin.cooldown / .relogin.lock 全部由它派生），
 # 用于给某个长跑项目一份互不干扰的独立副本——典型场景是 MoVA2 的冻结版 qzcli：
@@ -112,7 +145,6 @@ class ConfigError(ValueError):
 
 
 def load_config() -> Dict[str, Any]:
-    ensure_config_dir()
     try:
         with open(CONFIG_FILE, "r", encoding="utf-8") as f:
             config = json.load(f)
@@ -129,8 +161,139 @@ def save_config(config: Dict[str, Any]) -> None:
     """保存配置文件"""
     ensure_config_dir()
 
-    with open(CONFIG_FILE, "w", encoding="utf-8") as f:
-        json.dump(config, f, indent=2, ensure_ascii=False)
+    import tempfile
+
+    fd, temporary = tempfile.mkstemp(prefix=".config-", dir=str(CONFIG_DIR))
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump(config, f, indent=2, ensure_ascii=False)
+        os.replace(temporary, CONFIG_FILE)
+    finally:
+        if os.path.exists(temporary):
+            os.unlink(temporary)
+
+
+# Process-local CLI selections. They do not modify either tool's saved config.
+_auth_mode_override = None
+_qz_dir_override = None
+
+
+def select_auth(mode=None, qz_config_dir=None):
+    global _auth_mode_override, _qz_dir_override
+    _auth_mode_override = mode
+    _qz_dir_override = qz_config_dir
+
+
+def get_auth_mode(explicit=None):
+    mode = explicit or _auth_mode_override or os.environ.get("QZCLI_AUTH_MODE")
+    mode = mode or load_config().get("auth_mode", "qz")
+    if mode not in ("qz", "legacy"):
+        raise ConfigError("auth_mode 必须是 qz 或 legacy")
+    return mode
+
+
+def get_qz_config_dir(explicit=None):
+    value = (
+        explicit
+        or _qz_dir_override
+        or os.environ.get("QZ_CLI_CONFIG_DIR")
+        or load_config().get("qz_config_dir")
+        or Path.home() / ".config/inspire-cli"
+    )
+    return Path(value).expanduser().resolve()
+
+
+def load_qz_settings(directory=None):
+    import yaml
+
+    root = get_qz_config_dir(directory)
+    path = root / "config.yaml"
+    try:
+        data = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+    except FileNotFoundError:
+        data = {}
+    except (OSError, yaml.YAMLError) as exc:
+        raise ConfigError(f"读取官方配置失败：{path}") from exc
+    if not isinstance(data, dict):
+        raise ConfigError(f"官方配置必须为对象：{path}")
+    return {
+        "directory": root,
+        "server": os.environ.get("INSPIRE_SERVER")
+        or data.get("server")
+        or "https://qz.sii.edu.cn",
+        "auth_url": os.environ.get("INSPIRE_AUTH_URL")
+        or data.get("auth_url")
+        or "https://keycloak-inspire-prod.sii.edu.cn",
+    }
+
+
+def read_qz_credentials(directory):
+    """Read the official store; only the official qz program writes its secrets."""
+    from cryptography.exceptions import InvalidTag
+    from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+
+    root = get_qz_config_dir(directory)
+    key_file, credentials_file = root / ".encryption_key", root / "credentials.enc"
+    try:
+        blob = credentials_file.read_bytes()
+    except FileNotFoundError:
+        return {}
+    except OSError as exc:
+        raise ConfigError(f"读取官方凭据失败：{credentials_file}") from exc
+    try:
+        key = key_file.read_bytes()
+        if len(key) != 32 or len(blob) < 28:
+            raise ValueError("unsupported credential format")
+        data = json.loads(AESGCM(key).decrypt(blob[:12], blob[12:], None))
+    except (OSError, ValueError, UnicodeDecodeError, InvalidTag) as exc:
+        raise ConfigError(
+            f"无法解密官方凭据，请检查文件及配套密钥：{credentials_file}"
+        ) from exc
+    if not isinstance(data, dict):
+        raise ConfigError(f"官方凭据必须为对象：{credentials_file}")
+    return data
+
+
+@contextmanager
+def qz_refresh_lock(directory):
+    """One lock per official directory, including across QZCLI_HOME profiles."""
+    import fcntl
+
+    root = get_qz_config_dir(directory)
+    if not root.is_dir():
+        raise ConfigError(f"官方配置目录不存在：{root}；请运行 qzcli login")
+    path = root / ".qzcli-refresh.lock"
+    fd = os.open(str(path), os.O_CREAT | os.O_RDWR, 0o600)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        yield
+    finally:
+        fcntl.flock(fd, fcntl.LOCK_UN)
+        os.close(fd)
+
+
+def load_qz_refresh_failure(directory):
+    path = get_qz_config_dir(directory) / ".qzcli-refresh-error.json"
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return {}
+    except (OSError, ValueError) as exc:
+        raise ConfigError(f"读取刷新回执失败：{path}") from exc
+
+
+def save_qz_refresh_failure(directory, data):
+    import tempfile
+
+    root = get_qz_config_dir(directory)
+    fd, temporary = tempfile.mkstemp(prefix=".qzcli-refresh-", dir=str(root))
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as stream:
+            json.dump(data, stream, ensure_ascii=False)
+        os.replace(temporary, root / ".qzcli-refresh-error.json")
+    finally:
+        if os.path.exists(temporary):
+            os.unlink(temporary)
 
 
 def get_env_file_path() -> Path:
@@ -300,13 +463,13 @@ def describe_credential_conflict(action: str = "本次使用") -> str:
     for i, (label, f) in enumerate(seen):
         mark = f"← {action}" if i == 0 else ""
         lines.append(f"    {label}  指纹 {f} {mark}")
-    lines.append(
-        "  如果你刚改过密码却还在报密码错误，多半是优先级更高的那处没更新。"
-    )
+    lines.append("  如果你刚改过密码却还在报密码错误，多半是优先级更高的那处没更新。")
     lines.append(
         "  环境变量通常来自 ~/.zshrc / ~/.bashrc，**已经启动的进程不会自动更新** ——"
     )
-    lines.append("  那些进程要重启才会拿到新密码，或者在它们里先 unset QZCLI_PASSWORD。")
+    lines.append(
+        "  那些进程要重启才会拿到新密码，或者在它们里先 unset QZCLI_PASSWORD。"
+    )
     return "\n".join(lines)
 
 

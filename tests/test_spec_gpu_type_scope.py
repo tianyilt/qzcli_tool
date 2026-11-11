@@ -47,7 +47,7 @@ def _job(lcg_id, quota_id, gpu_type):
 
 class GpuTypeScopeTests(unittest.TestCase):
     def _fill(self, jobs, compute_group_id):
-        api = QzAPI(username="u", password="p")
+        api = QzAPI(username="u", password="p", auth_mode="legacy")
         specs = [{"id": _SPEC_ID, "gpu_type": ""}]
         with patch.object(api, "list_jobs_with_cookie", return_value={"jobs": jobs}):
             api._fill_missing_gpu_type(specs, "ws-1", compute_group_id)
@@ -101,7 +101,7 @@ class GpuTypeFromComputeGroupNodesTests(unittest.TestCase):
     """
 
     def _fill(self, jobs, nodes, compute_group_id=_TARGET_LCG):
-        api = QzAPI(username="u", password="p")
+        api = QzAPI(username="u", password="p", auth_mode="legacy")
         specs = [{"id": _SPEC_ID, "gpu_type": ""}]
         with patch.object(
             api, "list_jobs_with_cookie", return_value={"jobs": jobs}
@@ -142,7 +142,7 @@ class GpuTypeFromComputeGroupNodesTests(unittest.TestCase):
 
     def test_node_query_failure_is_not_fatal(self):
         """查节点失败不能让整个规格解析崩掉。"""
-        api = QzAPI(username="u", password="p")
+        api = QzAPI(username="u", password="p", auth_mode="legacy")
         specs = [{"id": _SPEC_ID, "gpu_type": ""}]
         from qzcli.api import QzAPIError
 

@@ -64,6 +64,7 @@ class CreateJobV2Tests(unittest.TestCase):
         ``_relogin`` 返回 None，原始 401 照常抛出。
         """
         a = api.QzAPI.__new__(api.QzAPI)
+        a.auth_mode = "legacy"
         a.base_url = "https://qz.sii.edu.cn"
         a._username = username
         a._password = password

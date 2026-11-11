@@ -82,24 +82,33 @@ def _connect(job_id: str, instance_name: str, timeout: int = 30):
             "缺少 websocket-client 依赖：pip install websocket-client"
         ) from exc
 
-    cookie = (get_cookie() or {}).get("cookie")
-    if not cookie:
-        raise WorkerExecError("没有登录态，请先运行 `qzcli login`")
+    from .api import get_api, QZ_CLIENT_SOURCE
 
-    base = "wss://qz.sii.edu.cn"
+    api = get_api()
+    server = api.base_url.rstrip("/")
+    headers = [f"Origin: {server}", f"User-Agent: {_UA}"]
+    if getattr(api, "auth_mode", None) == "qz":
+        headers.extend(
+            [
+                f"Authorization: Bearer {api._official_token()}",
+                f"X-Inspire-Client-Source: {QZ_CLIENT_SOURCE}",
+            ]
+        )
+    else:
+        cookie = (get_cookie() or {}).get("cookie")
+        if not cookie:
+            raise WorkerExecError("没有登录态，请先运行 `qzcli login`")
+        headers.append(f"Cookie: {cookie}")
+
+    base = server.replace("https://", "wss://", 1).replace("http://", "ws://", 1)
     url = f"{base}{_TRAIN_REMOTE_CMD}?" + urlencode(
         {"job_id": job_id, "instance_name": instance_name}
     )
-    headers = [
-        f"Cookie: {cookie}",
-        "Origin: https://qz.sii.edu.cn",
-        f"User-Agent: {_UA}",
-    ]
 
     # 代理：本机（macOS + clash）只能靠代理解析 qz.sii.edu.cn，直连会 DNS 失败。
     # get_proxy 会按 NO_PROXY 判断，不该走代理时返回空串。
     proxy_kwargs: Dict[str, object] = {}
-    proxy = (get_proxy("https://qz.sii.edu.cn") or "").strip()
+    proxy = (get_proxy(server) or "").strip()
     if proxy:
         parsed = urlparse(proxy if "://" in proxy else f"http://{proxy}")
         if parsed.hostname and parsed.port:
