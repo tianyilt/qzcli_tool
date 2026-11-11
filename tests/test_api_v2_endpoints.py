@@ -25,6 +25,7 @@ class _Resp:
 
 def _client():
     a = api.QzAPI.__new__(api.QzAPI)
+    a.auth_mode = "legacy"
     a.base_url = "https://qz.example"
     a._username = None
     a._password = None
@@ -38,6 +39,9 @@ class V2EndpointShapeTests(unittest.TestCase):
     """每个迁移过的端点：打到哪个 service/Action，body 长什么样。"""
 
     def setUp(self):
+        cookie_patch = mock.patch.object(api, "get_cookie", return_value={"cookie": "fake-test-cookie"})
+        cookie_patch.start()
+        self.addCleanup(cookie_patch.stop)
         api._V2_FALLBACK_WARNED.clear()
         self.seen = []
 
@@ -535,6 +539,9 @@ class RateLimitTests(unittest.TestCase):
     """
 
     def setUp(self):
+        cookie_patch = mock.patch.object(api, "get_cookie", return_value={"cookie": "fake-test-cookie"})
+        cookie_patch.start()
+        self.addCleanup(cookie_patch.stop)
         api._V2_FALLBACK_WARNED.clear()
 
     def _resp429(self, retry_after=None):

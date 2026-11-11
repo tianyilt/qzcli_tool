@@ -3,6 +3,7 @@
 """
 
 import contextlib
+import contextvars
 import functools
 import inspect
 import json as _json
@@ -16,7 +17,7 @@ from contextlib import contextmanager
 from functools import lru_cache
 from pathlib import Path
 from typing import Any, Dict, List, Optional
-from urllib.parse import urlencode
+from urllib.parse import urlencode, urljoin, urlparse
 
 import requests
 
@@ -28,8 +29,10 @@ from .config import (
     credential_conflict,
     describe_credential_conflict,
     get_api_base_url,
+    get_auth_mode,
     get_cookie,
     get_credentials,
+    get_credentials_with_source,
     get_proxy,
     get_token_cache,
     save_cookie,
@@ -37,10 +40,14 @@ from .config import (
 )
 from .crypto import encrypt_password
 from .diag import swallowed
+from .auth_diag import AuthDiagnostic, CasPage, has_auth_diagnostic
 
 # /api/v2/* requires this header — without it APISIX gateway redirects to
 # Keycloak login (returning HTML) even when the Bearer token is valid.
 V2_CLIENT_SOURCE = f"qzcli/{__version__}"
+# The Bearer gateway selects its CLI policy by the inspire-cli/ prefix.
+# Keep our caller/version visible rather than impersonating a qz build.
+QZ_CLIENT_SOURCE = f"inspire-cli/qzcli-{__version__}"
 
 # Match the browser-style headers that /api/v1/ cookie endpoints use. The
 # platform's /api/v2/ surface piggybacks on the same CAS session cookie that
@@ -66,10 +73,26 @@ class QzAPIError(Exception):
         message: str,
         code: Optional[int] = None,
         api_code: Optional[str] = None,
+        *,
+        diagnostic=None,
     ):
-        super().__init__(message)
+        super().__init__(
+            diagnostic.redact(message) if diagnostic is not None else message
+        )
         self.code = code
         self.api_code = api_code
+        self.diagnostic = diagnostic
+
+    def __str__(self):
+        message = super().__str__()
+        if self.diagnostic is not None and not getattr(
+            self.diagnostic, "authentication", True
+        ):
+            # Existing CLI/MCP handlers print str(error). Preserve response headers,
+            # trace IDs and the complete body there without calling a permission
+            # denial an authentication failure (which would block spec fallback).
+            return f"{message}\n\n{self.diagnostic.render()}"
+        return message
 
 
 class QzRateLimitError(QzAPIError):
@@ -80,8 +103,8 @@ class QzRateLimitError(QzAPIError):
     建议等待秒数（``Retry-After`` 头），没给就按指数退避。
     """
 
-    def __init__(self, message, code=429, retry_after=None):
-        super().__init__(message, code)
+    def __init__(self, message, code=429, retry_after=None, *, diagnostic=None):
+        super().__init__(message, code, diagnostic=diagnostic)
         self.retry_after = retry_after
 
 
@@ -198,6 +221,67 @@ def _backoff_delay(attempt: int, base: float = 0.5, cap: float = 2.0) -> float:
     return delay + random.uniform(0, delay * 0.25)
 
 
+_auth_trace = contextvars.ContextVar("qzcli_auth_trace", default=None)
+
+
+def _auth_request(
+    trace, session, method, url, *, may_retry=False, follow_redirects=True, **kwargs
+):
+    """Record every hop; never replay a password POST on a 307/308."""
+    for _ in range(11):
+        for cookie in session.cookies:
+            trace.remember(getattr(cookie, "value", ""))
+        trace.remember_cookie((kwargs.get("headers") or {}).get("Cookie", ""))
+        try:
+            resp = getattr(session, method.lower())(
+                url, allow_redirects=False, **kwargs
+            )
+        except requests.RequestException as exc:
+            if exc.response is not None:
+                trace.record(exc.response, method, url)
+            error_type = (
+                QzTransientError
+                if may_retry and not trace.password_submitted
+                else QzAPIError
+            )
+            message = (
+                "认证请求失败"
+                if not trace.password_submitted
+                else "密码提交后的认证请求失败，结果未知；未自动重放"
+            )
+            raise error_type(message, diagnostic=trace) from exc
+        trace.record(resp, method, url)
+        if may_retry and resp.status_code >= 500 and not trace.password_submitted:
+            raise QzTransientError(
+                "认证前请求返回服务端错误", resp.status_code, diagnostic=trace
+            )
+        location = (getattr(resp, "headers", {}) or {}).get("Location")
+        if (
+            not follow_redirects
+            or resp.status_code not in {301, 302, 303, 307, 308}
+            or not location
+        ):
+            return resp
+        if method.upper() == "POST" and resp.status_code in {307, 308}:
+            raise QzAPIError(
+                "认证服务要求重放密码 POST；已停止", resp.status_code, diagnostic=trace
+            )
+        if resp.status_code in {301, 302, 303}:
+            method = "GET"
+            kwargs.pop("data", None)
+            kwargs.pop("json", None)
+        next_url = urljoin(resp.url, location)
+        if urlparse(next_url).hostname != urlparse(url).hostname:
+            kwargs["headers"] = {
+                k: v
+                for k, v in kwargs.get("headers", {}).items()
+                if k.lower() not in {"cookie", "authorization"}
+            }
+        url = next_url
+        kwargs.pop("params", None)
+    raise QzAPIError("认证重定向次数超出限制", diagnostic=trace)
+
+
 def with_auth_retry(method):
     """装饰 cookie 认证的 ``QzAPI`` 方法：遇到 401（cookie 过期）时，用本地凭据
     透明地 ``login_with_cas`` 重新登录一次并重试原调用。
@@ -213,8 +297,8 @@ def with_auth_retry(method):
     不允许。登录因此收敛到「主线程一次」，可测量
     （``scratchpad/who.py``：worker 登录数 = 0）。
 
-    当没有凭据、``_auto_relogin`` 显式关闭、或重新登录失败时为 no-op：原始 401
-    被重新抛出，保留既有回退（例如 token 认证）。
+    没有凭据或 ``_auto_relogin`` 显式关闭时重新抛出原始 401。
+    尝试重新登录后的失败向上传递，并保留原始 401 的异常上下文。
     """
     sig = inspect.signature(method)
     takes_cookie = "cookie" in sig.parameters
@@ -381,17 +465,19 @@ _V2_FALLBACK_STATUS = frozenset({404, 405, 501, 502, 503, 504})
 
 # 跨进程重登锁：等锁的最长秒数。超时就放行去自己登 —— 宁可多登一次，
 # 也不能让命令挂死在这里（比如上一个持锁进程被 kill -9 没释放）。
-#: CAS 登录页上真正用来显示错误的容器。页面其余地方的文案一律不能当判据。
-_CAS_ERROR_RE = re.compile(
-    r'<[^>]*class="[^"]*form-error[^"]*"[^>]*>(.*?)</', re.I | re.S
-)
-_TAG_RE = re.compile(r"<[^>]+>")
-
-
 #: 这些字样出现在 CAS 错误文案里，代表**凭据本身不对**（密码错、账号被锁）。
 #: 这类失败**重试没有意义，而且有害** —— 每次重试都是一次新的失败尝试，
 #: 攒够次数 CAS 会把账号锁死。2026-08-12 真锁过一次。
-_CREDENTIAL_FAILURE_MARKERS = ("锁定", "密码错误", "用户名或密码", "账号不存在")
+_CREDENTIAL_FAILURE_RE = re.compile(
+    r"(?<!将)(?<!会)(?<!未)(?<!不)(?<!可能)被锁定|账号被锁|密码错误|用户名或密码|账号或密码|账号不存在"
+)
+_CREDENTIAL_FAILURE_MARKERS = (
+    "被锁定",
+    "密码错误",
+    "用户名或密码",
+    "账号或密码",
+    "账号不存在",
+)
 
 
 def _credential_conflict_block(action: str) -> str:
@@ -418,58 +504,23 @@ def _credential_conflict_block(action: str) -> str:
 
 
 def is_credential_failure(message: str) -> bool:
-    """这条登录失败是不是「凭据不对」——即**绝不该自动重试**的那种。
-
-    区分它和「临时被挡」（频繁登录触发的限流/验证码）是有实际代价的：
-    后者等几分钟自己好，前者你越重试锁得越死。
-    """
-    return any(m in (message or "") for m in _CREDENTIAL_FAILURE_MARKERS)
+    """Classify the server error text for retry policy, not the whole HTML page."""
+    return bool(_CREDENTIAL_FAILURE_RE.search(message or ""))
 
 
 def _describe_cas_login_failure(html: str) -> str:
-    """从 CAS 登录页的 HTML 里读出**真实**的失败原因。
-
-    以前这里是 ``if "验证码" in resp.text: raise "需要输入验证码"``。
-    问题是 CAS 登录页**永远**含"验证码"三个字 —— 它有 5 处，全部来自旁边那个
-    「短信验证码登录」标签页的固定文案（``<h3>验证码登录</h3>``、
-    ``placeholder="验证码"``、``发送验证码``、``动态验证码``），其中那个图形
-    验证码 ``<img>`` 指向的还是 ``mapp.suda.edu.cn``（苏州大学），是模板里没清
-    干净的死代码，启智根本没在用。
-
-    于是**任何**退回登录页的失败都被翻译成"需要输入验证码，请在浏览器中登录"。
-    用户照着提示跑去浏览器，发现压根没有验证码可过；而真实原因（多半是短时间内
-    登录过于频繁被 CAS 挡回）完全没被说出来，反而诱导用户反复重试。
-
-    现在只认 ``<div class="form-error">`` 里的文案 —— 那才是页面真正展示错误的
-    地方。读不到就如实说读不到，不编。
-    """
-    match = _CAS_ERROR_RE.search(html or "")
-    detail = ""
-    if match:
-        detail = _TAG_RE.sub("", match.group(1))
-        detail = " ".join(detail.split()).strip()
-
-    if detail:
-        if "验证码" in detail:
-            # CAS 平时不要验证码，是短时间内登录失败几次之后才临时打开的。
-            # 所以第一建议是"等几分钟重试"，而不是"去浏览器手工取 cookie"——
-            # 后者等于承认工具坏了；何况已保存的 cookie 通常还有效，
-            # 多数情况下根本不需要重新登录。
-            return (
-                f"CAS 暂时要求验证码：{detail}"
-                "（短时间内登录过于频繁会触发，等几分钟通常自行恢复）。"
-                "若已保存的 cookie 仍有效，无需重新登录即可继续使用"
-            )
-        if "密码" in detail or "账号" in detail or "用户名" in detail:
-            return f"用户名或密码错误：{detail}"
-        return f"登录失败：{detail}"
-
-    # 页面没给文案。**别猜**——尤其别再说成验证码。
-    return (
-        "登录失败：CAS 把请求退回了登录页，但页面未给出具体原因。"
-        "常见于短时间内登录过于频繁被挡，稍等片刻通常自行恢复；"
-        "若持续失败，可在浏览器登录后用 `qzcli cookie <cookie>` 手动设置"
-    )
+    detail = CasPage(html).error
+    if not detail:
+        return "CAS 返回登录页，但未提供错误说明。"
+    message = f"CAS 返回：{detail}"
+    if "验证码" in detail:
+        # Platform maintainer policy confirmed by the user on 2026-11-11.
+        message += (
+            "\n提示（平台已确认）：CAS 按 IP 和 User-Agent 记录，连续登录失败 3 次"
+            "触发图形验证码；验证成功或缓存 30 分钟过期后解除。"
+            "\n当前密码登录方式尚不支持图形验证码输入。"
+        )
+    return message
 
 
 _RELOGIN_LOCK_TIMEOUT_S = 60
@@ -478,8 +529,8 @@ _RELOGIN_LOCK_TIMEOUT_S = 60
 #:
 #: 光有互斥锁挡不住失败路径：登录失败时没有新 cookie 落盘，于是每个等在锁上的
 #: 线程/进程重读后都发现"还是旧的"，就各自再打一次 CAS。一条并发命令能打出十几次
-#: **失败**尝试 —— 而 CAS 正是按失败次数判定异常并延长验证码锁定的。
-#: 结果是自动重登把自己锁死，用户只能去浏览器手工取 cookie。
+#: **失败**尝试，可能达到 CAS 按 IP 和 User-Agent 记录的连续失败 3 次阈值。
+#: 这里的 60 秒是本地重试去重时间；平台验证码缓存为 30 分钟。
 _RELOGIN_COOLDOWN_S = 60
 _RELOGIN_COOLDOWN_FILE = ".relogin.cooldown"
 
@@ -520,40 +571,34 @@ def _recent_relogin_failure():
             return message
         if now - float(at_str) < _RELOGIN_COOLDOWN_S:
             return message or "上一次自动登录失败"
-    except (OSError, ValueError):
+    except FileNotFoundError:
         pass
     return None
 
 
-def describe_credential_block():
-    """被凭据类封锁时该告诉用户什么。
-
-    以前这里只说「请先解决登录问题再重试」—— **没说怎么解决**，于是所有人（包括
-    我自己和同事）都以为要「等一会儿再试」。**等是没用的**：凭据类封锁不看时间
-    （见 ``_recent_relogin_failure`` 里那两处 ``is_credential_failure`` 判据，
-    没有任何时间比较），文件放一年也还在。唯一能清掉它的是一次成功的
-    ``qzcli login``（``cmd_login`` 故意绕过封锁，成功后 ``_clear_relogin_failure``
-    删掉记录）。
-
-    所以这段话必须同时给出三件事：等待无效、确切的恢复命令、记录文件在哪。
-    """
-    at = ""
+def _format_cached_failure(message):
+    at = _relogin_failure["at"]
     try:
         raw = _cooldown_path().read_text(encoding="utf-8")
-        at_str, _, _msg = raw.partition("\n")
-        at = _time.strftime(
-            "%Y-%m-%d %H:%M:%S", _time.localtime(float(at_str))
-        )
-    except (OSError, ValueError):
+        at = float(raw.partition("\n")[0])
+    except FileNotFoundError:
         pass
-
-    when = f"（记于 {at}）" if at else ""
+    when = (
+        _time.strftime("%Y-%m-%d %H:%M:%S %z", _time.localtime(at))
+        if at
+        else "时间未知"
+    )
     return (
-        f"已阻止本次并发请求：账号处于锁定/凭据失效状态时继续重试，"
-        f"只会让 CAS 把锁定期拖得更长。\n"
-        f"  这条封锁是**本地永久记录**{when}，不会随时间自动解除 —— 等待无效。\n"
-        f"  平台账号解锁后，跑一次 `qzcli login` 即可恢复（成功会自动清掉这条记录）。\n"
-        f"  记录文件：{_cooldown_path()}"
+        f"本地登录失败记录（{when}）：\n{message}\n"
+        "本次未向认证服务提交密码；这条历史响应不代表平台当前状态。"
+    )
+
+
+def describe_credential_block():
+    return (
+        "本地策略已暂停自动重登，记录不会随时间自动解除，等待无效。\n"
+        "确认凭据来源后，可显式运行 `qzcli login`；成功后会清除记录。\n"
+        f"记录文件：{_cooldown_path()}"
     )
 
 
@@ -581,57 +626,45 @@ def _clear_relogin_failure():
 
 @contextmanager
 def _relogin_file_lock():
-    """跨进程互斥，保证同一时刻只有一个 qzcli 进程在走 CAS 登录。
-
-    多 agent 场景下每次 ``qzcli`` 调用都是独立进程，进程内的 ``threading.Lock``
-    完全挡不住它们同时撞 CAS —— 而 CAS 会把这种并发登录判为异常、要求验证码，
-    结果是**所有进程一起被锁在外面**。
-
-    用 ``flock`` 而不是"自己造锁文件"：进程被 ``kill -9`` 时内核会自动释放，
-    不会留下永久僵尸锁。拿不到锁也不阻塞主流程 —— 超时后照常放行。
-    """
-    lock_path = Path(CONFIG_DIR) / ".relogin.lock"
+    """Serialize CAS login; setup failures may degrade, body failures must propagate."""
+    try:
+        import fcntl
+    except ImportError:
+        yield False
+        return
     fh = None
     acquired = False
     try:
         try:
-            import fcntl
-        except ImportError:
-            # 非 POSIX（Windows）没有 flock，退回只有进程内锁的老行为
-            yield False
-            return
-
-        Path(CONFIG_DIR).mkdir(parents=True, exist_ok=True)
-        fh = open(lock_path, "w")
-        deadline = _time.time() + _RELOGIN_LOCK_TIMEOUT_S
-        while True:
-            try:
-                fcntl.flock(fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-                acquired = True
-                break
-            except OSError:
-                if _time.time() >= deadline:
-                    # 等太久了。放行去自己登 —— 多登一次总好过命令挂死。
+            Path(CONFIG_DIR).mkdir(parents=True, exist_ok=True)
+            fh = open(Path(CONFIG_DIR) / ".relogin.lock", "w")
+            deadline = _time.time() + _RELOGIN_LOCK_TIMEOUT_S
+            while True:
+                try:
+                    fcntl.flock(fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    acquired = True
                     break
-                _time.sleep(0.2)
+                except BlockingIOError:
+                    if _time.time() >= deadline:
+                        break
+                    _time.sleep(0.2)
+        except OSError as exc:
+            swallowed("锁/创建或获取", exc)
+        # Keep yield outside the setup exception handler: an OSError raised by
+        # the login body is the real failure, not permission to execute it again.
         yield acquired
-    except OSError:
-        # 锁文件建不了（只读 HOME 之类）不该让整条命令失败
-        yield False
     finally:
         if fh is not None:
             try:
                 if acquired:
-                    import fcntl as _f
-
-                    _f.flock(fh.fileno(), _f.LOCK_UN)
+                    fcntl.flock(fh.fileno(), fcntl.LOCK_UN)
             except OSError as exc:
-                # 解锁失败也要继续走到 close()；进程退出时内核会释放锁。
                 swallowed("锁/解锁", exc)
-            try:
-                fh.close()
-            except OSError as exc:
-                swallowed("锁/关闭句柄", exc)
+            finally:
+                try:
+                    fh.close()
+                except OSError as exc:
+                    swallowed("锁/关闭句柄", exc)
 
 
 def _v2_then_v1(name: str, v2_call, v1_call, *, logger=None):
@@ -658,6 +691,8 @@ def _v2_then_v1(name: str, v2_call, v1_call, *, logger=None):
         # 重试已经在 `with_rate_limit_retry` 里做过了，到这里就该让调用方看见。
         raise
     except QzAPIError as exc:
+        if has_auth_diagnostic(exc):
+            raise
         if not (exc.code in _V2_FALLBACK_STATUS or "非 JSON" in str(exc)):
             raise
         if name not in _V2_FALLBACK_WARNED:
@@ -692,14 +727,46 @@ def build_resource_spec_price(
 class QzAPI:
     """启智平台 API 客户端"""
 
-    def __init__(self, username: Optional[str] = None, password: Optional[str] = None):
+    def __init__(
+        self,
+        username: Optional[str] = None,
+        password: Optional[str] = None,
+        *,
+        auth_mode=None,
+        qz_config_dir=None,
+    ):
+        self.auth_mode = get_auth_mode(auth_mode)
+        self._official_auth = None
+        if self.auth_mode == "qz":
+            if username or password:
+                raise QzAPIError("用户名和密码需要显式选择 auth_mode=legacy")
+            from .qz_auth import OfficialAuth
+
+            self._official_auth = OfficialAuth(qz_config_dir)
+            self.base_url = self._official_auth.server
+            self._username, self._password = None, None
+            self._credential_sources = "凭据来源：官方 qz"
+            self._credential_identity = (None, None)
+            self._token = None
+            self._auto_relogin = False
+            self._relogin_lock = threading.Lock()
+            self._opaque_lock = threading.RLock()
+            self._opaque_check_active = False
+            self._validated_opaque_token = None
+            return
         self.base_url = get_api_base_url()
 
         if username and password:
             self._username = username
             self._password = password
+            self._credential_sources = "凭据来源：API 调用参数"
         else:
             self._username, self._password = get_credentials()
+            _, _, user_source, password_source = get_credentials_with_source()
+            self._credential_sources = (
+                f"凭据来源: 用户名={user_source} | 密码={password_source}"
+            )
+        self._credential_identity = (self._username, self._password)
 
         self._token: Optional[str] = None
         # 关掉可临时禁用 cookie 过期自动重登（如只读 / 无凭据场景）。
@@ -708,6 +775,11 @@ class QzAPI:
 
     def _post(self, url: str, **kwargs) -> _CurlResponse:
         return _curl_post(url, **kwargs)
+
+    def _v2_then_v1(self, name, v2_call, v1_call, **kwargs):
+        if self.auth_mode == "qz":
+            return v2_call()
+        return _v2_then_v1(name, v2_call, v1_call, **kwargs)
 
     def ensure_authenticated(self, cookie: str = "", probe: bool = True) -> str:
         """**并发扇出之前**把鉴权在当前线程里走完，返回此后该用的 cookie。
@@ -730,23 +802,23 @@ class QzAPI:
             cookie: 调用方手上的 cookie；留空则读盘。
             probe: 是否发探针。测试里下层被 mock 时可关掉。
         """
+        if self.auth_mode == "qz":
+            if cookie:
+                raise QzAPIError("显式 Cookie 需要 auth_mode=legacy")
+            self._official_token()
+            if probe:
+                self.get_user_detail()
+            return ""  # Never return a Bearer token through the legacy cookie contract.
         blocked = _recent_relogin_failure()
         if blocked is not None and is_credential_failure(blocked):
-            raise QzAPIError(f"{blocked}\n{describe_credential_block()}")
+            raise QzAPIError(
+                f"{_format_cached_failure(blocked)}\n{describe_credential_block()}",
+                diagnostic=AuthDiagnostic(stage="local authentication block"),
+            )
         candidate = cookie or (get_cookie() or {}).get("cookie", "")
         if probe:
-            try:
-                # 探针在「允许重登」窗口内跑：这样即便调用方不在主线程
-                # （看板 / MCP 工作线程），这一次串行探针撞 401 也能自愈。
-                with _allow_relogin_here():
-                    self.get_user_detail(cookie=candidate)
-            except Exception as exc:  # noqa: BLE001 —— 见下
-                # 探针是**纯加分项**：它的唯一作用是让 401→重登发生在当前线程。
-                # 401 已由装饰器串行处理过；走到这里说明是别的问题（网络、限流、
-                # 底层 urllib3 异常…）。这里必须吞掉一切 ——
-                # **绝不能因为探针失败而让整条命令挂掉**，真问题让业务请求去报。
-                # 留痕，别静默（QZCLI_DEBUG=1 可见）。
-                swallowed("扇出前鉴权探针", exc)
+            with _allow_relogin_here():
+                self.get_user_detail(cookie=candidate)
         return (get_cookie() or {}).get("cookie", "") or candidate
 
     @with_rate_limit_retry
@@ -765,11 +837,8 @@ class QzAPI:
     ) -> Optional[str]:
         """用本地凭据走 CAS 重新登录并持久化新 cookie。
 
-        返回新 cookie 字符串；没有凭据或登录失败时返回 ``None``。
-
-        ``propagate_errors=True`` 时改为把 ``QzAPIError`` 抛出去而不是吞成
-        ``None`` —— 交互式命令需要这个，否则"需要输入验证码"这种**用户能据此
-        行动**的信息会被压成一句笼统的"未找到有效 cookie"。
+        没有凭据时返回 None；尝试登录后的失败始终抛出，保留诊断上下文。
+        propagate_errors 参数保留以兼容调用方。
 
         **并发保护是两层的，缺一不可**：
 
@@ -807,19 +876,28 @@ class QzAPI:
         )
         with self._relogin_lock:
             current = (get_cookie() or {}).get("cookie")
-            if current and current != baseline:
+            if (
+                current
+                and current != baseline
+                and self.verify_cookie(current, self._username)
+            ):
                 return current  # 同进程其他线程已经刷新过了
             with _relogin_file_lock():
                 # 拿到跨进程锁后重读：可能别的进程已经登好了
                 current = (get_cookie() or {}).get("cookie")
-                if current and current != baseline:
+                if (
+                    current
+                    and current != baseline
+                    and self.verify_cookie(current, self._username)
+                ):
                     return current
                 # 刚失败过就别再打了 —— 重试只会把锁定期拖得更长
                 recent = _recent_relogin_failure()
                 if recent is not None:
-                    if propagate_errors:
-                        raise QzAPIError(recent)
-                    return None
+                    raise QzAPIError(
+                        _format_cached_failure(recent),
+                        diagnostic=AuthDiagnostic(stage="local authentication block"),
+                    )
                 # 冲突时**绝不发请求**。这里是自动重登，用户可能只是敲了
                 # 一句 `qzcli status` —— 拿他账号的锁定额度去赌哪个密码对，
                 # 而且全程无声，是这条路径上最坏的行为。
@@ -831,13 +909,13 @@ class QzAPI:
                     opslog.record(
                         "relogin", outcome="error", err_class="credential-conflict"
                     )
-                    if propagate_errors:
-                        raise QzAPIError(blocked)
-                    return None
+                    raise QzAPIError(blocked)
                 try:
                     cookie = self.login_with_cas(self._username, self._password)
                 except QzAPIError as exc:
-                    _record_relogin_failure(str(exc))
+                    diagnostic = getattr(exc, "diagnostic", None) or AuthDiagnostic()
+                    diagnostic.remember(self._password)
+                    _record_relogin_failure(diagnostic.redact(exc))
                     # 自动重登失败必须留痕。它不经过 main() 的分发点，
                     # 所以不写这一条的话操作日志里**一个字都不会有** ——
                     # 排查时会看到"本机没登录过"，而平台侧审计记着一串失败。
@@ -846,15 +924,15 @@ class QzAPI:
                         outcome="error",
                         err_class=exc.__class__.__name__,
                     )
-                    if propagate_errors:
-                        raise
-                    return None
+                    raise
                 _clear_relogin_failure()
                 save_cookie(cookie, (get_cookie() or {}).get("workspace_id", ""))
                 return cookie
 
     def _get_token(self, force_refresh: bool = False) -> str:
         """获取 Access Token（带缓存）"""
+        if self.auth_mode == "qz":
+            raise QzAPIError("旧 token 接口仅在 auth_mode=legacy 下使用")
         if not force_refresh and self._token:
             return self._token
 
@@ -963,7 +1041,7 @@ class QzAPI:
         与 /openapi/v1 不同：
           - 响应是 AWS 风格信封 ``{"ResponseMetadata": ..., "Result": ...}``
           - APISIX 网关要求 ``x-inspire-client-source`` 头，否则 302 到 Keycloak
-          - 认证走 cookie（同 /api/v1/）：Bearer 在这条路径下不被接受
+          - qz 模式使用官方 Bearer；legacy 模式使用 CAS cookie
 
         默认返回**已解封装的** ``Result``（见 ``_unwrap_v2_result``）；调用方不需要
         再自己剥一层。需要看原始信封时传 ``raw=True``。
@@ -972,6 +1050,10 @@ class QzAPI:
         cookie 的调用点用得到）；不传则从 ``~/.qzcli/.cookie`` 读，配合
         ``with_auth_retry`` 在 401 时自动重登后读到新 cookie。
         """
+        if self.auth_mode == "qz":
+            if cookie:
+                raise QzAPIError("显式 Cookie 需要 auth_mode=legacy")
+            return self._request_official_v2(service, action, body, referer_path, raw)
         if not cookie:
             cookie_data = get_cookie()
             cookie = cookie_data.get("cookie") if cookie_data else None
@@ -1000,9 +1082,13 @@ class QzAPI:
         )
 
         if response.status_code == 401:
+            trace = AuthDiagnostic(stage="platform API authentication")
+            trace.remember_cookie(cookie)
+            trace.record(response, "POST", url)
             raise QzAPIError(
                 "Cookie 已过期或无效，请运行 `qzcli login` 重新获取",
                 401,
+                diagnostic=trace,
             )
 
         # 429 必须在 content-type 嗅探**之前**判掉。APISIX 限流返回的是一张
@@ -1049,6 +1135,151 @@ class QzAPI:
             )
         return result if raw else _unwrap_v2_result(result)
 
+    def _official_token(self, *, _identity_request=False, **kwargs):
+        from .qz_auth import OfficialAuthError, Token
+
+        try:
+            token = self._official_auth.token(**kwargs)
+            if _identity_request or Token.parse(token).expires_at is not None:
+                return token
+            # Opaque/malformed-exp tokens are neither expired nor authenticated
+            # locally. Verify identity before a business call, including writes.
+            # RLock permits the identity request to obtain its own auth header.
+            with self._opaque_lock:
+                if self._opaque_check_active or token == self._validated_opaque_token:
+                    return token
+                self._opaque_check_active = True
+                try:
+                    user = self.get_user_detail()
+                    if not isinstance(user, dict) or not user.get("id"):
+                        raise QzAPIError("官方身份响应缺少用户 ID，未发送业务请求")
+                    # The identity request may itself have renewed the pair.
+                    token = self._official_auth.token()
+                    self._validated_opaque_token = token
+                    return token
+                finally:
+                    self._opaque_check_active = False
+        except OfficialAuthError as exc:
+            error = QzAPIError(str(exc), 401 if exc.action_required else None)
+            error.action_required = exc.action_required
+            raise error from exc
+
+    def _request_official_v2(self, service, action, body, referer_path, raw):
+        url = f"{self.base_url}/api/v2/{service}"
+        return self._request_official(
+            url,
+            body,
+            referer_path,
+            raw,
+            params={"Action": action},
+            label=f"{service}.{action}",
+        )
+
+    def _request_official(
+        self,
+        url,
+        body,
+        referer_path="/",
+        raw=False,
+        *,
+        params=None,
+        label="platform API",
+    ):
+        identity_request = url == f"{self.base_url}/api/v2/user" and params == {
+            "Action": "GetUserDetail"
+        }
+        token = self._official_token(_identity_request=identity_request)
+        for attempt in range(2):
+            response = _curl_post(
+                url,
+                params=params,
+                json=body,
+                headers={
+                    "accept": "application/json",
+                    "content-type": "application/json",
+                    "authorization": f"Bearer {token}",
+                    "origin": self.base_url,
+                    "referer": f"{self.base_url}{referer_path}",
+                    "user-agent": V2_BROWSER_UA,
+                    "x-inspire-client-source": QZ_CLIENT_SOURCE,
+                },
+                timeout=60,
+            )
+            trace = AuthDiagnostic(
+                stage=f"platform API {label}",
+                authentication=response.status_code == 401,
+            )
+            trace.remember(token)
+            trace.record(response, "POST", url)
+            if response.status_code == 401 and attempt == 0:
+                try:
+                    token = self._official_token(
+                        force_refresh=True,
+                        failing_token=token,
+                        _identity_request=identity_request,
+                    )
+                except QzAPIError as exc:
+                    exc.diagnostic = trace
+                    raise
+                continue
+            if response.status_code == 429:
+                raise QzRateLimitError(
+                    "触发平台限流（HTTP 429）",
+                    retry_after=_parse_retry_after(response.headers.get("Retry-After")),
+                    diagnostic=trace,
+                )
+            try:
+                data = response.json()
+            except ValueError as exc:
+                raise QzAPIError(
+                    f"{label}: HTTP {response.status_code}\n{self._official_auth.redact(response.text)}",
+                    response.status_code,
+                    diagnostic=trace,
+                ) from exc
+            if response.status_code >= 400:
+                raise QzAPIError(
+                    f"{label}: HTTP {response.status_code}\n{self._official_auth.redact(response.text)}",
+                    response.status_code,
+                    diagnostic=trace,
+                )
+            try:
+                return data if raw else _unwrap_v2_result(data)
+            except QzAPIError as exc:
+                raise QzAPIError(
+                    f"{exc}\n{self._official_auth.redact(response.text)}",
+                    exc.code,
+                    exc.api_code,
+                    diagnostic=trace,
+                ) from exc
+
+    def auth_status(self, check=False):
+        if self.auth_mode == "legacy":
+            status = {
+                "auth_mode": "legacy",
+                "cookie_present": bool((get_cookie() or {}).get("cookie")),
+            }
+            if check:
+                # A status check must not submit a password behind the user's back.
+                probe = QzAPI(auth_mode="legacy")
+                probe._auto_relogin = False
+                user = probe.get_user_detail()
+                status.update(
+                    authenticated=True,
+                    user={"id": user.get("id"), "name": user.get("name")},
+                )
+            return status
+        status = self._official_auth.status()
+        if check:
+            user = self.get_user_detail()
+            status = self._official_auth.status()
+            status.update(
+                {
+                    "authenticated": True,
+                    "user": {"id": user.get("id"), "name": user.get("name")},
+                }
+            )
+        return status
+
     def get_job_detail(self, job_id: str) -> Dict[str, Any]:
         """查询任务详情（使用 cookie 认证，优先于 token）
 
@@ -1062,6 +1293,8 @@ class QzAPI:
         实测后果：``qzcli list -c --all-ws``（每个工作空间 5 线程扇出批量查详情）
         在全量形态下稳定撞 429 —— 是 live_smoke 补上"默认形态"用例之后才暴露的。
         """
+        if self.auth_mode == "qz":
+            return self._get_job_detail_v2(job_id)
         cookie_data = get_cookie()
         cookie = cookie_data.get("cookie") if cookie_data else None
         if cookie:
@@ -1069,7 +1302,9 @@ class QzAPI:
                 return self.get_job_detail_with_cookie(job_id, cookie)
             except QzRateLimitError:
                 raise
-            except QzAPIError:
+            except QzAPIError as _auth_exc:
+                if has_auth_diagnostic(_auth_exc):
+                    raise
                 pass
         result = self._request("/openapi/v1/train_job/detail", {"job_id": job_id})
         return result.get("data", {})
@@ -1079,7 +1314,7 @@ class QzAPI:
 
         两边都把 job 字段平铺在结果顶层，调用方无需区分。
         """
-        return _v2_then_v1(
+        return self._v2_then_v1(
             "train_job/detail",
             lambda: self._get_job_detail_v2(job_id, cookie),
             lambda: self._get_job_detail_v1(job_id, cookie),
@@ -1182,7 +1417,11 @@ class QzAPI:
         ``events`` 列表（v2 在 ``Result.events``，v1 在 ``data.events``）。
         读取所有分页后再交给 CLI 排序/截尾，避免长排队任务只显示早期事件。
         """
-        if isinstance(page_size, bool) or not isinstance(page_size, int) or page_size <= 0:
+        if (
+            isinstance(page_size, bool)
+            or not isinstance(page_size, int)
+            or page_size <= 0
+        ):
             raise ValueError("page_size must be a positive integer")
         events = []
         seen_pages = set()
@@ -1193,10 +1432,13 @@ class QzAPI:
                 "page_size": page_size,
                 "filter": {"object_type": object_type, "object_ids": list(object_ids)},
             }
-            data = _v2_then_v1(
+            data = self._v2_then_v1(
                 "train_job/events/list",
                 lambda: self._request_v2(
-                    "train", "ListJobEvents", payload, cookie=cookie,
+                    "train",
+                    "ListJobEvents",
+                    payload,
+                    cookie=cookie,
                     referer_path=f"/jobs/distributedTrainingDetail/{job_id}",
                 ),
                 lambda: self._get_events_v1(job_id, cookie, payload),
@@ -1222,10 +1464,13 @@ class QzAPI:
                 # age 每次查询都会变化，不能用它判断服务器是否重复返回第一页。
                 fingerprint = _json.dumps(
                     [{k: v for k, v in e.items() if k != "age"} for e in page],
-                    sort_keys=True, ensure_ascii=False,
+                    sort_keys=True,
+                    ensure_ascii=False,
                 )
                 if fingerprint in seen_pages:
-                    raise QzAPIError(f"事件接口重复返回分页 {page_num}，无法确认完整结果")
+                    raise QzAPIError(
+                        f"事件接口重复返回分页 {page_num}，无法确认完整结果"
+                    )
                 seen_pages.add(fingerprint)
                 events.extend(page)
             if total is not None:
@@ -1446,6 +1691,8 @@ class QzAPI:
         except (QzAPIError, requests.RequestException) as exc:
             # 拿不到真名就退回猜，但**必须留痕** —— 否则"猜错了"和"平台没数据"
             # 长得一模一样。
+            if has_auth_diagnostic(exc):
+                raise
             swallowed("logs/取实例名", exc)
 
         if n_instances is None:
@@ -1460,7 +1707,9 @@ class QzAPI:
                         or d.get("instances")
                         or d.get("replica_count")
                     )
-            except Exception:
+            except Exception as _auth_exc:
+                if has_auth_diagnostic(_auth_exc):
+                    raise
                 n_instances = None
         if not n_instances or n_instances < 1:
             n_instances = 1
@@ -1521,23 +1770,31 @@ class QzAPI:
                 try:
                     results[job_id] = future.result()
                 except Exception as e:
+                    if has_auth_diagnostic(e):
+                        raise
                     results[job_id] = {"error": str(e)}
 
         return results
 
     def stop_job(self, job_id: str) -> bool:
         """停止任务（优先 cookie 认证，回退 token）"""
+        if self.auth_mode == "qz":
+            return self._stop_job_v2(job_id)
         cookie_data = get_cookie()
         cookie = cookie_data.get("cookie") if cookie_data else None
         if cookie:
             try:
                 return self.stop_job_with_cookie(job_id, cookie)
-            except QzAPIError:
+            except QzAPIError as _auth_exc:
+                if has_auth_diagnostic(_auth_exc):
+                    raise
                 pass
         try:
             self._request("/openapi/v1/train_job/stop", {"job_id": job_id})
             return True
-        except QzAPIError:
+        except QzAPIError as _auth_exc:
+            if has_auth_diagnostic(_auth_exc):
+                raise
             return False
 
     def stop_job_with_cookie(self, job_id: str, cookie: str) -> bool:
@@ -1547,7 +1804,7 @@ class QzAPI:
         （404/405/50x/非 JSON）—— 业务错误（任务已结束、无权限）会直接抛给用户，
         绝不会因为回落而变成"停了两次"。
         """
-        return _v2_then_v1(
+        return self._v2_then_v1(
             "train_job/stop",
             lambda: self._stop_job_v2(job_id, cookie),
             lambda: self._stop_job_v1(job_id, cookie),
@@ -1613,6 +1870,8 @@ class QzAPI:
 
     def create_job(self, config: Dict[str, Any]) -> Dict[str, Any]:
         """创建任务"""
+        if self.auth_mode == "qz":
+            return self.create_job_v2("", config)
         result = self._request("/openapi/v1/train_job/create", config)
         return result.get("data", result)
 
@@ -1622,6 +1881,10 @@ class QzAPI:
         self, cookie: str, config: Dict[str, Any]
     ) -> Dict[str, Any]:
         """使用 cookie 创建任务（内部 API）"""
+        if self.auth_mode == "qz":
+            if cookie:
+                raise QzAPIError("显式 Cookie 需要 auth_mode=legacy")
+            return self.create_job_v2("", config)
         url = f"{self.base_url}/api/v1/train_job/create"
         workspace_id = config.get("workspace_id", "")
         headers = {
@@ -1693,7 +1956,7 @@ class QzAPI:
         priority: int = 1,
     ) -> Dict[str, Any]:
         """
-        提交 HPC/CPU 任务（使用 cookie 认证，POST /api/v1/hpc_jobs）
+        提交 HPC/CPU 任务（v2 hpc.CreateJobConsole，使用所选认证）
 
         ``priority`` 是**必填**：平台后来加了这个校验，不传直接被拒
         （``API 请求失败: priority must be set``），导致 `qzcli hpc` 整个不可用。
@@ -1723,7 +1986,6 @@ class QzAPI:
         Returns:
             API 响应 data 字段（含 job_id 等）
         """
-        url = f"{self.base_url}/api/v1/hpc_jobs"
         payload = {
             "job_name": job_name,
             "workspace_id": workspace_id,
@@ -1760,37 +2022,15 @@ class QzAPI:
                 },
             },
         }
-        headers = {
-            "accept": "application/json, text/plain, */*",
-            "content-type": "application/json",
-            "cookie": cookie,
-            "origin": self.base_url,
-            "referer": f"{self.base_url}/jobs/hpc?spaceId={workspace_id}",
-            "user-agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36",
-        }
-        response = _curl_post(url, json=payload, headers=headers, timeout=60)
-        if response.status_code == 401:
-            raise QzAPIError("Cookie 已过期或无效，请重新获取", 401)
-        if response.status_code == 429:
-            raise QzRateLimitError(
-                "触发平台限流（HTTP 429）",
-                429,
-                retry_after=_parse_retry_after(response.headers.get("Retry-After")),
-            )
-        if response.status_code != 200:
-            raise QzAPIError(
-                f"请求失败: HTTP {response.status_code}", response.status_code
-            )
-        try:
-            result = response.json()
-        except Exception:
-            raise QzAPIError("响应不是有效的 JSON")
-        if result.get("code") != 0:
-            raise QzAPIError(
-                f"API 请求失败: {result.get('message', '未知错误')}",
-                result.get("code"),
-            )
-        return result.get("data", {})
+        # The former REST endpoint returns 404. Console preserves the exact
+        # existing payload, including priority and sbatch maximum running time.
+        return self._request_v2(
+            "hpc",
+            "CreateJobConsole",
+            payload,
+            cookie=cookie,
+            referer_path=f"/jobs/hpc?spaceId={workspace_id}",
+        )
 
     def list_hpc_jobs(
         self,
@@ -1825,10 +2065,15 @@ class QzAPI:
 
     def test_connection(self) -> bool:
         """测试连接"""
+        if self.auth_mode == "qz":
+            self.get_user_detail()
+            return True
         try:
             self._get_token(force_refresh=True)
             return True
-        except Exception:
+        except Exception as _auth_exc:
+            if has_auth_diagnostic(_auth_exc):
+                raise
             return False
 
     def list_workspace_tasks(
@@ -1847,7 +2092,7 @@ class QzAPI:
         """
         end_ts = int(_time.time())
         start_ts = end_ts - hours * 3600
-        return _v2_then_v1(
+        return self._v2_then_v1(
             "cluster_metric/overview_task_metric",
             lambda: self._list_workspace_tasks_v2(
                 workspace_id, cookie, start_ts, end_ts
@@ -1954,7 +2199,7 @@ class QzAPI:
 
         两边响应形状一致（``{jobs: [...], total: N}``），调用方无需区分。
         """
-        return _v2_then_v1(
+        return self._v2_then_v1(
             "train_job/list",
             lambda: self._list_jobs_v2(
                 workspace_id, cookie, page_num, page_size, created_by
@@ -1978,6 +2223,10 @@ class QzAPI:
             "page_num": page_num,
             "page_size": page_size,
         }
+        if self.auth_mode == "qz":
+            # Bearer defaults to MINE: created_by is ignored and total is global.
+            # ALL restores the workspace list/filter contract of the Cookie API.
+            body["scope"] = "TASK_LIST_SCOPE_ALL"
         if created_by:
             body["created_by"] = created_by
         return self._request_v2(
@@ -2123,7 +2372,7 @@ class QzAPI:
                 "vscode_url": "",
             }
 
-        return _v2_then_v1("notebook/lab", _v2, _v1)
+        return self._v2_then_v1("notebook/lab", _v2, _v1)
 
     def _notebook_lab_url_v1(self, notebook_id: str, cookie: str = "") -> str:
         """v1 兜底：``GET /api/v1/notebook/lab/{id}`` 的 301 ``Location``。
@@ -2170,7 +2419,7 @@ class QzAPI:
 
         两边都返回 ``{list: [...], total: N}``。
         """
-        return _v2_then_v1(
+        return self._v2_then_v1(
             "notebook/list",
             lambda: self._list_notebooks_v2(
                 workspace_id, cookie, page, page_size, user_ids, status
@@ -2350,7 +2599,11 @@ class QzAPI:
     ) -> List[Dict[str, Any]]:
         """获取计算组可用的规格列表。
 
-        这是整个迁移里最麻烦的一个：**v2 没有任何 action 返回 spec_id**。
+        官方模式优先使用用户可访问的 ``train GetTrainScheduleConfig``，读取
+        ``predef_train_spec``；管理员级的 workspace 配置被拒不代表规格不可查询。
+        以下旧迁移背景保留用于说明历史任务及 legacy 兜底的来源。
+
+        早期的 schema 中没有规格清单：
         把 144 个 action 的 schema 全 grep 过 —— ``spec_id`` 只作为**请求**字段
         存在（``train.CreateJob.framework_config[]`` / ``hpc.CreateJob`` /
         ``inference-serving.CreateServing``）。``workspace GetWorkspaceNodeSpecs``
@@ -2382,6 +2635,13 @@ class QzAPI:
             if predef:
                 return predef
 
+        if self.auth_mode == "qz":
+            return (
+                self._specs_from_job_history(compute_group_id, workspace_id)
+                if workspace_id
+                else []
+            )
+
         try:
             result = self._request(
                 "/openapi/v1/specs/list", {"logic_compute_group_id": compute_group_id}
@@ -2389,8 +2649,10 @@ class QzAPI:
             specs = result.get("data", {}).get("specs", [])
             if specs:
                 return specs
-        except QzAPIError:
+        except QzAPIError as _auth_exc:
             # 404 / invalid_grant 都算这一级不可用，静默降级到历史任务推断
+            if has_auth_diagnostic(_auth_exc):
+                raise
             pass
 
         if not workspace_id:
@@ -2416,15 +2678,25 @@ class QzAPI:
         """
         try:
             cfg = self._request_v2(
-                "workspace",
-                "GetScheduleConfig",
+                "train" if self.auth_mode == "qz" else "workspace",
+                (
+                    "GetTrainScheduleConfig"
+                    if self.auth_mode == "qz"
+                    else "GetScheduleConfig"
+                ),
                 {"workspace_id": workspace_id},
                 referer_path=f"/jobs/spacesOverview?spaceId={workspace_id}",
             )
-        except QzAPIError:
+        except QzAPIError as _auth_exc:
+            if has_auth_diagnostic(_auth_exc):
+                raise
             return []
 
-        raw = ((cfg or {}).get("schedule_config") or {}).get("predef_train_spec")
+        raw = (
+            (cfg or {}).get("predef_train_spec")
+            if self.auth_mode == "qz"
+            else ((cfg or {}).get("schedule_config") or {}).get("predef_train_spec")
+        )
         if not raw:
             return []
         try:
@@ -2494,7 +2766,9 @@ class QzAPI:
                 logic_compute_group_id=compute_group_id,
                 page_size=100,
             )
-        except QzAPIError:
+        except QzAPIError as _auth_exc:
+            if has_auth_diagnostic(_auth_exc):
+                raise
             return ""
         counts: Dict[str, int] = {}
         for node in data.get("node_dimensions") or []:
@@ -2539,7 +2813,9 @@ class QzAPI:
             return
         try:
             data = self.list_jobs_with_cookie(workspace_id, "", page_size=200)
-        except QzAPIError:
+        except QzAPIError as _auth_exc:
+            if has_auth_diagnostic(_auth_exc):
+                raise
             return
         found: Dict[str, str] = {}
         for job in data.get("jobs") or []:
@@ -2581,7 +2857,9 @@ class QzAPI:
             data = self.list_jobs_with_cookie(
                 workspace_id, "", page_num=1, page_size=page_size
             )
-        except QzAPIError:
+        except QzAPIError as _auth_exc:
+            if has_auth_diagnostic(_auth_exc):
+                raise
             return []
 
         specs: Dict[str, Dict[str, Any]] = {}
@@ -2674,7 +2952,7 @@ class QzAPI:
         一样，但前者是集群管理员权限 —— 普通账号实测返回 ``AccessForbidden``。
         qzcli 是工作空间级工具，一律走 ``workspace.*``。
         """
-        return _v2_then_v1(
+        return self._v2_then_v1(
             "cluster_metric/list_node_dimension",
             lambda: self._list_node_dimension_v2(
                 workspace_id,
@@ -2804,7 +3082,7 @@ class QzAPI:
         同 ``list_node_dimension``：**必须走 `workspace` 不是 `cluster`**，
         后者对普通账号是 ``AccessForbidden``。
         """
-        return _v2_then_v1(
+        return self._v2_then_v1(
             "cluster_metric/list_task_dimension",
             lambda: self._list_task_dimension_v2(
                 workspace_id, cookie, project_id, page_num, page_size
@@ -2914,7 +3192,7 @@ class QzAPI:
         ``cluster GetClusterBasicInfo`` —— 后者普通账号 ``AccessForbidden``。
         两边都返回 ``{clusters, compute_groups, resource_types}``。
         """
-        return _v2_then_v1(
+        return self._v2_then_v1(
             "cluster_metric/cluster_basic_info",
             lambda: self._cluster_basic_info_v2(workspace_id, cookie),
             lambda: self._cluster_basic_info_v1(workspace_id, cookie),
@@ -3160,7 +3438,7 @@ class QzAPI:
         ``[{id, name, space_list: [{id, name, usage_status, ...}], ...}]``。
         形状变了不会报错，只会让 ``list_workspaces`` 静默返空 —— 那比崩掉更难查。
         """
-        return _v2_then_v1(
+        return self._v2_then_v1(
             "project/list",
             lambda: self._project_list_items_v2(cookie),
             lambda: self._project_list_items_v1(cookie),
@@ -3243,198 +3521,204 @@ class QzAPI:
         """Check if any session-like cookie exists (handles name changes like session -> inspire-session)."""
         return any("session" in name.lower() for name in cookies)
 
-    def login_with_cas(self, username: str, password: str) -> str:
-        """通过 CAS 统一认证登录，获取 session cookie。
+    def _session_is_authenticated(
+        self, session, cookie_str, username="", diagnostic=None
+    ):
+        """Only an explicit 401 means unauthenticated; other failures propagate."""
+        trace = diagnostic or AuthDiagnostic(stage="verify session")
+        trace.stage = "verify session"
+        resp = _auth_request(
+            trace,
+            session,
+            "POST",
+            f"{self.base_url}/api/v2/user",
+            params={"Action": "GetUserDetail"},
+            json={},
+            headers={
+                "Content-Type": "application/json",
+                "Accept": "application/json",
+                "Cookie": cookie_str,
+                "User-Agent": V2_BROWSER_UA,
+                "x-inspire-client-source": V2_CLIENT_SOURCE,
+            },
+            timeout=20,
+            follow_redirects=False,
+        )
+        if resp.status_code == 401:
+            return False
+        if resp.status_code != 200:
+            raise QzAPIError("会话校验未成功", resp.status_code, diagnostic=trace)
+        try:
+            data = resp.json()
+        except ValueError as exc:
+            raise QzAPIError("会话校验返回非 JSON", diagnostic=trace) from exc
+        try:
+            result = _unwrap_v2_result(data)
+        except QzAPIError as exc:
+            exc.diagnostic = trace
+            raise
+        if not result.get("id"):
+            raise QzAPIError("会话校验响应缺少用户身份", diagnostic=trace)
+        extra = result.get("extra_info") or {}
+        identifiers = {
+            str(extra.get(k) or "").strip() for k in ("login_name", "institution_id")
+        }
+        identifiers.add(str(result.get("email") or "").strip())
+        if not username or username.strip() not in identifiers:
+            raise QzAPIError("会话用户与本次登录账号不一致或无法确认", diagnostic=trace)
+        return True
 
-        瞬时故障（SSL EOF、连接重置、CAS/代理 5xx）会以指数退避重试；用户名密码
-        错误等永久性错误立即抛出，不重试。
-        """
-        last_exc: Optional[QzAPIError] = None
-        for attempt in range(_LOGIN_MAX_TRIES):
-            try:
-                return self._login_with_cas_once(username, password)
-            except QzTransientError as exc:
-                last_exc = exc
-                if attempt < _LOGIN_MAX_TRIES - 1:
+    def verify_cookie(self, cookie, username):
+        session = requests.Session()
+        try:
+            proxy = get_proxy(self.base_url)
+            if proxy:
+                session.trust_env = False
+                session.proxies = {"http": proxy, "https": proxy}
+            return self._session_is_authenticated(session, cookie, username)
+        finally:
+            session.close()
+
+    def login_with_cas(self, username: str, password: str) -> str:
+        """Retry only failures before the first password submission."""
+        if self.auth_mode != "legacy":
+            raise QzAPIError("CAS 密码登录需要显式选择 auth_mode=legacy")
+        trace = AuthDiagnostic()
+        trace.credential_sources = (
+            self._credential_sources
+            if getattr(self, "_credential_identity", None) == (username, password)
+            else "凭据来源：API 调用参数"
+        )
+        trace.remember(password)
+        token = _auth_trace.set(trace)
+        try:
+            for attempt in range(_LOGIN_MAX_TRIES):
+                try:
+                    return self._login_with_cas_once(username, password)
+                except QzTransientError as exc:
+                    exc.diagnostic = trace
+                    trace.attempts.append(
+                        f"attempt {attempt + 1}: {type(exc).__name__}: {trace.redact(exc)}"
+                    )
+                    if trace.password_submitted or attempt == _LOGIN_MAX_TRIES - 1:
+                        raise
                     _time.sleep(_backoff_delay(attempt))
-        raise last_exc  # 重试用尽，抛出最后一次瞬时错误
+        except Exception as exc:
+            # Attach evidence and re-raise the original error, including programming bugs.
+            if has_auth_diagnostic(exc):
+                raise
+            exc.diagnostic = trace
+            raise
+        finally:
+            _auth_trace.reset(token)
 
     def _login_with_cas_once(self, username: str, password: str) -> str:
-        """单次 CAS 登录流程（不含重试）。
-
-        登录流程：
-        1. 访问 qz.sii.edu.cn -> 重定向到 Keycloak
-        2. Keycloak 重定向到 CAS 登录页
-        3. 在 CAS 提交用户名密码
-        4. CAS 验证后重定向回 Keycloak
-        5. Keycloak 重定向回 qz.sii.edu.cn，设置 session cookie
-
-        Args:
-            username: CAS 用户名（学工号）
-            password: CAS 密码
-
-        Returns:
-            session cookie 字符串
-        """
-        import re
-        from urllib.parse import urlparse
-
+        trace = _auth_trace.get() or AuthDiagnostic()
+        trace.remember(password)
         session = requests.Session()
-
-        # 配置 SOCKS5 代理（WSL 等环境需要）
-        # trust_env=False 避免环境变量 HTTP_PROXY（http://）覆盖 SOCKS5 代理
-        proxy = get_proxy(self.base_url)
-        if proxy:
-            session.trust_env = False
-            # 直接用原始 proxy —— 不要把 socks5h:// 降级成 socks5://。
-            # socks5h 让 DNS 解析走代理；在只能靠代理解析 qz.sii.edu.cn 的
-            # 环境（WSL/VPN）里降级会导致本机解析失败、登录连不上（#35）。
-            # requests（依赖 PySocks，本仓硬依赖）原生支持 socks5h://。
-            session.proxies = {"http": proxy, "https": proxy}
-
-        # 设置浏览器 User-Agent
-        headers = {
-            "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/144.0.0.0 Safari/537.36",
-            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8",
-            "Accept-Language": "en-US,en;q=0.9,zh-CN;q=0.8,zh;q=0.7",
-        }
-        session.headers.update(headers)
-
-        # Step 1: 访问启智平台，触发 OAuth 流程
         try:
-            resp = session.get(self.base_url, timeout=30, allow_redirects=True)
-        except requests.RequestException as e:
-            raise QzTransientError(f"无法连接到启智平台: {e}")
-        if resp.status_code >= 500:
-            raise QzTransientError(
-                f"启智平台/代理暂时不可用 (HTTP {resp.status_code})", resp.status_code
+            proxy = get_proxy(self.base_url)
+            if proxy:
+                session.trust_env = False
+                session.proxies = {"http": proxy, "https": proxy}
+            session.headers.update(
+                {
+                    "User-Agent": V2_BROWSER_UA,
+                    "Accept-Language": "zh-CN,zh;q=0.9",
+                    "Accept": "text/html,application/xhtml+xml,application/json",
+                }
             )
-
-        current_url = resp.url
-        current_host = urlparse(current_url).netloc
-
-        # 如果已经在启智平台且有 session cookie，说明已登录
-        if current_host == "qz.sii.edu.cn":
-            qz_cookies = {}
-            for cookie in session.cookies:
-                if "qz.sii.edu.cn" in cookie.domain:
-                    qz_cookies[cookie.name] = cookie.value
-            if self._has_session_cookie(qz_cookies):
-                cookie_str = "; ".join([f"{k}={v}" for k, v in qz_cookies.items()])
-                return cookie_str
-
-        # Step 2: 如果在 Keycloak，需要继续到 CAS
-        if "keycloak" in current_url:
-            # Keycloak 页面使用 JavaScript 渲染，CAS URL 在 kcContext 对象中
-            # 查找 providers 中的 CAS loginUrl
-            cas_url_match = re.search(
-                r'"loginUrl":\s*"([^"]*broker/cas/login[^"]*)"', resp.text
+            trace.stage = "platform / Keycloak"
+            resp = _auth_request(
+                trace, session, "GET", self.base_url, may_retry=True, timeout=30
             )
-            if cas_url_match:
-                cas_broker_url = cas_url_match.group(1)
-                # 处理转义的斜杠
-                cas_broker_url = cas_broker_url.replace("\\/", "/")
-                if not cas_broker_url.startswith("http"):
-                    # 相对 URL，需要拼接
-                    parsed = urlparse(current_url)
-                    cas_broker_url = (
-                        f"{parsed.scheme}://{parsed.netloc}{cas_broker_url}"
+            platform_host = urlparse(self.base_url).hostname
+            cookies = self._platform_cookies(session)
+            if urlparse(
+                resp.url
+            ).hostname == platform_host and self._has_session_cookie(cookies):
+                value = "; ".join(f"{k}={v}" for k, v in cookies.items())
+                if self._session_is_authenticated(session, value, username, trace):
+                    return value
+            if "keycloak" in (urlparse(resp.url).hostname or ""):
+                trace.stage = "Keycloak / CAS"
+                match = re.search(
+                    r'"loginUrl":\s*"([^"\n]*broker/cas/login[^"\n]*)"', resp.text
+                )
+                if not match:
+                    raise QzAPIError(
+                        "Keycloak 页面中未找到 CAS 登录链接", diagnostic=trace
                     )
-
-                try:
-                    resp = session.get(cas_broker_url, timeout=30, allow_redirects=True)
-                    current_url = resp.url
-                except requests.RequestException as e:
-                    raise QzTransientError(f"跳转 CAS 失败: {e}")
-            else:
-                raise QzAPIError("Keycloak 页面中未找到 CAS 登录链接")
-
-        # Step 3: 检查是否在 CAS 登录页
-        if "cas.sii.edu.cn" not in current_url:
-            raise QzAPIError(f"未能到达 CAS 登录页面，当前 URL: {current_url}")
-
-        cas_login_url = current_url
-        login_page_html = resp.text
-
-        encrypted_password = encrypt_password(password)
-
-        lt_match = re.search(r'name="lt"\s+value="([^"]+)"', login_page_html)
-        execution_match = re.search(
-            r'name="execution"\s+value="([^"]+)"', login_page_html
-        )
-
-        login_data = {
-            "username": username,
-            "password": encrypted_password,
-            "_eventId": "submit",
-            "submit": "登 录",
-            "loginType": "1",
-            "encrypted": "true",
-        }
-
-        if lt_match:
-            login_data["lt"] = lt_match.group(1)
-        if execution_match:
-            login_data["execution"] = execution_match.group(1)
-
-        # Step 5: 提交登录表单
-        login_headers = {
-            "Content-Type": "application/x-www-form-urlencoded",
-            "Origin": "https://cas.sii.edu.cn",
-            "Referer": cas_login_url,
-        }
-
-        try:
-            resp = session.post(
-                cas_login_url,
-                data=login_data,
-                headers=login_headers,
+                broker_url = urljoin(resp.url, match[1].replace("\\/", "/"))
+                resp = _auth_request(
+                    trace, session, "GET", broker_url, may_retry=True, timeout=30
+                )
+            if urlparse(resp.url).hostname != "cas.sii.edu.cn":
+                raise QzAPIError(
+                    "未到达 CAS 登录页面", resp.status_code, diagnostic=trace
+                )
+            page = CasPage(resp.text)
+            fields = page.password_form["inputs"]
+            encrypted = encrypt_password(password)
+            trace.remember(encrypted)
+            data = {
+                "username": username,
+                "password": encrypted,
+                "_eventId": "submit",
+                "submit": "登 录",
+                "loginType": "1",
+                "encrypted": "true",
+            }
+            for name in ("lt", "execution"):
+                if name in fields:
+                    data[name] = fields[name]
+                    trace.remember(fields[name])
+            trace.stage = "CAS password submission"
+            trace.password_submitted = True
+            resp = _auth_request(
+                trace,
+                session,
+                "POST",
+                resp.url,
+                data=data,
+                headers={
+                    "Content-Type": "application/x-www-form-urlencoded",
+                    "Origin": "https://cas.sii.edu.cn",
+                    "Referer": resp.url,
+                },
                 timeout=30,
-                allow_redirects=True,
             )
-        except requests.RequestException as e:
-            raise QzTransientError(f"登录请求失败: {e}")
+            if (
+                urlparse(resp.url).hostname == "cas.sii.edu.cn"
+                and "login" in urlparse(resp.url).path
+            ):
+                raise QzAPIError(
+                    _describe_cas_login_failure(resp.text),
+                    resp.status_code,
+                    diagnostic=trace,
+                )
+            if resp.status_code >= 400:
+                raise QzAPIError(
+                    "认证服务返回失败响应", resp.status_code, diagnostic=trace
+                )
+            cookies = self._platform_cookies(session)
+            if not self._has_session_cookie(cookies):
+                raise QzAPIError("认证流程未取得平台 session cookie", diagnostic=trace)
+            value = "; ".join(f"{k}={v}" for k, v in cookies.items())
+            if not self._session_is_authenticated(session, value, username, trace):
+                raise QzAPIError("认证后会话校验返回 HTTP 401", 401, diagnostic=trace)
+            return value
+        finally:
+            # Minimal injected sessions in existing callers may not own a connection pool.
+            close = getattr(session, "close", None)
+            if close is not None:
+                close()
 
-        current_url = resp.url
-
-        # Step 6: 检查登录结果
-        if "cas.sii.edu.cn" in current_url and "login" in current_url:
-            raise QzAPIError(_describe_cas_login_failure(resp.text))
-
-        # Step 7: 确保完成所有重定向回到启智平台
-        current_host = urlparse(current_url).netloc
-        if current_host != "qz.sii.edu.cn":
-            # 可能还需要额外访问启智平台来完成 session 设置
-            try:
-                resp = session.get(self.base_url, timeout=30, allow_redirects=True)
-            except requests.RequestException as e:
-                raise QzTransientError(f"获取 session 失败: {e}")
-
-        # 收集所有 qz.sii.edu.cn 域的 cookies
-        all_cookies = {}
-        for cookie in session.cookies:
-            # 检查是否是 qz.sii.edu.cn 的 cookie
-            if "qz.sii.edu.cn" in cookie.domain:
-                all_cookies[cookie.name] = cookie.value
-
-        if not all_cookies or not self._has_session_cookie(all_cookies):
-            try:
-                resp = session.get(self.base_url, timeout=30, allow_redirects=True)
-                for cookie in session.cookies:
-                    if "qz.sii.edu.cn" in cookie.domain:
-                        all_cookies[cookie.name] = cookie.value
-            except requests.RequestException as exc:
-                # 只兜网络问题。以前这里是 except Exception —— 属性名写错之类的
-                # 真 bug 会被吞成「拿不到 session cookie」，把人往登录态失效上引。
-                swallowed("登录/预热会话", exc)
-
-        if not all_cookies or not self._has_session_cookie(all_cookies):
-            raise QzAPIError("登录成功但未获取到 session cookie")
-
-        # 构建 cookie 字符串（确保 session 和 session_2 都包含）
-        cookie_str = "; ".join([f"{k}={v}" for k, v in all_cookies.items()])
-
-        return cookie_str
+    def _platform_cookies(self, session):
+        host = urlparse(self.base_url).hostname
+        return {
+            c.name: c.value for c in session.cookies if c.domain.lstrip(".") == host
+        }
 
 
 # 全局 API 实例（延迟初始化）
@@ -3444,6 +3728,15 @@ _api_instance: Optional[QzAPI] = None
 def get_api() -> QzAPI:
     """获取全局 API 实例"""
     global _api_instance
-    if _api_instance is None:
+    from .config import get_qz_config_dir
+
+    if (
+        _api_instance is None
+        or _api_instance.auth_mode != get_auth_mode()
+        or (
+            _api_instance.auth_mode == "qz"
+            and _api_instance._official_auth.directory != get_qz_config_dir()
+        )
+    ):
         _api_instance = QzAPI()
     return _api_instance

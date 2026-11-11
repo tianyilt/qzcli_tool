@@ -86,7 +86,7 @@ _PREDEF = [
 def _client(predef=_PREDEF):
     import json
 
-    api = QzAPI(username="u", password="p")
+    api = QzAPI(username="u", password="p", auth_mode="legacy")
     api._request_v2 = lambda service, action, body, **kw: (
         {"schedule_config": {"predef_train_spec": json.dumps(predef)}}
         if action == "GetScheduleConfig"

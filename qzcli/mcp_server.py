@@ -114,6 +114,14 @@ def _cookie_preview(cookie: str) -> str:
 
 
 def _require_cookie() -> tuple[str, dict[str, Any]]:
+    if getattr(get_api(), "auth_mode", None) == "qz":
+        from .config import load_config
+
+        get_api().ensure_authenticated(probe=False)
+        return "", {
+            "auth_mode": "qz",
+            "workspace_id": load_config().get("default_workspace_id", ""),
+        }
     cookie_data = get_cookie()
     if not cookie_data or not cookie_data.get("cookie"):
         raise RuntimeError(
@@ -157,7 +165,7 @@ def _resolve_workspace_refs(
         cached = list_cached_workspaces()
         if cached:
             return [{"id": item["id"], "name": item.get("name", "")} for item in cached]
-        if not cookie:
+        if cookie is None:
             raise RuntimeError(
                 "没有已缓存的工作空间，且当前没有可用 cookie 用于远端发现。"
             )
@@ -178,7 +186,7 @@ def _resolve_workspace_refs(
                 }
             ]
 
-        if not cookie:
+        if cookie is None:
             cookie, _ = _require_cookie()
         remote_workspace = _match_workspace_from_remote(workspace, cookie)
         if remote_workspace:
@@ -436,11 +444,21 @@ def _availability_result(
 
 
 @server.tool(
-    description="通过 CAS 登录启智平台并保存 cookie。未传参数时自动读取环境变量 QZCLI_USERNAME/QZCLI_PASSWORD 或 ~/.qzcli/config.json。"
+    description="检查官方 qz 认证；需网页登录时在终端运行 qzcli login。显式 legacy 模式支持原 CAS 密码登录。"
 )
 def qz_auth_login(
     username: str = "", password: str = "", workspace_id: str = ""
 ) -> dict[str, Any]:
+    api = get_api()
+    if getattr(api, "auth_mode", None) == "qz":
+        if username or password:
+            raise QzAPIError("密码登录需要显式设置 QZCLI_AUTH_MODE=legacy")
+        # MCP must not block waiting for a device code hidden in server stdout.
+        # qzcli login prints the official URL/code in an interactive terminal.
+        return _result(
+            api.auth_status(check=True),
+            message="官方认证有效；需网页登录时请在终端运行 qzcli login。",
+        )
     # 在做任何事之前先记下当前 cookie，作为下面 _relogin 的去重基准（原因见那里）
     baseline_cookie = (get_cookie() or {}).get("cookie")
     if not username or not password:
@@ -498,6 +516,8 @@ def qz_auth_login(
 def qz_set_cookie(
     cookie: str, workspace_id: str = "", test: bool = True
 ) -> dict[str, Any]:
+    if getattr(get_api(), "auth_mode", None) == "qz":
+        raise QzAPIError("手动 Cookie 需要显式设置 QZCLI_AUTH_MODE=legacy")
     total = None
     if test and workspace_id:
         total = (
@@ -1431,12 +1451,7 @@ def qz_create_hpc_job(
     store = get_store()
     warnings: list[str] = []
 
-    cookie_data = get_cookie()
-    if not cookie_data:
-        raise RuntimeError("未找到 cookie，请先调用 qz_auth_login。")
-    cookie = cookie_data.get("cookie", "")
-    if not cookie:
-        raise RuntimeError("cookie 为空，请先调用 qz_auth_login。")
+    cookie, _ = _require_cookie()
 
     # Resolve workspace
     if workspace.startswith("ws-"):

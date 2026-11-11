@@ -68,7 +68,7 @@ _V1_ITEMS = _V2_ITEMS + [
 
 
 def _api():
-    return QzAPI(username="u", password="p")
+    return QzAPI(username="u", password="p", auth_mode="legacy")
 
 
 class ProjectListV2Tests(unittest.TestCase):

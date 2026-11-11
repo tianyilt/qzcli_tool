@@ -105,8 +105,8 @@ def load_df(ws_id, ws_name):
     ``{计算组: 空闲GPU数}``（= 节点容量总和 − 已用），用于叠加灰块。
     """
     api = get_api()
-    cookie_data = get_cookie()
-    if not cookie_data or not cookie_data.get("cookie"):
+    cookie_data = cli._auth_state()
+    if not cli._has_auth_context(cookie_data):
         raise QzAPIError("未设置 cookie，请先运行: qzcli login")
     cookie = cookie_data["cookie"]
     node_map = cli.build_node_to_lcg_map(api, ws_id, cookie)
@@ -150,8 +150,8 @@ def _frag_one(ws_id):
     """单个 workspace 的节点碎卡聚合(复用与 load_df 相同的数据源)。无 streamlit,
     可在线程里调。"""
     api = get_api()
-    cookie_data = get_cookie()
-    if not cookie_data or not cookie_data.get("cookie"):
+    cookie_data = cli._auth_state()
+    if not cli._has_auth_context(cookie_data):
         raise QzAPIError("未设置 cookie，请先运行: qzcli login")
     cookie = cookie_data["cookie"]
     node_map = cli.build_node_to_lcg_map(api, ws_id, cookie)

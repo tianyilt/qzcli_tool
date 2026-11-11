@@ -130,7 +130,7 @@ def _capture_login_sessions(proxy_value):
         def post(self, *a, **kw):
             raise requests.exceptions.RequestException("stop here")
 
-    api = api_mod.QzAPI(username="u", password="p")
+    api = api_mod.QzAPI(username="u", password="p", auth_mode="legacy")
     with patch.object(api_mod.requests, "Session", _Probe), patch.object(
         api_mod, "get_proxy", return_value=proxy_value
     ), patch.object(api_mod._time, "sleep", lambda *_: None):
@@ -246,7 +246,7 @@ class RateLimitMustNotDoubleQpsTests(unittest.TestCase):
     """
 
     def test_rate_limit_is_not_swallowed_into_a_v1_retry(self):
-        api = api_mod.QzAPI(username="u", password="p")
+        api = api_mod.QzAPI(username="u", password="p", auth_mode="legacy")
         v1_calls = {"n": 0}
 
         def _count_v1(*a, **kw):
@@ -269,7 +269,7 @@ class RateLimitMustNotDoubleQpsTests(unittest.TestCase):
 
     def test_other_errors_still_fall_back_to_v1(self):
         """对照组：非限流的错误仍要保留 v1 兜底，别把这条路修死了。"""
-        api = api_mod.QzAPI(username="u", password="p")
+        api = api_mod.QzAPI(username="u", password="p", auth_mode="legacy")
         with sandbox_home(
             cookie='{"cookie": "inspire-session=ok", "workspace_id": "ws-1"}'
         ):

@@ -34,6 +34,7 @@ from support.sandbox import sandbox_home  # noqa: E402
 from qzcli import mcp_server  # noqa: E402
 
 
+@patch.dict(os.environ, {"QZCLI_AUTH_MODE": "legacy"})
 class RequireCookieTests(unittest.TestCase):
     def test_missing_cookie_raises_actionable_error(self):
         """没有 cookie 时要说清楚**怎么办**，而不是只说"失败了"。"""
@@ -59,6 +60,7 @@ class RequireCookieTests(unittest.TestCase):
         self.assertEqual(data.get("workspace_id"), "ws-1")
 
 
+@patch.dict(os.environ, {"QZCLI_AUTH_MODE": "legacy"})
 class WorkspaceResolutionTests(unittest.TestCase):
     """`_resolve_workspace_refs` —— 所有需要工作空间的 tool 都从这里进。"""
 
@@ -138,6 +140,7 @@ class CollectingDisplayTests(unittest.TestCase):
             self.assertTrue(callable(getattr(display, name, None)), f"缺少 {name}")
 
 
+@patch.dict(os.environ, {"QZCLI_AUTH_MODE": "legacy"})
 class AuthLoginTests(unittest.TestCase):
     """`qz_auth_login` 必须和 CLI 走同一套并发保护（曾是第三处裸奔）。"""
 

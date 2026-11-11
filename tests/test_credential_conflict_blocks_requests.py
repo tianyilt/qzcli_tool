@@ -103,6 +103,7 @@ class ReloginMustNotSendOnConflictTests(unittest.TestCase):
     def _api_in_conflict(self):
         """造一个「两处密码不一致」的环境，并把所有落盘/网络副作用掐掉。"""
         api = api_mod.QzAPI.__new__(api_mod.QzAPI)
+        api.auth_mode = "legacy"
         api._username = "fake-user"
         api._password = _PW_A
         import threading
@@ -129,13 +130,14 @@ class ReloginMustNotSendOnConflictTests(unittest.TestCase):
         ), mock.patch.object(
             api_mod, "_relogin_file_lock"
         ):
-            out = api._relogin(failing_cookie="stale-fake-cookie")
+            with self.assertRaisesRegex(api_mod.QzAPIError, "已阻止"):
+                api._relogin(failing_cookie="stale-fake-cookie")
 
         self.assertEqual(
             [], called,
             "冲突时自动重登仍然发了认证请求 —— 这正是把账号越锁越死的那条路径",
         )
-        self.assertIsNone(out, "挡下来时不该返回 cookie")
+
 
     def test_relogin_conflict_is_written_to_ops_log(self):
         api = self._api_in_conflict()
@@ -154,7 +156,8 @@ class ReloginMustNotSendOnConflictTests(unittest.TestCase):
         ), mock.patch.object(
             api_mod, "_relogin_file_lock"
         ):
-            api._relogin(failing_cookie="stale-fake-cookie")
+            with self.assertRaisesRegex(api_mod.QzAPIError, "已阻止"):
+                api._relogin(failing_cookie="stale-fake-cookie")
 
         rows = [r for r in self._ops_rows() if r.get("op") == "relogin"]
         self.assertTrue(rows, "自动重登被挡下来却没留痕 —— 排查时会看成「本机没登录过」")
@@ -181,7 +184,8 @@ class ReloginMustNotSendOnConflictTests(unittest.TestCase):
         ), mock.patch.object(
             api_mod, "_relogin_file_lock"
         ):
-            api._relogin(failing_cookie="stale-fake-cookie")
+            with self.assertRaisesRegex(api_mod.QzAPIError, "fake 登录失败"):
+                api._relogin(failing_cookie="stale-fake-cookie")
 
         rows = [r for r in self._ops_rows() if r.get("op") == "relogin"]
         self.assertTrue(rows, "自动重登失败没留痕")
@@ -219,6 +223,7 @@ class TokenPathMustNotSendOnConflictTests(unittest.TestCase):
 
     def test_get_token_raises_before_posting(self):
         api = api_mod.QzAPI.__new__(api_mod.QzAPI)
+        api.auth_mode = "legacy"
         api._username = "fake-user"
         api._password = _PW_A
         api._token = ""

@@ -65,7 +65,7 @@ class ResolvePodNamesTests(unittest.TestCase):
     def setUp(self):
         with patch("qzcli.api.get_api_base_url", return_value="https://qz.test"), \
              patch("qzcli.api.get_credentials", return_value=("u", "p")):
-            self.api = QzAPI("u", "p")
+            self.api = QzAPI("u", "p", auth_mode="legacy")
             self.api._token = "tok"
 
     def test_platform_names_win_over_convention(self):
@@ -138,7 +138,8 @@ class RequestV2HeadersTests(unittest.TestCase):
     def setUp(self):
         with patch("qzcli.api.get_api_base_url", return_value="https://qz.test"), \
              patch("qzcli.api.get_credentials", return_value=("u", "p")):
-            self.api = QzAPI("u", "p")
+            self.api = QzAPI("u", "p", auth_mode="legacy")
+        self.api._auto_relogin = False
 
     def test_post_body_and_headers(self):
         fake_resp = MagicMock()

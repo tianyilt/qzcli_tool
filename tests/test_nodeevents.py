@@ -140,6 +140,7 @@ class ApiPaginationTests(unittest.TestCase):
         from qzcli.api import QzAPI
 
         api = QzAPI.__new__(QzAPI)
+        api.auth_mode = "legacy"
         calls = []
 
         def fake(service, action, body, cookie=""):
@@ -171,6 +172,7 @@ class ApiPaginationTests(unittest.TestCase):
         from qzcli.api import QzAPI
 
         api = QzAPI.__new__(QzAPI)
+        api.auth_mode = "legacy"
         asked = []
 
         def fake(service, action, body, cookie=""):
@@ -185,6 +187,7 @@ class ApiPaginationTests(unittest.TestCase):
         from qzcli.api import QzAPI, QzAPIError
 
         api = QzAPI.__new__(QzAPI)
+        api.auth_mode = "legacy"
 
         def fake(service, action, body, cookie=""):
             if body["filter"]["node_names"] == ["b"]:
@@ -199,6 +202,7 @@ class ApiPaginationTests(unittest.TestCase):
         from qzcli.api import QzAPI
 
         api = QzAPI.__new__(QzAPI)
+        api.auth_mode = "legacy"
         api._request_v2 = mock.Mock(side_effect=AssertionError("不该发请求"))
         self.assertEqual(api.get_node_events([]), [])
 

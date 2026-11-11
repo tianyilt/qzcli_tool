@@ -98,7 +98,7 @@ class ReloginTests(unittest.TestCase):
         self.addCleanup(qz_api._clear_relogin_failure)
 
     def test_relogin_logs_in_and_persists(self):
-        api = QzAPI(username="u", password="p")
+        api = QzAPI(username="u", password="p", auth_mode="legacy")
         with patch.object(
             api, "login_with_cas", return_value="fresh"
         ) as mock_login, patch.object(
@@ -112,14 +112,14 @@ class ReloginTests(unittest.TestCase):
         mock_save.assert_called_once_with("fresh", "ws-1")
 
     def test_relogin_without_credentials_returns_none(self):
-        api = QzAPI(username="", password="")
+        api = QzAPI(username="", password="", auth_mode="legacy")
         api._username, api._password = "", ""
         with patch.object(api, "login_with_cas") as mock_login:
             self.assertIsNone(api._relogin())
         mock_login.assert_not_called()
 
-    def test_relogin_returns_none_on_login_failure(self):
-        api = QzAPI(username="u", password="p")
+    def test_relogin_preserves_login_failure(self):
+        api = QzAPI(username="u", password="p", auth_mode="legacy")
         with patch.object(
             api, "login_with_cas", side_effect=QzAPIError("nope")
         ), patch.object(
@@ -127,14 +127,15 @@ class ReloginTests(unittest.TestCase):
         ), patch.object(
             qz_api, "save_cookie"
         ):
-            self.assertIsNone(api._relogin())
+            with self.assertRaisesRegex(QzAPIError, "nope"):
+                api._relogin()
 
 
 class LoginRetryTests(unittest.TestCase):
     """`login_with_cas`: retry transient failures, propagate permanent ones."""
 
     def setUp(self):
-        self.api = QzAPI(username="u", password="p")
+        self.api = QzAPI(username="u", password="p", auth_mode="legacy")
 
     def test_retries_transient_then_succeeds(self):
         attempts = [QzTransientError("ssl eof"), QzTransientError("503"), "cookie"]
@@ -247,6 +248,7 @@ class CrossProcessReloginLockTests(unittest.TestCase):
         from qzcli import api as _api
 
         a = _api.QzAPI.__new__(_api.QzAPI)
+        a.auth_mode = "legacy"
         a.base_url = "https://qz.example"
         a._username, a._password = "u", "p"
         a._token = None
@@ -308,11 +310,12 @@ class CrossProcessReloginLockTests(unittest.TestCase):
 
         with patch.object(_api, "_relogin_file_lock", lock), patch.object(
             _api, "get_cookie", side_effect=lambda: next(reads)
-        ), patch.object(_api, "save_cookie"):
+        ), patch.object(_api, "save_cookie"), patch.object(_api.QzAPI, "verify_cookie", return_value=True) as verified:
             got = self._client(fake_login)._relogin()
 
         self.assertEqual(got, "inspire-session=FROM-OTHER-PROC")
         self.assertEqual(calls, [], "别的进程已经登好了，不该再撞一次 CAS")
+        verified.assert_called_once_with("inspire-session=FROM-OTHER-PROC", "u")
 
     def test_lock_helper_yields_and_releases(self):
         from qzcli.api import _relogin_file_lock
