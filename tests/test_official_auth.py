@@ -542,6 +542,39 @@ class OfficialApiTests(unittest.TestCase):
 
 
 class OfficialInitializationTests(unittest.TestCase):
+    def test_init_handles_cached_reauthorization_but_preserves_network_failures(self):
+        from qzcli import cli
+
+        for action_required in (True, False):
+            with self.subTest(action_required=action_required):
+                client = Mock(auth_mode="qz")
+                client._official_auth.directory = Path("/fake/official")
+                client._official_auth.token.side_effect = OfficialAuthError(
+                    "ORIGINAL_FAKE_INIT_FAILURE", action_required=action_required
+                )
+                client.auth_status.return_value = {"user": {"id": "fake-user"}}
+                with (
+                    patch.object(cli, "get_api", return_value=client),
+                    patch.object(cli, "get_display", return_value=Mock()),
+                    patch.object(
+                        config, "load_config", return_value={"preserved": "fake"}
+                    ),
+                    patch.object(config, "save_config") as save,
+                ):
+                    if action_required:
+                        self.assertEqual(
+                            cli.cmd_init(Mock(username="", password="")), 0
+                        )
+                        client._official_auth.login.assert_called_once_with()
+                        self.assertEqual(save.call_args.args[0]["preserved"], "fake")
+                    else:
+                        with self.assertRaisesRegex(
+                            OfficialAuthError, "ORIGINAL_FAKE_INIT_FAILURE"
+                        ):
+                            cli.cmd_init(Mock(username="", password=""))
+                        client._official_auth.login.assert_not_called()
+                        save.assert_not_called()
+
     def test_dashboard_propagates_selected_provider_to_child(self):
         import argparse
         from qzcli import cli

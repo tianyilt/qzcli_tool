@@ -424,14 +424,16 @@ def cmd_init(args):
         if args.username or args.password:
             raise QzAPIError("用户名和密码初始化请显式使用 --auth-mode legacy")
         from .config import load_config, save_config
-        from .qz_auth import LoginRequired
+        from .qz_auth import OfficialAuthError
 
         api._official_auth._binary()
         display.print(f"官方配置目录: {api._official_auth.directory}")
         display.print(f"业务服务地址: {api.base_url}")
         try:
             api._official_auth.token()
-        except LoginRequired:
+        except OfficialAuthError as exc:
+            if not exc.action_required:
+                raise
             api._official_auth.login()
         status = api.auth_status(check=True)
         config = load_config()
