@@ -1,5 +1,39 @@
 # Changelog
 
+## v0.5.0 - 2026-11-11
+
+**默认使用官方 qz 网页设备授权，日常命令通过 refresh token 自动续期。**
+
+这是默认认证方式的变更。先安装平台官方 Go `qz`；已有 `qz login` 授权可直接运行
+`qzcli init` 和 `qzcli auth status --check` 复用。首次登录或续期凭据失效时才需要
+网页授权。原密码、CAS、Cookie 与旧 token 方式保留为 `--auth-mode legacy`，
+不会因官方认证失败而自动切回密码登录。
+
+- CLI、MCP、看板、Notebook exec 和 worker WebSocket 共用认证层。业务 API
+  仍由 Python 直接调用；官方 qz 负责登录、刷新以及 access/refresh token 的保存。
+- 分别处理两枚 token 的缺失、到期和未知状态。access token 有效时直接使用；
+  到期后协调调用官方 qz 续期，回读两枚凭据。401 至多恢复一次；权限拒绝、限流
+  和网络失败保留完整脱敏响应，不误判为需要重新登录。
+- `QZCLI_HOME` 管理 qzcli 状态，`QZ_CLI_CONFIG_DIR` 或 `--qz-config-dir`
+  选择官方凭据目录。每台主机独立授权，不跨机器复制刷新链。
+- 修正 Bearer 请求的网关来源头、任务列表 scope/用户筛选及分页、普通用户规格
+  发现，以及 HTTP/WebSocket 的代理一致性。HPC 创建保留原 payload，改用
+  `hpc.CreateJobConsole`。
+- legacy 保留认证来源诊断、密码冲突保护、完整错误链和 CAS 验证码策略提示。
+  错误信息不会再被统一替换成“登录频繁”。
+- 增加 `cryptography`、`PyYAML`、`python-socks` 依赖，并补齐 Notebook/worker
+  所需的 `websocket-client` 安装声明；原 CAS RSA 实现保留。
+
+验收包括完整单元测试、macOS 与 Linux 开发机的原生命令、真实自然到期及独立
+官方进程并发续期、exec 输出/退出码/重连、MCP stdio、看板和创建/停止回查。
+维护者已完成 macOS 复验并批准发布。
+
+发布例外保留在 PR 与验收记录：旧 v1 对照接口返回 404，旧全量只读冒烟未全绿；
+项目提交配额曾拒绝本机 batch/交互创建。它们不记为通过，也不因本次发布而放宽
+现有测试断言。空间模糊匹配的歧义、浏览器/代理网络问题仍需按实际响应判断。
+
+详见 [认证迁移 PR #85](https://github.com/tianyilt/qzcli_tool/pull/85)。
+
 ## v0.4.18 - 2026-09-21
 
 **主题：规格和计算组对不上时，直接告诉用户该填哪条 spec。**

@@ -4,7 +4,6 @@ qzcli - 启智平台任务管理 CLI
 """
 
 import argparse
-import contextlib
 import re
 import shlex
 import sys
@@ -9059,7 +9058,7 @@ def cmd_exec_attach(args):
 
 
 def cmd_login(args):
-    """通过 CAS 登录获取 cookie"""
+    """默认通过官方 qz 网页授权；显式 legacy 使用 CAS 密码登录。"""
     import getpass
 
     display = get_display()
@@ -9462,7 +9461,7 @@ def main():
 
     # cookie 命令
     cookie_parser = subparsers.add_parser(
-        "cookie", help="设置浏览器 cookie（用于访问内部 API）"
+        "cookie", help="legacy：设置浏览器 cookie"
     )
     cookie_parser.add_argument("cookie", nargs="?", help="浏览器 cookie 字符串")
     cookie_parser.add_argument("--file", "-f", help="从文件读取 cookie")
@@ -9475,16 +9474,20 @@ def main():
 
     # login 命令
     login_parser = subparsers.add_parser(
-        "login", help="通过 CAS 统一认证登录获取 cookie"
+        "login",
+        help="官方 qz 网页授权（legacy 使用 CAS 密码登录）",
+        description="默认通过官方 qz 进行网页设备授权。已有可用凭据时，"
+        "运行 auth status --check 验证；日常请求会自动续期，无需反复 login。",
+        epilog="密码参数仅用于显式 legacy 模式：qzcli --auth-mode legacy login。",
     )
-    login_parser.add_argument("--username", "-u", help="学工号")
+    login_parser.add_argument("--username", "-u", help="legacy：学工号")
     login_parser.add_argument(
-        "--password", "-p", help="密码（含特殊字符时建议用单引号或 --password-stdin）"
+        "--password", "-p", help="legacy：密码（含特殊字符时建议用单引号或 --password-stdin）"
     )
     login_parser.add_argument(
         "--password-stdin",
         action="store_true",
-        help="从 stdin 读取密码（适合脚本: echo 'pass' | qzcli login -u user --password-stdin）",
+        help="legacy：从 stdin 读取密码（通过 qzcli --auth-mode legacy login 使用）",
     )
     login_parser.add_argument(
         "--source",
