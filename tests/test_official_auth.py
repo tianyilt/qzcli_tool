@@ -345,6 +345,25 @@ class OfficialApiTests(unittest.TestCase):
         self.assertIn("FULL_BODY_END", text)
         self.assertFalse(has_auth_diagnostic(ctx.exception))
 
+    def test_rate_limit_keeps_complete_response_without_authentication_refresh(self):
+        response = api._CurlResponse(
+            429,
+            "<html>ORIGINAL_429_END</html>",
+            headers={"X-Trace-ID": "fake-rate-trace", "Retry-After": "12"},
+        )
+        with (
+            patch.object(api, "_RATE_LIMIT_MAX_TRIES", 1),
+            patch.object(api, "_curl_post", return_value=response) as request,
+        ):
+            with self.assertRaises(api.QzRateLimitError) as ctx:
+                self.client.get_user_detail()
+        self.assertEqual(request.call_count, 1)
+        self.provider.token.assert_called_once_with()
+        self.assertEqual(ctx.exception.retry_after, 12)
+        self.assertIn("fake-rate-trace", str(ctx.exception))
+        self.assertIn("ORIGINAL_429_END", str(ctx.exception))
+        self.assertFalse(has_auth_diagnostic(ctx.exception))
+
     def test_transport_error_does_not_refresh_or_replay_create(self):
         with patch.object(
             api, "_curl_post", side_effect=OSError("TLS EOF ORIGINAL_END")

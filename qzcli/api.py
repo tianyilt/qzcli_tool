@@ -103,8 +103,8 @@ class QzRateLimitError(QzAPIError):
     建议等待秒数（``Retry-After`` 头），没给就按指数退避。
     """
 
-    def __init__(self, message, code=429, retry_after=None):
-        super().__init__(message, code)
+    def __init__(self, message, code=429, retry_after=None, *, diagnostic=None):
+        super().__init__(message, code, diagnostic=diagnostic)
         self.retry_after = retry_after
 
 
@@ -1226,6 +1226,7 @@ class QzAPI:
                 raise QzRateLimitError(
                     "触发平台限流（HTTP 429）",
                     retry_after=_parse_retry_after(response.headers.get("Retry-After")),
+                    diagnostic=trace,
                 )
             try:
                 data = response.json()
