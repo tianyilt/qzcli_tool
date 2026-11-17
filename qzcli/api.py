@@ -745,7 +745,7 @@ class QzAPI:
             self._official_auth = OfficialAuth(qz_config_dir)
             self.base_url = self._official_auth.server
             self._username, self._password = None, None
-            self._credential_sources = "凭据来源：官方 qz"
+            self._credential_sources = "凭据来源：官方 OAuth（Python 直连）"
             self._credential_identity = (None, None)
             self._token = None
             self._auto_relogin = False

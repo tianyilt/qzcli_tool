@@ -10,7 +10,7 @@ from html.parser import HTMLParser
 from urllib.parse import quote, quote_plus, unquote
 
 
-_SECRET_NAME = r"(?:cookie|authorization|password|passwd|token|access_token|refresh_token|id_token|ticket|code|state|session_state|session_?code|auth_?session_?id|tab_?id|execution|lt|nonce|csrf\w*)"
+_SECRET_NAME = r"(?:cookie|authorization|password|passwd|token|access_token|refresh_token|id_token|device_code|user_code|ticket|code|state|session_state|session_?code|auth_?session_?id|tab_?id|execution|lt|nonce|csrf\w*)"
 _ATTR = re.compile(r"""([\w:-]+)\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s"'=<>`]+))""")
 
 

@@ -7,7 +7,7 @@ from setuptools import find_packages, setup
 
 setup(
     name="qzcli",
-    version="0.5.0",
+    version="0.6.0.dev0",
     description="启智平台任务管理 CLI 工具",
     author="openveo3",
     packages=find_packages(),

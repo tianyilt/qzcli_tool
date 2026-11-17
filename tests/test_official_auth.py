@@ -52,168 +52,171 @@ class OfficialAuthTests(unittest.TestCase):
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
         self.root = Path(self.tmp.name).resolve() / "official"
-        self.env = patch.dict(os.environ, {}, clear=True)
-        self.env.start()
-        self.addCleanup(self.env.stop)
-        self.binary = patch("qzcli.qz_auth.shutil.which", return_value="/fake/bin/qz")
-        self.binary.start()
-        self.addCleanup(self.binary.stop)
-        self.runner = Mock(
-            return_value=subprocess.CompletedProcess(
-                [], 0, '{"Result":{"id":"fake-user"}}', ""
-            )
+        env = patch.dict(os.environ, {}, clear=True)
+        env.start()
+        self.addCleanup(env.stop)
+        self.oauth = Mock()
+        self.pair = self.make_pair()
+        self.oauth.refresh.return_value = self.pair
+        self.oauth.login.return_value = self.pair
+
+    def make_pair(self, lifetime=3600):
+        from qzcli.oauth import TokenPair
+
+        return TokenPair(
+            fake_token(NOW + lifetime, "new-access"),
+            fake_token(NOW + 7200, "new-refresh"),
+            NOW + lifetime,
+            NOW + 7200,
         )
 
     def auth(self):
-        return OfficialAuth(self.root, now=lambda: NOW, runner=self.runner)
+        return OfficialAuth(self.root, now=lambda: NOW, oauth=self.oauth)
 
-    def test_access_valid_with_any_refresh_state_needs_no_qz(self):
+    def test_access_valid_with_any_refresh_state_needs_no_network(self):
         for refresh in [
             "",
             fake_token(NOW - 1),
             fake_token(NOW + 7200),
-            "fake-opaque-refresh",
+            "opaque-refresh",
         ]:
-            with self.subTest(refresh_state=Token.parse(refresh).status(NOW)["state"]):
+            with self.subTest(refresh=bool(refresh)):
                 access = fake_token(NOW + 3600)
                 write_store(self.root, access, refresh)
                 before = (self.root / "credentials.enc").read_bytes()
                 self.assertEqual(self.auth().token(), access)
                 self.assertEqual((self.root / "credentials.enc").read_bytes(), before)
-        self.runner.assert_not_called()
+        self.oauth.refresh.assert_not_called()
+        self.oauth.login.assert_not_called()
 
-    def test_missing_or_expired_access_and_unusable_refresh_require_login(self):
+    def test_unusable_refresh_requires_login_without_network(self):
         for access in ["", fake_token(NOW - 1)]:
             for refresh in ["", fake_token(NOW - 1)]:
                 write_store(self.root, access, refresh)
-                with self.assertRaises(LoginRequired):
+                with self.assertRaises(LoginRequired) as ctx:
                     self.auth().token()
-        self.runner.assert_not_called()
+                self.assertIn(str(self.root), str(ctx.exception))
+                self.assertIn("到期" if refresh else "缺失", str(ctx.exception))
+        self.oauth.refresh.assert_not_called()
 
-    def test_missing_directory_requires_login_without_creating_it(self):
+    def test_missing_directory_does_not_create_state(self):
         with self.assertRaises(LoginRequired):
             self.auth().token()
         self.assertFalse(self.root.exists())
 
-    def test_expired_pair_rotates_using_official_probe_and_rereads(self):
-        write_store(self.root, fake_token(NOW - 1), fake_token(NOW + 7200))
-        access, refresh = (
-            fake_token(NOW + 3600, "new-access"),
-            fake_token(NOW + 7200, "new-refresh"),
-        )
-        self.runner.side_effect = lambda *a, **kw: (
-            write_store(self.root, access, refresh)
-            or subprocess.CompletedProcess([], 0, '{"Result":{"id":"fake-user"}}', "")
-        )
-        self.assertEqual(self.auth().token(), access)
-        self.assertEqual(
-            config.read_qz_credentials(self.root)["refresh_token"], refresh
-        )
-        command = self.runner.call_args.args[0]
-        self.assertEqual(command[-2:], ["user", "GetUserDetail"])
-        self.assertEqual(
-            self.runner.call_args.kwargs["env"]["QZ_CLI_CONFIG_DIR"], str(self.root)
-        )
-        self.assertEqual(self.runner.call_count, 1)
+    def test_expired_access_rotates_persists_and_next_provider_reuses(self):
+        rt = fake_token(NOW + 7200)
+        write_store(self.root, fake_token(NOW - 1), rt)
+        key = (self.root / ".encryption_key").read_bytes()
+        self.assertEqual(self.auth().token(), self.pair.access)
+        values = config.read_qz_credentials(self.root)
+        self.assertEqual(values["refresh_token"], self.pair.refresh)
+        self.assertEqual(values["access_expires_at"], self.pair.access_expires_at)
+        self.assertEqual((self.root / ".encryption_key").read_bytes(), key)
+        self.assertEqual(self.auth().token(), self.pair.access)
+        self.oauth.refresh.assert_called_once_with(rt)
+        self.assertEqual((self.root / "credentials.enc").stat().st_mode & 0o777, 0o600)
 
-    def test_unknown_expiration_is_not_expired(self):
+    def test_unknown_expiration_and_opaque_lifetime_metadata(self):
         for value in [
-            "fake-opaque",
+            "opaque",
             fake_token("unknown"),
             fake_token(float("inf")),
             fake_token(-1),
             fake_token(True),
         ]:
             self.assertEqual(Token.parse(value).status(NOW)["state"], "unknown")
-        write_store(self.root, "fake-opaque-access", "")
-        self.assertEqual(self.auth().token(), "fake-opaque-access")
-        self.runner.assert_not_called()
+        config.save_qz_credentials(
+            self.root, {"token": "opaque-access", "access_expires_at": NOW + 60}
+        )
+        self.assertEqual(self.auth().token(), "opaque-access")
+        config.save_qz_credentials(
+            self.root, {"token": "opaque-access", "access_expires_at": NOW - 1}
+        )
+        with self.assertRaises(LoginRequired):
+            self.auth().token()
+        self.assertTrue(Token.parse(fake_token(NOW - 1), NOW + 60).expired(NOW))
 
-    def test_401_reuses_external_update_before_touching_refresh_chain(self):
-        old, new = fake_token(NOW + 100), fake_token(NOW + 100, "external-new")
-        write_store(self.root, new, fake_token(NOW + 7200))
-        self.assertEqual(self.auth().token(force_refresh=True, failing_token=old), new)
-        self.runner.assert_not_called()
-
-    def test_401_reuses_updated_access_even_without_refresh(self):
-        new = fake_token(NOW + 3600, "external-new")
+    def test_401_reuses_external_update_even_without_refresh(self):
+        new = fake_token(NOW + 3600, "external")
         write_store(self.root, new, "")
         self.assertEqual(
-            self.auth().token(force_refresh=True, failing_token="fake-old"), new
+            self.auth().token(force_refresh=True, failing_token="old"), new
         )
-        self.runner.assert_not_called()
+        self.oauth.refresh.assert_not_called()
 
-    def test_login_supports_old_and_new_official_flags(self):
-        for flags in ["--auth-url string", "--scope string"]:
-            self.runner.reset_mock()
+    def test_login_reuses_or_refreshes_without_interactive_flow(self):
+        write_store(self.root, fake_token(NOW - 1), fake_token(NOW + 7200))
+        self.assertEqual(self.auth().login()["provider"], "native-oauth")
+        self.auth().login()
+        self.oauth.refresh.assert_called_once()
+        self.oauth.login.assert_not_called()
 
-            def run(command, **kwargs):
-                if command[-1] == "--help":
-                    return subprocess.CompletedProcess(command, 0, flags, "")
-                write_store(self.root, fake_token(NOW + 3600), fake_token(NOW + 7200))
-                return subprocess.CompletedProcess(command, 0)
-
-            self.runner.side_effect = run
-            self.auth().login()
-            command = self.runner.call_args.args[0]
-            self.assertEqual("--auth-url" in command, "--auth-url" in flags)
-            self.assertNotIn("capture_output", self.runner.call_args.kwargs)
+    def test_first_and_explicit_reauthentication_use_device_flow(self):
+        notify = Mock()
+        self.auth().login(notify=notify)
+        self.oauth.login.assert_called_once_with(notify)
+        self.auth().login(force=True, notify=notify)
+        self.assertEqual(self.oauth.login.call_count, 2)
+        self.oauth.refresh.assert_not_called()
+        self.assertEqual((self.root / ".encryption_key").stat().st_mode & 0o777, 0o600)
 
     def test_independent_providers_share_directory_lock(self):
-        # Separate provider objects model separate callers, each with its own mutex.
         write_store(self.root, fake_token(NOW - 1), fake_token(NOW + 7200))
-        new = fake_token(NOW + 3600, "new")
-
-        def renew(*args, **kwargs):
-            write_store(self.root, new, fake_token(NOW + 7200, "rotated"))
-            return subprocess.CompletedProcess(
-                [], 0, '{"Result":{"id":"fake-user"}}', ""
-            )
-
-        self.runner.side_effect = renew
         providers = [self.auth() for _ in range(8)]
         with concurrent.futures.ThreadPoolExecutor(max_workers=8) as pool:
             values = list(pool.map(lambda x: x.token(), providers))
-        self.assertEqual(values, [new] * 8)
-        self.assertEqual(self.runner.call_count, 1)
+        self.assertEqual(values, [self.pair.access] * 8)
+        self.oauth.refresh.assert_called_once()
 
-    def test_invalid_grant_is_preserved_redacted_and_deduplicated(self):
+    def test_invalid_grant_preserved_redacted_and_deduplicated(self):
         access, refresh = fake_token(NOW - 1), fake_token(NOW + 7200)
         write_store(self.root, access, refresh)
-        self.runner.return_value = subprocess.CompletedProcess(
-            [], 1, "", "invalid_grant: Token is not active " + refresh
+        self.oauth.refresh.side_effect = LoginRequired(
+            "invalid_grant: Token is not active " + refresh
         )
         for _ in range(3):
             with self.assertRaises(OfficialAuthError) as ctx:
                 self.auth().token()
             self.assertTrue(ctx.exception.action_required)
             self.assertIn("invalid_grant", str(ctx.exception))
-            self.assertNotIn(refresh, str(ctx.exception))
-        self.assertEqual(self.runner.call_count, 1)
+            self.assertNotIn(refresh, self.auth().redact(ctx.exception))
+        self.oauth.refresh.assert_called_once()
         self.assertEqual(config.read_qz_credentials(self.root)["token"], access)
 
     def test_network_failure_does_not_request_login_or_delete_pair(self):
         write_store(self.root, fake_token(NOW - 1), fake_token(NOW + 7200))
         before = (self.root / "credentials.enc").read_bytes()
-        self.runner.return_value = subprocess.CompletedProcess(
-            [], 1, "", "dial tcp: DNS failure; ORIGINAL_END"
-        )
+        self.oauth.refresh.side_effect = OfficialAuthError("DNS failure; ORIGINAL_END")
         with self.assertRaises(OfficialAuthError) as ctx:
-            self.auth().token()
+            self.auth().login()
         self.assertFalse(ctx.exception.action_required)
         self.assertIn("DNS failure; ORIGINAL_END", str(ctx.exception))
         self.assertEqual((self.root / "credentials.enc").read_bytes(), before)
+        self.oauth.login.assert_not_called()
 
-    def test_external_login_overlapping_failed_refresh_is_reread(self):
+    def test_external_login_overlapping_failed_or_successful_refresh_is_preserved(self):
+        new = fake_token(NOW + 3600, "external-new")
+        for failed in (False, True):
+            write_store(self.root, fake_token(NOW - 1), fake_token(NOW + 7200))
+
+            def overlap(*args):
+                write_store(self.root, new, fake_token(NOW + 7200, "external-refresh"))
+                if failed:
+                    raise LoginRequired("invalid_grant")
+                return self.pair
+
+            self.oauth.refresh.side_effect = overlap
+            self.assertEqual(self.auth().token(), new)
+            self.assertEqual(config.read_qz_credentials(self.root)["token"], new)
+
+    def test_rejected_expired_new_access_does_not_overwrite_old_store(self):
         write_store(self.root, fake_token(NOW - 1), fake_token(NOW + 7200))
-        new = fake_token(NOW + 3600, "independent-login")
-
-        def overlap(*args, **kwargs):
-            write_store(self.root, new, fake_token(NOW + 7200, "independent-refresh"))
-            return subprocess.CompletedProcess([], 1, "", "invalid_grant")
-
-        self.runner.side_effect = overlap
-        self.assertEqual(self.auth().token(), new)
+        before = (self.root / "credentials.enc").read_bytes()
+        self.oauth.refresh.return_value = self.make_pair(-10)
+        with self.assertRaises(OfficialAuthError):
+            self.auth().token()
+        self.assertEqual((self.root / "credentials.enc").read_bytes(), before)
 
     def test_static_token_never_refreshes_or_logs_in(self):
         os.environ["INSPIRE_TOKEN"] = fake_token(NOW + 3600)
@@ -224,24 +227,17 @@ class OfficialAuthTests(unittest.TestCase):
             )
         with self.assertRaises(OfficialAuthError):
             self.auth().login()
-        self.runner.assert_not_called()
+        self.oauth.refresh.assert_not_called()
+        self.oauth.login.assert_not_called()
 
-    def test_proxy_bridge_preserves_no_proxy_and_config_directory(self):
-        os.environ["NO_PROXY"] = ".internal.example"
-        with patch("qzcli.qz_auth.get_proxy", return_value="http://proxy.example:7897"):
-            env = self.auth()._environment()
-        self.assertEqual(env["https_proxy"], "http://proxy.example:7897")
-        self.assertEqual(env["NO_PROXY"], ".internal.example")
-        self.assertEqual(env["QZ_CLI_CONFIG_DIR"], str(self.root))
-
-    def test_corrupt_store_is_explicit_and_not_overwritten(self):
-        write_store(self.root, "fake-access", "fake-refresh")
-        (self.root / ".encryption_key").write_bytes(b"wrong-key")
+    def test_corrupt_store_is_not_overwritten(self):
+        self.root.mkdir()
+        (self.root / "credentials.enc").write_bytes(b"corrupt")
         before = (self.root / "credentials.enc").read_bytes()
         with self.assertRaises(config.ConfigError):
-            self.auth().status()
+            self.auth().login(force=True)
         self.assertEqual((self.root / "credentials.enc").read_bytes(), before)
-        self.runner.assert_not_called()
+        self.oauth.login.assert_not_called()
 
 
 class OfficialApiTests(unittest.TestCase):

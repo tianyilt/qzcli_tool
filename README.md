@@ -1,21 +1,23 @@
 # qzcli - 启智平台任务管理 CLI
 
-![Release](https://img.shields.io/github/v/release/tianyilt/qzcli_tool?sort=semver) ![Python](https://img.shields.io/badge/python-%3E%3D3.8-blue) ![Tests](https://img.shields.io/badge/tests-54%20passed%2C%201%20skipped-brightgreen) ![License](https://img.shields.io/badge/license-MIT-green)
+![Release](https://img.shields.io/github/v/release/tianyilt/qzcli_tool?sort=semver) ![Python](https://img.shields.io/badge/python-%3E%3D3.8-blue) ![Tests](https://img.shields.io/badge/tests-733%20passed-brightgreen) ![License](https://img.shields.io/badge/license-MIT-green)
 
 一个类似 `kubectl` / `docker` 风格的启智平台命令行工具，把资源查询、任务提交、任务管理、日志查看和 MCP/agent 工作流收敛到 CLI 里完成。
 
 ## 项目链接
 
-- Release: <https://github.com/tianyilt/qzcli_tool/releases/tag/v0.3.0>
+- Release: <https://github.com/tianyilt/qzcli_tool/releases>
 - Changelog: [CHANGELOG.md](CHANGELOG.md)
 - Issues: <https://github.com/tianyilt/qzcli_tool/issues>
 - License: [MIT](LICENSE)
 
+本开发分支为 **0.6.0.dev0 原生 OAuth 候选版，尚未发布**。已发布的 v0.5.0 仍依赖官方 Go `qz`；本分支直接用 Python 完成网页设备授权和续期，无需安装 Inspire-CLI。详见 [认证实现与验收](docs/native_oauth.md)。
+
 ## 特性
 
-- **官方登录**: `qzcli login` 通过官方 qz 网页授权，直接复用其 access/refresh token；密码认证显式使用 legacy
+- **官方登录**: `qzcli login` 由 Python 直连官方网页设备授权接口，自动续期并加密保存 access/refresh token；密码认证显式使用 legacy
 - **资源发现**: `qzcli res -u` 调 `cluster_info` / `task_dimension` 聚合工作空间、计算组、项目并本地缓存（默认 quick 模式秒级返回；需要更新 specs 时加 `--full` 走全量历史任务扫描）
-- **节点查询**: `qzcli avail` 查询各计算组空余节点，支持低优任务统计和 cookie 失效自动刷新
+- **节点查询**: `qzcli avail` 查询各计算组空余节点，支持低优任务统计和访问令牌自动续期
 - **可视化看板**: `qzcli dashboard` 用 treemap 按「计算组→优先级→项目→用户→任务」逐层下钻 GPU 占用（需 `pip install 'qzcli[dashboard]'`）
 - **交互式提交**: `qzcli create -i` 提供层级式选择界面，缺少快照时按需预加载
 - **任务列表**: 美观的卡片式显示，完整 URL 方便点击
@@ -50,7 +52,7 @@ pip install -e .
 ## 快速开始
 
 ```bash
-# 1. 已安装官方 qz 后初始化；已有有效授权会直接复用
+# 1. 初始化原生官方 OAuth；已有有效授权会直接复用，无需安装 qz
 qzcli init
 qzcli auth status --check
 
@@ -212,23 +214,28 @@ qzcli ls -c -w 分布式 -r
 
 | 命令 | 说明 | 示例 |
 |------|------|------|
-| `init` | 验证官方依赖、配置和身份，成功后保存绑定 | `qzcli init` |
-| `login` | 官方 qz 网页授权 | `qzcli login` |
+| `init` | 验证配置和官方身份，成功后保存绑定 | `qzcli init` |
+| `login` | Python 原生官方网页授权 | `qzcli login` |
 | `auth status` | 分别显示两枚 token 的到期状态，不显示凭据 | `qzcli auth status --check` |
 | `cookie` | legacy 手动 Cookie | `qzcli --auth-mode legacy cookie -f cookies.txt` |
 
-官方 `qz` 安装方式见平台的 Inspire-CLI 用户手册。默认认证目录为 `~/.config/inspire-cli`，由 `QZ_CLI_CONFIG_DIR` 或根参数 `--qz-config-dir` 指定。`QZCLI_HOME` 只隔离 qzcli 的配置、资源和任务记录，不会隔离同一官方目录内的 refresh 链。每台机器应独立授权，不复制刷新令牌链。
+本分支只需安装 qzcli 的 Python 包和声明的依赖，无需 Go `qz`、整个 InspireSkill 或 Chromium。浏览器只用于平台要求的人工验证。兼容认证目录仍为 `~/.config/inspire-cli`，由 `QZ_CLI_CONFIG_DIR` 或根参数 `--qz-config-dir` 指定；可直接读取已有加密凭据，续期时原子保存两枚新令牌及到期时间。`QZCLI_HOME` 只隔离配置、资源和任务记录；选择同一凭据目录的调用仍共享一条刷新链。各主机应独立授权，不复制刷新令牌链。
 
 ```bash
-qzcli init
-qzcli auth status --check
-qzcli login                    # 打印官方授权网址与验证码，等待浏览器批准
-qzcli --qz-config-dir /path/to/official-config login
+qzcli init                     # 已有 AT/RT 可用时直接复用/续期
+qzcli auth status --check       # 回读实际身份，不显示凭据
+qzcli login                    # 仅在需要时发起网页授权
+qzcli login --reauth            # 明确要求建立新的网页授权
+qzcli --qz-config-dir /path/to/private-config login
 ```
 
-访问令牌未过期时直接使用，即使刷新令牌已过期或缺失。访问令牌失效但刷新令牌可用时，调用官方 `qz user GetUserDetail` 续期并重新读取两枚凭据；不能续期时提示重新网页登录。未知到期时间不等于过期，以真实接口验证。401 最多一次协调刷新和一次业务重试；403 是权限拒绝，网络错误保留原文，不删除凭据、不自动登录。
+`--auth-mode native` 是明确的原生模式名称；旧配置 `auth_mode=qz` 和 `--auth-mode qz` 保持兼容，状态返回 `auth_mode=qz, provider=native-oauth`。`INSPIRE_TOKEN` 是独立的静态覆盖，不能续期；网页登录前需移除它。
 
-业务 API 仍由 Python 直连，请求携带 `Authorization: Bearer …` 和 `X-Inspire-Client-Source: inspire-cli/qzcli-<version>`。qzcli 只读取官方加密凭据，登录、刷新和凭据写入均由官方 qz 负责。首次需要安装 `cryptography` 和 `PyYAML`（已列为依赖）。`INSPIRE_TOKEN` 是独立的静态覆盖，不能续期；网页登录前需移除它。官方子进程、HTTP 与 WebSocket 采用相同代理配置和 `NO_PROXY` 规则。
+访问令牌（AT）未过期时直接使用，即使刷新令牌（RT）已过期或缺失。AT 到期但 RT 可用时，Python 直接刷新：新授权使用平台 `/api/v1/public/auth/refresh`；已有 `inspire-code` 客户端凭据使用其配置的 Keycloak token 端点。两种客户端的 RT 不可混用，不在失败后盲试另一个端点。RT 的时间字段未过期，也不能证明服务端会话未被撤销；保留服务端 `invalid_grant` 等完整脱敏响应再判断。
+
+按凭据目录加线程/进程锁，锁内重读以复用其他调用的新令牌；两枚令牌整体加密、原子替换，下一进程直接使用。独立 Go `qz` 不遵守此锁，避免同一目录同时混用两个刷新程序；已观察到外部更新时不会覆盖。未知到期时间不等于过期，以真实接口验证。401 最多一次协调刷新和一次业务重试；403、429 和网络错误保留完整脱敏响应、响应头及异常链，不删除凭据、不自动登录或切回 CAS。
+
+CLI、Python API、MCP、看板、Notebook 和 worker 共用认证层。业务 API 继续 Python 直连，携带 `Authorization: Bearer …` 和 `X-Inspire-Client-Source: inspire-cli/qzcli-<version>`，HTTP/WebSocket 与认证采用一致的代理和 `NO_PROXY` 规则。
 
 #### legacy 备用认证
 

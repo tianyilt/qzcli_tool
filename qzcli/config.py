@@ -187,8 +187,10 @@ def select_auth(mode=None, qz_config_dir=None):
 def get_auth_mode(explicit=None):
     mode = explicit or _auth_mode_override or os.environ.get("QZCLI_AUTH_MODE")
     mode = mode or load_config().get("auth_mode", "qz")
+    if mode == "native":
+        mode = "qz"  # Preserve existing API/config contracts for official OAuth.
     if mode not in ("qz", "legacy"):
-        raise ConfigError("auth_mode 必须是 qz 或 legacy")
+        raise ConfigError("auth_mode 必须是 native、qz（兼容名称）或 legacy")
     return mode
 
 
@@ -228,7 +230,7 @@ def load_qz_settings(directory=None):
 
 
 def read_qz_credentials(directory):
-    """Read the official store; only the official qz program writes its secrets."""
+    """Read the compatible encrypted store, including existing official credentials."""
     from cryptography.exceptions import InvalidTag
     from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 
@@ -246,40 +248,97 @@ def read_qz_credentials(directory):
             raise ValueError("unsupported credential format")
         data = json.loads(AESGCM(key).decrypt(blob[:12], blob[12:], None))
     except (OSError, ValueError, UnicodeDecodeError, InvalidTag) as exc:
-        raise ConfigError(
-            f"无法解密官方凭据，请检查文件及配套密钥：{credentials_file}"
-        ) from exc
+        raise ConfigError(f"无法解密官方凭据，请检查文件及配套密钥：{credentials_file}") from exc
     if not isinstance(data, dict):
         raise ConfigError(f"官方凭据必须为对象：{credentials_file}")
     return data
 
 
+def save_qz_credentials(directory, data):
+    """Atomically persist a rotating pair in the existing AES-GCM format.
+
+    The caller holds qz_refresh_lock. Keeping the format and directory avoids
+    copying a rotating refresh chain or forcing a login during an upgrade.
+    """
+    import tempfile
+    from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+
+    root = get_qz_config_dir(directory)
+    root.mkdir(parents=True, exist_ok=True, mode=0o700)
+    key_file = root / ".encryption_key"
+    try:
+        key = key_file.read_bytes()
+    except FileNotFoundError:
+        if (root / "credentials.enc").exists():
+            raise ConfigError(f"官方凭据缺少配套密钥：{key_file}") from None
+        key = AESGCM.generate_key(bit_length=256)
+        fd = os.open(str(key_file), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        with os.fdopen(fd, "wb") as stream:
+            stream.write(key)
+            stream.flush()
+            os.fsync(stream.fileno())
+    if len(key) != 32:
+        raise ConfigError(f"无法使用凭据密钥：{key_file}")
+    nonce = os.urandom(12)
+    blob = nonce + AESGCM(key).encrypt(
+        nonce, json.dumps(data, ensure_ascii=False).encode("utf-8"), None
+    )
+    fd, temporary = tempfile.mkstemp(prefix=".credentials-", dir=str(root))
+    try:
+        with os.fdopen(fd, "wb") as stream:
+            stream.write(blob)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, root / "credentials.enc")
+    finally:
+        if os.path.exists(temporary):
+            os.unlink(temporary)
+
+
 @contextmanager
 def qz_refresh_lock(directory):
     """One lock per official directory, including across QZCLI_HOME profiles."""
-    import fcntl
-
     root = get_qz_config_dir(directory)
     if not root.is_dir():
         raise ConfigError(f"官方配置目录不存在：{root}；请运行 qzcli login")
     path = root / ".qzcli-refresh.lock"
     fd = os.open(str(path), os.O_CREAT | os.O_RDWR, 0o600)
     try:
-        fcntl.flock(fd, fcntl.LOCK_EX)
-        yield
+        if os.name == "nt":
+            import msvcrt
+
+            if os.fstat(fd).st_size == 0:
+                os.write(fd, b"\0")
+            os.lseek(fd, 0, os.SEEK_SET)
+            msvcrt.locking(fd, msvcrt.LK_LOCK, 1)
+            try:
+                yield
+            finally:
+                os.lseek(fd, 0, os.SEEK_SET)
+                msvcrt.locking(fd, msvcrt.LK_UNLCK, 1)
+        else:
+            import fcntl
+
+            fcntl.flock(fd, fcntl.LOCK_EX)
+            try:
+                yield
+            finally:
+                fcntl.flock(fd, fcntl.LOCK_UN)
     finally:
-        fcntl.flock(fd, fcntl.LOCK_UN)
         os.close(fd)
 
 
 def load_qz_refresh_failure(directory):
     path = get_qz_config_dir(directory) / ".qzcli-refresh-error.json"
     try:
-        return json.loads(path.read_text(encoding="utf-8"))
+        data = json.loads(path.read_text(encoding="utf-8"))
     except FileNotFoundError:
         return {}
     except (OSError, ValueError) as exc:
         raise ConfigError(f"读取刷新回执失败：{path}") from exc
+    if not isinstance(data, dict):
+        raise ConfigError(f"刷新回执必须为对象：{path}")
+    return data
 
 
 def save_qz_refresh_failure(directory, data):
@@ -464,12 +523,8 @@ def describe_credential_conflict(action: str = "本次使用") -> str:
         mark = f"← {action}" if i == 0 else ""
         lines.append(f"    {label}  指纹 {f} {mark}")
     lines.append("  如果你刚改过密码却还在报密码错误，多半是优先级更高的那处没更新。")
-    lines.append(
-        "  环境变量通常来自 ~/.zshrc / ~/.bashrc，**已经启动的进程不会自动更新** ——"
-    )
-    lines.append(
-        "  那些进程要重启才会拿到新密码，或者在它们里先 unset QZCLI_PASSWORD。"
-    )
+    lines.append("  环境变量通常来自 ~/.zshrc / ~/.bashrc，**已经启动的进程不会自动更新** ——")
+    lines.append("  那些进程要重启才会拿到新密码，或者在它们里先 unset QZCLI_PASSWORD。")
     return "\n".join(lines)
 
 
@@ -490,9 +545,7 @@ def get_credentials_from_source(source: str) -> tuple[str, str]:
         if not user:
             user = get_credentials_with_source()[0]
         return user, pw
-    raise ValueError(
-        f"未知的凭据来源 {source!r}，可选: " + " / ".join(CREDENTIAL_SOURCE_KEYS)
-    )
+    raise ValueError(f"未知的凭据来源 {source!r}，可选: " + " / ".join(CREDENTIAL_SOURCE_KEYS))
 
 
 def get_credentials() -> tuple[str, str]:
