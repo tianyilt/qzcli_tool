@@ -58,13 +58,16 @@ qzcli auth status --check
 #    默认 quick 模式秒级返回；如需更新 specs（资源规格），加 --full 走全量历史任务扫描
 qzcli res -u
 
-# 3. 查看空余节点
-qzcli avail
+# 3. 查看分布式空间的空余节点和低优任务
+qzcli avail -v --lp -w 分布式
 
 # 4. 查看运行中的任务（-c 模式必须指定工作空间，或用 --all-ws 查全部）
-qzcli ls -c -r -w <工作空间名称或ID>
+qzcli ls -c -r -w 分布式
 qzcli ls -c -r --all-ws
 ```
+
+用户文档统一使用 `-w 分布式` 举例；其他工作空间需按实际访问权限选择。
+公开示例和测试样例不包含验收环境的专属空间名称、别名或资源标识。
 
 下面的密码配置仅供显式 `legacy` 模式使用。官方模式不会读取这些密码。
 
@@ -361,7 +364,7 @@ qzcli create -i -w "我的工作空间"
 qzcli create \
   --name "my-training-job" \
   --command "bash /path/to/script.sh" \
-  --workspace "我的工作空间" \
+  --workspace 分布式 \
   --project "我的项目" \
   --compute-group "我的计算组" \
   --image registry.example.com/team/train-image:latest \
@@ -384,10 +387,10 @@ qzcli create \
   --instances 4
 
 # 预览 payload 不提交
-qzcli create --name test --command "echo hi" --workspace "我的工作空间" --image registry.example.com/team/train-image:latest --dry-run
+qzcli create --name test --command "echo hi" --workspace 分布式 --image registry.example.com/team/train-image:latest --dry-run
 
 # JSON 输出（供脚本集成）
-qzcli create --name test --command "echo hi" --workspace "我的工作空间" --image registry.example.com/team/train-image:latest --json
+qzcli create --name test --command "echo hi" --workspace 分布式 --image registry.example.com/team/train-image:latest --json
 ```
 
 **参数说明:**
@@ -506,7 +509,7 @@ for ckpt in "${CHECKPOINTS[@]}"; do
     qzcli create \
       --name "eval-$(basename $ckpt)-step${step}" \
       --command "bash /path/to/eval.sh --ckpt $ckpt --step $step" \
-      --workspace "分布式训练" \
+      --workspace 分布式 \
       --compute-group "xxx-3号机房-2" \
       --instances 4
     sleep 3

@@ -35,9 +35,9 @@ class JobRecord:
     instance_count: int = 0
     
     # 新增：计算组和 GPU 信息
-    compute_group_name: str = ""  # 如 "H200-3号机房-2"
+    compute_group_name: str = ""  # 如 "分布式示例计算组"
     gpu_type: str = ""  # 如 "H200"
-    project_name: str = ""  # 如 "CI-扩散音视频生成"
+    project_name: str = ""  # 如 "分布式示例项目"
 
     # 交互式建模额外信息
     user_name: str = ""  # 创建者姓名
