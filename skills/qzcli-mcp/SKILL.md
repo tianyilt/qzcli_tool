@@ -16,7 +16,7 @@ description: Use the qzcli MCP tools to query 启智平台 workspaces, resources
 
 ## 工作流
 
-1. 如果还没有认证，先用 `qz_auth_login` 或 `qz_set_cookie`
+1. 先用 `qz_auth_login` 检查认证；需要人工授权时在终端执行 `qzcli login`。原生 OAuth 无需官方 Go `qz`，MCP 不等待网页授权；`qz_set_cookie` 仅用于显式 legacy。
 2. 如果 workspace / 计算组缓存可能过期，先用 `qz_refresh_resources`
 3. 查询资源推荐时，优先用 `qz_get_availability`
 4. 查询任务时，优先用 `qz_list_jobs` / `qz_get_job_detail`

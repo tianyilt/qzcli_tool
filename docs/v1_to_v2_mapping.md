@@ -1,5 +1,7 @@
 # qzcli v1 → v2 端点映射（**真机实测**，2026-07-30）
 
+> 版本说明：本文保留历史 Cookie 接口探针及数字；当前开发分支默认采用 Python 原生官方 OAuth，Cookie 为显式 legacy 后备。认证实现和本轮验收见 [native_oauth.md](native_oauth.md)。
+
 qz spec 版本 `cf22fdbe`。每一行都用 `qzcli` 的 CAS cookie 实际打过，不是照 schema 推的。
 探针全量结果见 `v2_probe_report.md`，接口全量文档见 `api_spec_v2.md`。
 

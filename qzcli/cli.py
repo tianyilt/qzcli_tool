@@ -425,8 +425,8 @@ def cmd_init(args):
         from .config import load_config, save_config
         from .qz_auth import OfficialAuthError
 
-        api._official_auth._binary()
-        display.print(f"官方配置目录: {api._official_auth.directory}")
+        display.print("认证方式: Python 直连官方 OAuth（无需安装 Inspire-CLI）")
+        display.print(f"凭据目录: {api._official_auth.directory}")
         display.print(f"业务服务地址: {api.base_url}")
         try:
             api._official_auth.token()
@@ -9058,7 +9058,7 @@ def cmd_exec_attach(args):
 
 
 def cmd_login(args):
-    """默认通过官方 qz 网页授权；显式 legacy 使用 CAS 密码登录。"""
+    """默认原生官方 OAuth；显式 legacy 使用 CAS 密码登录。"""
     import getpass
 
     display = get_display()
@@ -9074,15 +9074,27 @@ def cmd_login(args):
             raise QzAPIError("密码登录参数需要显式选择 --auth-mode legacy")
         from .config import load_config, save_config
 
-        api._official_auth.login()
+        oauth_client = getattr(args, "oauth_client", None)
+        if oauth_client is not None:
+            api._official_auth.login(
+                force=bool(getattr(args, "reauth", False)) or True,
+                oauth_client=oauth_client,
+            )
+        elif getattr(args, "reauth", False):
+            api._official_auth.login(force=True)
+        else:
+            api._official_auth.login()
         status = api.auth_status(check=True)
         config = load_config()
         config.update(auth_mode="qz", qz_config_dir=str(api._official_auth.directory))
         if args.workspace:
             config["default_workspace_id"] = args.workspace
         save_config(config)
+        rt_info = status.get("refresh_token") or {}
+        rt_type = rt_info.get("token_type")
+        suffix = f"（RT 类型：{rt_type}）" if rt_type else ""
         display.print_success(
-            f"官方登录成功：{status['user'].get('name') or status['user']['id']}"
+            f"官方登录成功：{status['user'].get('name') or status['user']['id']}{suffix}"
         )
         return 0
     from .config import (
@@ -9092,6 +9104,9 @@ def cmd_login(args):
         get_credentials_with_source,
         password_fingerprint,
     )
+
+    if getattr(args, "reauth", False) or getattr(args, "oauth_client", None):
+        raise QzAPIError("--reauth / --oauth-client 仅用于原生官方 OAuth 模式")
 
     stored_username, stored_password = get_credentials()
     _, _, _user_src, _pass_src = get_credentials_with_source()
@@ -9273,9 +9288,10 @@ def main():
         "--version", "-V", action="version", version=f"qzcli {__version__}"
     )
     parser.add_argument(
-        "--auth-mode", choices=("qz", "legacy"), help="认证模式（默认官方 qz）"
+        "--auth-mode", choices=("native", "qz", "legacy"),
+        help="认证模式（默认原生官方 OAuth；qz 是兼容名称）"
     )
-    parser.add_argument("--qz-config-dir", help="官方 qz 配置目录")
+    parser.add_argument("--qz-config-dir", help="官方 OAuth 凭据目录（兼容已有 qz 配置）")
 
     subparsers = parser.add_subparsers(dest="command", help="子命令")
     auth_parser = subparsers.add_parser("auth", help="查看认证状态（不显示凭据）")
@@ -9475,10 +9491,16 @@ def main():
     # login 命令
     login_parser = subparsers.add_parser(
         "login",
-        help="官方 qz 网页授权（legacy 使用 CAS 密码登录）",
-        description="默认通过官方 qz 进行网页设备授权。已有可用凭据时，"
+        help="原生官方网页授权（legacy 使用 CAS 密码登录）",
+        description="Python 直接调用官方设备授权接口，无需安装 Inspire-CLI。已有可用凭据时，"
         "运行 auth status --check 验证；日常请求会自动续期，无需反复 login。",
         epilog="密码参数仅用于显式 legacy 模式：qzcli --auth-mode legacy login。",
+    )
+    login_parser.add_argument("--reauth", action="store_true", help="重新发起官方网页授权；默认复用或续期已有凭据")
+    login_parser.add_argument(
+        "--oauth-client",
+        choices=("platform", "inspire-code"),
+        help="官方设备授权客户端（默认 platform；若网关未透传 offline_access 可选 inspire-code 直连 Keycloak）",
     )
     login_parser.add_argument("--username", "-u", help="legacy：学工号")
     login_parser.add_argument(

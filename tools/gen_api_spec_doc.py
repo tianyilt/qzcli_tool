@@ -358,8 +358,8 @@ def render_markdown(
     )
     md.append(
         "认证有两条路，**接口相同、认证不同**：\n"
-        "- **Bearer**（官方 `qz` 用）：Keycloak device code 登录后拿 access token，放 `Authorization: Bearer <token>`\n"
-        "- **CAS cookie**（`qzcli` 用）：`inspire-session` cookie + `x-inspire-client-source` 头。"
+        "- **Bearer**（qzcli 原生 OAuth 与官方 `qz` 使用）：Keycloak device code 登录后拿 access token，放 `Authorization: Bearer <token>`\n"
+        "- **CAS cookie**（qzcli 显式 legacy 后备）：`inspire-session` cookie + `x-inspire-client-source` 头。"
         "**缺 `x-inspire-client-source` 时 APISIX 网关会 302 到 Keycloak 并返回 HTML**，即使 token 合法"
     )
     md.append(
