@@ -388,7 +388,11 @@ def _is_qz_mode(api=None):
 
 def _auth_state():
     """Select the provider; an empty cookie never stands for a Bearer credential."""
-    if _is_qz_mode():
+    api = get_api()
+    if getattr(api, "_allow_cas_fallback", None) is True and api.auth_mode == "qz":
+        # Resolve OAuth vs CAS session fallback lazily before callers inspect cookie_data.
+        api.ensure_authenticated(probe=False)
+    if _is_qz_mode(api):
         from .config import load_config
 
         return {
@@ -406,11 +410,12 @@ def _has_auth_context(state):
 def cmd_auth(args):
     import json
 
-    print(
-        json.dumps(
-            get_api().auth_status(check=args.check), ensure_ascii=False, indent=2
-        )
-    )
+    api = get_api()
+    if getattr(args, "auth_command", "status") == "refresh":
+        payload = api.auth_refresh(check=args.check)
+    else:
+        payload = api.auth_status(check=args.check)
+    print(json.dumps(payload, ensure_ascii=False, indent=2))
     return 0
 
 
@@ -433,7 +438,10 @@ def cmd_init(args):
         except OfficialAuthError as exc:
             if not exc.action_required:
                 raise
-            api._official_auth.login()
+            if getattr(args, "no_browser", None) is True:
+                api._official_auth.login(open_browser=False)
+            else:
+                api._official_auth.login()
         status = api.auth_status(check=True)
         config = load_config()
         config.update(auth_mode="qz", qz_config_dir=str(api._official_auth.directory))
@@ -9063,30 +9071,42 @@ def cmd_login(args):
 
     display = get_display()
     api = get_api()
-    if _is_qz_mode(api):
-        if (
-            args.username
-            or args.password
-            or getattr(args, "password_stdin", False)
-            or getattr(args, "source", None)
-            or getattr(args, "force", False)
-        ):
-            raise QzAPIError("密码登录参数需要显式选择 --auth-mode legacy")
+    configured_mode = getattr(api, "_configured_auth_mode", getattr(api, "auth_mode", None))
+    has_password_flags = bool(
+        args.username
+        or args.password
+        or getattr(args, "password_stdin", False)
+        or getattr(args, "source", None)
+        or getattr(args, "force", False)
+    )
+    if _is_qz_mode(api) and not (configured_mode == "auto" and has_password_flags):
+        if has_password_flags:
+            raise QzAPIError("密码登录参数需要显式选择 --auth-mode legacy（或 auto）")
         from .config import load_config, save_config
 
         oauth_client = getattr(args, "oauth_client", None)
+        extra = (
+            {"open_browser": False}
+            if getattr(args, "no_browser", None) is True
+            else {}
+        )
         if oauth_client is not None:
             api._official_auth.login(
                 force=bool(getattr(args, "reauth", False)) or True,
                 oauth_client=oauth_client,
+                **extra,
             )
         elif getattr(args, "reauth", False):
-            api._official_auth.login(force=True)
+            api._official_auth.login(force=True, **extra)
         else:
-            api._official_auth.login()
+            api._official_auth.login(**extra)
+        _clear_relogin_failure()
         status = api.auth_status(check=True)
         config = load_config()
-        config.update(auth_mode="qz", qz_config_dir=str(api._official_auth.directory))
+        saved_mode = "auto" if configured_mode == "auto" else "qz"
+        config.update(
+            auth_mode=saved_mode, qz_config_dir=str(api._official_auth.directory)
+        )
         if args.workspace:
             config["default_workspace_id"] = args.workspace
         save_config(config)
@@ -9097,6 +9117,8 @@ def cmd_login(args):
             f"官方登录成功：{status['user'].get('name') or status['user']['id']}{suffix}"
         )
         return 0
+    if configured_mode == "auto":
+        api.auth_mode = "legacy"
     from .config import (
         credential_conflict,
         describe_credential_conflict,
@@ -9288,13 +9310,14 @@ def main():
         "--version", "-V", action="version", version=f"qzcli {__version__}"
     )
     parser.add_argument(
-        "--auth-mode", choices=("native", "qz", "legacy"),
-        help="认证模式（默认原生官方 OAuth；qz 是兼容名称）"
+        "--auth-mode",
+        choices=("auto", "native", "qz", "legacy"),
+        help="认证模式（默认原生 OAuth；auto 在 OAuth 到期时自动回退本地 CAS 会话，遇到验证码即停并提示人工登录）",
     )
     parser.add_argument("--qz-config-dir", help="官方 OAuth 凭据目录（兼容已有 qz 配置）")
 
     subparsers = parser.add_subparsers(dest="command", help="子命令")
-    auth_parser = subparsers.add_parser("auth", help="查看认证状态（不显示凭据）")
+    auth_parser = subparsers.add_parser("auth", help="查看或主动刷新认证状态（不显示凭据）")
     auth_sub = auth_parser.add_subparsers(dest="auth_command", required=True)
     auth_status = auth_sub.add_parser(
         "status", help="显示 access/refresh token 到期状态"
@@ -9302,11 +9325,21 @@ def main():
     auth_status.add_argument(
         "--check", action="store_true", help="实际验证身份，需要时刷新"
     )
+    auth_refresh = auth_sub.add_parser(
+        "refresh",
+        help="主动使用 refresh token 续期并落盘（可用于定时保活，重置服务端闲置超时）",
+    )
+    auth_refresh.add_argument(
+        "--check", action="store_true", help="续期后实际调用身份接口验证"
+    )
 
     # init 命令
     init_parser = subparsers.add_parser("init", help="初始化配置")
     init_parser.add_argument("--username", "-u", help="用户名")
     init_parser.add_argument("--password", "-p", help="密码")
+    init_parser.add_argument(
+        "--no-browser", action="store_true", help="需要网页授权时不自动打开浏览器"
+    )
 
     # list 命令
     list_parser = subparsers.add_parser("list", aliases=["ls"], help="列出任务")
@@ -9498,9 +9531,12 @@ def main():
     )
     login_parser.add_argument("--reauth", action="store_true", help="重新发起官方网页授权；默认复用或续期已有凭据")
     login_parser.add_argument(
+        "--no-browser", action="store_true", help="不自动打开默认浏览器（SSH/无界面环境亦会自动跳过）"
+    )
+    login_parser.add_argument(
         "--oauth-client",
         choices=("platform", "inspire-code"),
-        help="官方设备授权客户端（默认 platform；若网关未透传 offline_access 可选 inspire-code 直连 Keycloak）",
+        help="官方设备授权客户端（默认 platform；可选 inspire-code 直连 Keycloak）",
     )
     login_parser.add_argument("--username", "-u", help="legacy：学工号")
     login_parser.add_argument(

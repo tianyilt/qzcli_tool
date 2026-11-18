@@ -25,6 +25,7 @@ from . import __version__
 from . import opslog
 from .config import (
     CONFIG_DIR,
+    allows_cas_fallback,
     clear_token_cache,
     credential_conflict,
     describe_credential_conflict,
@@ -735,24 +736,29 @@ class QzAPI:
         auth_mode=None,
         qz_config_dir=None,
     ):
-        self.auth_mode = get_auth_mode(auth_mode)
+        configured_mode = get_auth_mode(auth_mode)
+        self.auth_mode = configured_mode
+        self._configured_auth_mode = configured_mode
+        self._allow_cas_fallback = allows_cas_fallback(auth_mode)
+        self._auto_fallback_active = False
         self._official_auth = None
-        if self.auth_mode == "qz":
-            if username or password:
+        if configured_mode in ("qz", "auto"):
+            if configured_mode == "qz" and (username or password):
                 raise QzAPIError("用户名和密码需要显式选择 auth_mode=legacy")
             from .qz_auth import OfficialAuth
 
             self._official_auth = OfficialAuth(qz_config_dir)
             self.base_url = self._official_auth.server
-            self._username, self._password = None, None
+            self._username, self._password = username, password
             self._credential_sources = "凭据来源：官方 OAuth（Python 直连）"
-            self._credential_identity = (None, None)
+            self._credential_identity = (username, password)
             self._token = None
             self._auto_relogin = False
             self._relogin_lock = threading.Lock()
             self._opaque_lock = threading.RLock()
             self._opaque_check_active = False
             self._validated_opaque_token = None
+            self.auth_mode = "qz"
             return
         self.base_url = get_api_base_url()
 
@@ -772,6 +778,64 @@ class QzAPI:
         # 关掉可临时禁用 cookie 过期自动重登（如只读 / 无凭据场景）。
         self._auto_relogin = True
         self._relogin_lock = threading.Lock()
+
+    def _activate_legacy_fallback(
+        self,
+        *,
+        oauth_exc: QzAPIError,
+        username: Optional[str] = None,
+        password: Optional[str] = None,
+        probe: bool = True,
+        allow_password: bool = True,
+    ) -> str:
+        """Switch an ``auto`` instance from expired OAuth to CAS session fallback.
+
+        Stops immediately (0 retries) if CAS requires CAPTCHA / manual verification
+        or if credentials conflict / fail, instructing the user to run ``qzcli login``.
+        """
+        u = username if username is not None else self._username
+        p = password if password is not None else self._password
+        if u and p:
+            src = "凭据来源：API 调用参数"
+        else:
+            u, p = get_credentials()
+            _, _, user_source, password_source = get_credentials_with_source()
+            src = f"凭据来源: 用户名={user_source} | 密码={password_source}"
+        cached_cookie = (get_cookie() or {}).get("cookie", "")
+        if not allow_password:
+            u, p = None, None
+        if not (u and p) and not cached_cookie:
+            raise oauth_exc
+
+        self.auth_mode = "legacy"
+        self._auto_fallback_active = True
+        self.base_url = get_api_base_url()
+        self._username = u
+        self._password = p
+        self._credential_sources = src
+        self._credential_identity = (u, p)
+        self._token = None
+        self._auto_relogin = bool(u and p) and allow_password
+        try:
+            if not cached_cookie and self._auto_relogin:
+                with _allow_relogin_here():
+                    cached_cookie = self._relogin(failing_cookie="") or ""
+            return self.ensure_authenticated(cookie=cached_cookie, probe=probe)
+        except QzAPIError as cas_exc:
+            self._auto_relogin = False
+            notice = (
+                f"{cas_exc}\n\n"
+                "[需人工介入] OAuth 令牌已到期，且自动会话登录受阻（如触发验证码、二次验证或凭据问题），"
+                "已立即停止自动尝试；请直接运行 `qzcli login` 在浏览器点确认恢复登录。"
+            )
+            wrapped = QzAPIError(
+                notice,
+                cas_exc.code,
+                cas_exc.api_code,
+                diagnostic=getattr(cas_exc, "diagnostic", None),
+            )
+            wrapped.action_required = True
+            raise wrapped from cas_exc
 
     def _post(self, url: str, **kwargs) -> _CurlResponse:
         return _curl_post(url, **kwargs)
@@ -805,10 +869,18 @@ class QzAPI:
         if self.auth_mode == "qz":
             if cookie:
                 raise QzAPIError("显式 Cookie 需要 auth_mode=legacy")
-            self._official_token()
-            if probe:
-                self.get_user_detail()
-            return ""  # Never return a Bearer token through the legacy cookie contract.
+            try:
+                self._official_token()
+                if probe:
+                    self.get_user_detail()
+                return ""  # Never return a Bearer token through the legacy cookie contract.
+            except QzAPIError as exc:
+                if (
+                    getattr(self, "_allow_cas_fallback", None) is True
+                    and getattr(exc, "action_required", False)
+                ):
+                    return self._activate_legacy_fallback(oauth_exc=exc, probe=probe)
+                raise
         blocked = _recent_relogin_failure()
         if blocked is not None and is_credential_failure(blocked):
             raise QzAPIError(
@@ -1166,14 +1238,25 @@ class QzAPI:
 
     def _request_official_v2(self, service, action, body, referer_path, raw):
         url = f"{self.base_url}/api/v2/{service}"
-        return self._request_official(
-            url,
-            body,
-            referer_path,
-            raw,
-            params={"Action": action},
-            label=f"{service}.{action}",
-        )
+        try:
+            return self._request_official(
+                url,
+                body,
+                referer_path,
+                raw,
+                params={"Action": action},
+                label=f"{service}.{action}",
+            )
+        except QzAPIError as exc:
+            if (
+                getattr(self, "_allow_cas_fallback", None) is True
+                and getattr(exc, "action_required", False)
+            ):
+                self._activate_legacy_fallback(oauth_exc=exc)
+                return self._request_v2(
+                    service, action, body, referer_path=referer_path, raw=raw
+                )
+            raise
 
     def _request_official(
         self,
@@ -1258,6 +1341,9 @@ class QzAPI:
                 "auth_mode": "legacy",
                 "cookie_present": bool((get_cookie() or {}).get("cookie")),
             }
+            if getattr(self, "_configured_auth_mode", None) == "auto":
+                status["configured_auth_mode"] = "auto"
+                status["fallback_active"] = True
             if check:
                 # A status check must not submit a password behind the user's back.
                 probe = QzAPI(auth_mode="legacy")
@@ -1269,6 +1355,59 @@ class QzAPI:
                 )
             return status
         status = self._official_auth.status()
+        if getattr(self, "_configured_auth_mode", None) == "auto":
+            status["configured_auth_mode"] = "auto"
+            status["fallback_active"] = False
+            status["cookie_present"] = bool((get_cookie() or {}).get("cookie"))
+        if check:
+            if getattr(self, "_configured_auth_mode", None) == "auto":
+                # A status check must not submit a password behind the user's back.
+                probe = QzAPI(
+                    auth_mode="qz", qz_config_dir=self._official_auth.directory
+                )
+                try:
+                    user = probe.get_user_detail()
+                except QzAPIError as exc:
+                    if not getattr(exc, "action_required", False):
+                        raise
+                    probe._configured_auth_mode = "auto"
+                    probe._activate_legacy_fallback(
+                        oauth_exc=exc, probe=True, allow_password=False
+                    )
+                    user = probe.get_user_detail()
+                    status = probe.auth_status(check=False)
+                else:
+                    status = self._official_auth.status()
+                    status["configured_auth_mode"] = "auto"
+                    status["fallback_active"] = False
+            else:
+                user = self.get_user_detail()
+                status = self._official_auth.status()
+            status.update(
+                {
+                    "authenticated": True,
+                    "user": {"id": user.get("id"), "name": user.get("name")},
+                }
+            )
+        return status
+
+    def auth_refresh(self, check=False):
+        if self.auth_mode == "legacy":
+            raise QzAPIError(
+                "auth refresh 仅用于原生官方 OAuth 模式；legacy 模式会在会话过期时自动重登"
+            )
+        try:
+            status = self._official_auth.refresh()
+        except Exception as exc:
+            from .qz_auth import OfficialAuthError
+
+            if isinstance(exc, OfficialAuthError):
+                error = QzAPIError(str(exc), 401 if exc.action_required else None)
+                error.action_required = exc.action_required
+                if getattr(exc, "diagnostic", None) is not None:
+                    error.diagnostic = exc.diagnostic
+                raise error from exc
+            raise
         if check:
             user = self.get_user_detail()
             status = self._official_auth.status()
@@ -3730,11 +3869,15 @@ def get_api() -> QzAPI:
     global _api_instance
     from .config import get_qz_config_dir
 
+    desired_mode = get_auth_mode()
+    desired_fallback = allows_cas_fallback()
     if (
         _api_instance is None
-        or _api_instance.auth_mode != get_auth_mode()
+        or getattr(_api_instance, "_configured_auth_mode", _api_instance.auth_mode)
+        != desired_mode
+        or getattr(_api_instance, "_allow_cas_fallback", None) != desired_fallback
         or (
-            _api_instance.auth_mode == "qz"
+            _api_instance._official_auth is not None
             and _api_instance._official_auth.directory != get_qz_config_dir()
         )
     ):

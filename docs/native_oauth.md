@@ -1,6 +1,6 @@
 # Python 原生官方 OAuth：实现与验收
 
-本页对应 `v0.6.0`（2026-11-18 发布，同步 GitHub 与 Gitee `master`）。相比依赖外部 Go `qz` 的 v0.5.0，v0.6.0 完全由 Python 原生完成设备码授权与自动续期，并默认申请 `offline_access` 获取离线刷新令牌（`typ=Offline`），已通过隔夜 >10 小时零请求静置后的毫秒级自动续期实测。
+本页记录 Python 原生官方设备码 OAuth 的实现与验收。相比依赖外部 Go `qz` 的 v0.5.0，v0.6.0+ 完全由 Python 原生完成设备码授权与自动续期。平台 Keycloak 已于 2026-11-18 晚停用 `offline_access` 离线刷新权限（旧 `typ=Offline` 令牌刷新会返回 `invalid_grant`），因此默认 scope 已对齐官方 `qz v1.0.0` 收敛为 `openid profile email`，并新增 `qzcli auth refresh` 主动续期保活命令与旧 `Offline` 令牌自动替换逻辑。
 
 OAuth 是官方授权协议；设备授权让用户在浏览器完成平台登录与双因子验证，命令行仅持有令牌。访问令牌（AT）用于业务请求，刷新令牌（RT）换取新 AT。旧 Cookie 历史约一天、刷新授权历史约六天是迁移动机，实际窗口以服务端为准；不是每次刷新都会重新延长六天。
 
@@ -43,7 +43,7 @@ flowchart TD
 
 ## 请求、凭据和到期决策
 
-新设备授权默认使用 `POST /api/v1/public/auth/device-code`，JSON scope 为 `openid profile email offline_access`（实测平台 `inspire-studio` 客户端透传 `offline_access` 并签发 `typ=Offline` 的离线刷新令牌，不受 Keycloak 在线会话约 8~12 小时 `SSO Session Idle` 隔夜回收及 7 天 `MaxLifespan` 硬上限限制；另保留 `--oauth-client inspire-code` 直连 Keycloak 设备码通道作备选）。按官方返回间隔轮询 `token`，使用设备授权 grant。`authorization_pending` 等待，`slow_down` 延长五秒；拒绝、到期、网络或服务端异常保留完整脱敏响应，不无界重试。Keycloak 对离线刷新令牌返回 `exp=0` / `refresh_expires_in=0`（表示无固定截止时间戳），解析层将其识别为 `state=unexpired, token_type=Offline, expires_at=null`，不会误判为 1970 年过期。
+新设备授权默认使用 `POST /api/v1/public/auth/device-code`，JSON scope 为 `openid profile email`（与官方 Go `qz v1.0.0` 一致；桌面交互终端自动打开确认页，`--no-browser` 或 SSH/无界面环境自动跳过）。由于平台已停用 `offline_access`，本地若仍残留旧 `typ=Offline` 令牌，`qzcli auth status` 会标记 `offline_deprecated=true` 并提示告警，执行 `qzcli login`（无需额外传 `--reauth`）即可直接覆盖为新的在线会话令牌（`typ=Refresh`）。针对在线会话约 12 小时 `SSO Session Idle` 闲置回收与约一周 `MaxLifespan` 上限，提供两层保障：（1）定时执行 `qzcli auth refresh` 主动轮换令牌重置 12 小时闲置计时；（2）管线与 Agent 可设置 `QZCLI_AUTH_MODE=auto`（或在 `~/.qzcli/config.json` 设 `"auth_mode": "auto"`），平时走 OAuth，OAuth 到期时自动无感回退本地 CAS 会话续跑，一旦遇到图形验证码、二次验证或密码冲突则 **0 次重试立即熔断**，并提示用户直接运行 `qzcli login` 在浏览器点确认恢复。解析层仍保留对 `exp=0` / `refresh_expires_in=0` 的防御处理，不会误判为 1970 年过期。
 
 平台新客户端使用 JSON `POST /api/v1/public/auth/refresh`。旧 Go 凭据的公共客户端是 `inspire-code`；当前实测该 RT 送入平台网关返回 HTTP 400 `invalid_grant`，原 Keycloak 表单 refresh 成功。因此旧凭据采用配置的认证服务 `/realms/inf-internal/protocol/openid-connect/token`，表单字段为 `client_id=inspire-code`、`grant_type=refresh_token` 和 RT。根据已知客户端与配置的 issuer 选择协议；不从任意 JWT issuer 派生 URL，不在失败后换客户端盲试。
 
@@ -66,6 +66,7 @@ qzcli 按目录协调线程和进程。锁内重读可复用新令牌，失败�
 qzcli --version
 qzcli init
 qzcli auth status --check
+qzcli auth refresh --check   # 主动续期保活（可挂 cron/launchd 重置闲置超时）
 qzcli list -c -w 分布式 -n 5
 qzcli avail -v --lp -w 分布式
 qzcli login --reauth   # 仅在明确需要建立新授权时

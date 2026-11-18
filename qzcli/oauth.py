@@ -16,7 +16,7 @@ from .qz_auth import LoginRequired, OfficialAuthError
 
 
 DEVICE_GRANT = "urn:ietf:params:oauth:grant-type:device_code"
-DEFAULT_SCOPE = "openid profile email offline_access"
+DEFAULT_SCOPE = "openid profile email"
 
 
 @dataclass(frozen=True)
@@ -78,7 +78,7 @@ class DeviceOAuth:
         return trace
 
     @staticmethod
-    def _failure(endpoint, response, trace, body):
+    def _failure(endpoint, response, trace, body, *, offline_token=False):
         error = (
             (body.get("error") or body.get("message"))
             if isinstance(body, dict)
@@ -97,8 +97,14 @@ class DeviceOAuth:
             }
             else OfficialAuthError
         )
+        prefix = (
+            "平台已停用离线刷新令牌（offline_access），当前 Offline 令牌无法续期；"
+            "请运行 qzcli login --reauth 重新获取在线会话令牌。\n"
+            if cls is LoginRequired and offline_token
+            else ""
+        )
         exc = cls(
-            f"OAuth {endpoint}: HTTP {response.status_code}\n{trace.redact(response.text)}"
+            f"{prefix}OAuth {endpoint}: HTTP {response.status_code}\n{trace.redact(response.text)}"
         )
         exc.diagnostic = trace
         return exc
@@ -179,6 +185,7 @@ class DeviceOAuth:
             claims = json.loads(base64.urlsafe_b64decode(part + "=" * (-len(part) % 4)))
         except (IndexError, ValueError, UnicodeDecodeError):
             claims = {}
+        is_offline = isinstance(claims, dict) and claims.get("typ") == "Offline"
         old_client = (
             isinstance(claims, dict)
             and claims.get("azp") == "inspire-code"
@@ -196,14 +203,18 @@ class DeviceOAuth:
                 form=True,
             )
             if response.status_code != 200 or body.get("error"):
-                raise self._failure("refresh", response, trace, body)
+                raise self._failure(
+                    "refresh", response, trace, body, offline_token=is_offline
+                )
             normalized = {"data": body}
         else:
             response, body, trace = self._post(
                 "refresh", {"refresh_token": refresh_token}
             )
             if response.status_code != 200 or body.get("code") != 0:
-                raise self._failure("refresh", response, trace, body)
+                raise self._failure(
+                    "refresh", response, trace, body, offline_token=is_offline
+                )
             normalized = body
         return self._tokens("refresh", response, normalized, trace)
 
