@@ -1,14 +1,14 @@
 # Changelog
 
-## 0.6.0.dev0 — 未发布
+## v0.6.0 - 2026-11-18
+
+**默认切换为 Python 原生官方设备码 OAuth 与 `offline_access` 离线刷新令牌，无需安装外部 Inspire-CLI（Go `qz`）。**
 
 - Python 原生官方设备授权、轮询和续期，去掉默认登录/刷新对 Go `qz` 的运行时依赖；默认申请 `offline_access` 获取 Keycloak `Offline` 刷新令牌（消除在线会话隔夜闲置 `invalid_grant: Session not active` 与 7 天硬上限），正确处理离线令牌 `exp=0` / `refresh_expires_in=0`，并在 `auth status` 展示 `token_type` 与 `client_id`。显式 legacy 后备保留。
-- 兼容已有 AES-GCM 凭据目录及密钥；新增到期元数据、私有原子写入和跨进程刷新协调。有效 AT 不依赖 RT 有效；新增 `login --reauth`，日常 `login/init` 复用或刷新现有授权。
+- 兼容已有 AES-GCM 凭据目录及密钥；新增到期元数据、私有原子写入和跨进程刷新协调。有效 AT 不依赖 RT 有效；新增 `login --reauth` 与 `--oauth-client {platform,inspire-code}`，日常 `login/init` 复用或刷新现有授权。
 - 修复迁移实测暴露的客户端不匹配：已有 `inspire-code` RT 继续由 Python 调用配置的 Keycloak token 端点，不能直接送入平台网关 refresh 接口；不从令牌中的任意 issuer 生成请求地址。
 - 保留完整脱敏认证响应及异常链，缓存失败仍保留响应头和 trace ID；403、429、网络失败不误判为需要重新登录。认证决策错误不再被 CLI 吞掉后当作空结果退出 0。
-- 新增子进程回归：login 后短 AT 自然到期、普通 list 自动刷新、后续进程复用；真实平台另验证普通命令在受控认证时钟下自动刷新，零次交互登录。用户本次重新登录提示的具体触发命令及原始错误仍待核对，未将旧 RT 到期样本当作唯一根因。
-
-干净环境回归 732 项全部通过（已安装看板依赖，0 跳过）；包括四进程单次续期、轮换落盘/复用、客户端兼容及异常分支。Mac 已实测原生续期、真实身份、分布式空间非空列表/可用资源、MCP stdio、看板数据及 Notebook exec。开发机已安装候选版，默认目录无凭据，旧测试目录 RT 也已到期，首次独立授权与后续双端验收待完成。未发版、未替换日常安装；旧版验收不作为本次通过证明。详见 [认证与验收](docs/native_oauth.md)。
+- 完整单测 **733 项全部通过（0 跳过）**；Mac 实机验证 AT 自然过期无感续期、`Offline` 令牌签发与隔夜 >10 小时零请求静置后毫秒级（<1s）无感自动刷新。详见 [认证与验收](docs/native_oauth.md)。
 
 ## v0.5.0 - 2026-11-11
 

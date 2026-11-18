@@ -6,12 +6,13 @@
 
 ## 项目链接
 
-- Release: <https://github.com/tianyilt/qzcli_tool/releases>
+- GitHub: <https://github.com/tianyilt/qzcli_tool>（Release: <https://github.com/tianyilt/qzcli_tool/releases/tag/v0.6.0>）
+- Gitee 所内镜像: <https://gitee.sii.edu.cn/sii/repos/sii/qzcli/sources>（clone: `https://gitee.sii.edu.cn/sii/qzcli.git`）
 - Changelog: [CHANGELOG.md](CHANGELOG.md)
 - Issues: <https://github.com/tianyilt/qzcli_tool/issues>
 - License: [MIT](LICENSE)
 
-本开发分支为 **0.6.0.dev0 原生 OAuth 候选版，尚未发布**。已发布的 v0.5.0 仍依赖官方 Go `qz`；本分支直接用 Python 完成网页设备授权和续期，无需安装 Inspire-CLI。详见 [认证实现与验收](docs/native_oauth.md)。
+v0.6.0 起默认使用 **Python 原生官方 OAuth + `Offline` 离线刷新令牌**，无需安装外部 Go `qz`（Inspire-CLI），消除隔夜闲置 `invalid_grant: Session not active` 重复网页登录问题。详见 [认证实现与验收](docs/native_oauth.md)。
 
 ## 特性
 
@@ -219,7 +220,7 @@ qzcli ls -c -w 分布式 -r
 | `auth status` | 分别显示两枚 token 的到期状态，不显示凭据 | `qzcli auth status --check` |
 | `cookie` | legacy 手动 Cookie | `qzcli --auth-mode legacy cookie -f cookies.txt` |
 
-本分支只需安装 qzcli 的 Python 包和声明的依赖，无需 Go `qz`、整个 InspireSkill 或 Chromium。浏览器只用于平台要求的人工验证。兼容认证目录仍为 `~/.config/inspire-cli`，由 `QZ_CLI_CONFIG_DIR` 或根参数 `--qz-config-dir` 指定；可直接读取已有加密凭据，续期时原子保存两枚新令牌及到期时间。`QZCLI_HOME` 只隔离配置、资源和任务记录；选择同一凭据目录的调用仍共享一条刷新链。各主机应独立授权，不复制刷新令牌链。
+v0.6.0 起只需安装 qzcli 的 Python 包和声明的依赖，无需 Go `qz`、整个 InspireSkill 或 Chromium。浏览器只用于平台要求的人工验证。兼容认证目录仍为 `~/.config/inspire-cli`，由 `QZ_CLI_CONFIG_DIR` 或根参数 `--qz-config-dir` 指定；可直接读取已有加密凭据，续期时原子保存两枚新令牌及到期时间。`QZCLI_HOME` 只隔离配置、资源和任务记录；选择同一凭据目录的调用仍共享一条刷新链。各主机应独立授权，不复制刷新令牌链。
 
 ```bash
 qzcli init                     # 已有 AT/RT 可用时直接复用/续期
