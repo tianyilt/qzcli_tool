@@ -174,6 +174,16 @@ _REAL_ID_RE = re.compile(r"\b(ws|project|lcg|cg|user|nb)-([0-9a-f]{8})\b", re.I)
 #: 明显编造的占位 ID：同一个字符重复，或 1234abcd 这种键盘序。
 _FAKE_ID_RE = re.compile(r"^(?:(.)\1{7}|1234abcd|0*)$", re.I)
 
+# Keep the private alias out of public examples, including abbreviated names.
+# Construct it here so the guard itself does not become a workspace example.
+_PRIVATE_WORKSPACE_ALIAS = bytes((67, 73)).decode("ascii")
+_PRIVATE_WORKSPACE_EXAMPLE_RE = re.compile(
+    r"(?:['\"]" + _PRIVATE_WORKSPACE_ALIAS + r"(?:-[^'\"\n]*)?['\"]"
+    r"|\b" + _PRIVATE_WORKSPACE_ALIAS + r"-[\u3400-\u9fff][\w-]*"
+    r"|(?:-w|--workspace)(?:\s+|=)['\"]?" + _PRIVATE_WORKSPACE_ALIAS + r"\b)",
+    re.IGNORECASE,
+)
+
 
 class NoInternalIdentifiersTests(unittest.TestCase):
     """public 仓库里不许出现内部项目名和真实资源 ID。
@@ -233,6 +243,37 @@ class NoInternalIdentifiersTests(unittest.TestCase):
             + "\n  ".join(offenders)
             + "\n\n换成明显编造的（如 ws-11111111-1111-4111-8111-111111111111）。",
         )
+
+    def test_no_private_workspace_aliases_in_examples(self):
+        offenders = [
+            f"{path.relative_to(REPO)}:{text[:match.start()].count(chr(10)) + 1}"
+            for path, text in self._tracked_text()
+            for match in _PRIVATE_WORKSPACE_EXAMPLE_RE.finditer(text)
+        ]
+        self.assertEqual(
+            offenders, [],
+            "Public workspace examples must use 分布式; private aliases found at:\n"
+            + "\n".join(offenders),
+        )
+
+    def test_private_alias_guard_covers_commands_and_fixtures(self):
+        alias = _PRIVATE_WORKSPACE_ALIAS
+        for sample in (
+            f"qzcli avail -v --lp -w {alias}",
+            f"qzcli list --workspace={alias}",
+            f'WS_NAME = "{alias}-测试空间"',
+            f'project_name = "{alias}-项目"',
+            f'{{"name": "{alias}"}}',
+        ):
+            with self.subTest(sample_type=sample.split()[0]):
+                self.assertIsNotNone(_PRIVATE_WORKSPACE_EXAMPLE_RE.search(sample))
+        for public in (
+            "qzcli avail -v --lp -w 分布式",
+            'WS_NAME = "分布式-测试空间"',
+            f"Run tests in {alias} before merging",
+            f"Use {alias}-only runners for tests",
+        ):
+            self.assertIsNone(_PRIVATE_WORKSPACE_EXAMPLE_RE.search(public))
 
     def test_the_check_would_have_caught_the_half_redaction(self):
         """自检：喂**上次真漏掉的那个形状**，必须被抓到。

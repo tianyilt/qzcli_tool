@@ -1,5 +1,7 @@
 # v2 接口 cookie 认证探针报告
 
+> 版本说明：本文保留历史 Cookie 接口探针及数字；当前开发分支默认采用 Python 原生官方 OAuth，Cookie 为显式 legacy 后备。认证实现和本轮验收见 [native_oauth.md](native_oauth.md)。
+
 - qz spec 版本：`cf22fdbe`
 - 探测 Action 数：**109**（只读 `List*`/`Get*`，写操作全部跳过）
 - ✅ **cookie 被接受：99**（返回 JSON = 认证通过）

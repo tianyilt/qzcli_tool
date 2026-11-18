@@ -444,7 +444,7 @@ def _availability_result(
 
 
 @server.tool(
-    description="检查官方 qz 认证；需网页登录时在终端运行 qzcli login。显式 legacy 模式支持原 CAS 密码登录。"
+    description="检查 Python 原生官方 OAuth 认证；需网页登录时在终端运行 qzcli login。显式 legacy 模式支持原 CAS 密码登录。"
 )
 def qz_auth_login(
     username: str = "", password: str = "", workspace_id: str = ""

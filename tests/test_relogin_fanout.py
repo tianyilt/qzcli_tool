@@ -247,7 +247,7 @@ class AvailWithExpiredCookieTests(unittest.TestCase):
         import argparse
 
         args = argparse.Namespace(
-            workspace="ci",
+            workspace="分布式",
             nodes=None,
             group=None,
             low_priority=True,
@@ -264,7 +264,7 @@ class AvailWithExpiredCookieTests(unittest.TestCase):
             return_value=[
                 {
                     "id": "ws-1",
-                    "name": "ci-空间",
+                    "name": "分布式空间",
                     "updated_at": 0,
                     "project_count": 0,
                     "compute_group_count": 6,
@@ -275,7 +275,7 @@ class AvailWithExpiredCookieTests(unittest.TestCase):
             cli,
             "get_workspace_resources",
             return_value={
-                "name": "ci-空间",
+                "name": "分布式空间",
                 "compute_groups": {
                     f"lcg-{i}": {"id": f"lcg-{i}", "name": f"组{i}"} for i in range(6)
                 },
@@ -307,7 +307,7 @@ class AvailWithExpiredCookieTests(unittest.TestCase):
                 raise QzAPIError("Cookie 已过期或无效", 401)
 
             def list_workspaces(self, cookie):
-                return [{"id": "ws-1", "name": "ci-空间"}]
+                return [{"id": "ws-1", "name": "分布式空间"}]
 
         api = _ExpiredAPI(fail_with=QzAPIError("CAS 要求验证码"))
         display = _SilentDisplay()
@@ -331,7 +331,7 @@ class AvailWithExpiredCookieTests(unittest.TestCase):
                 raise QzAPIError("Cookie 已过期或无效", 401)
 
             def list_workspaces(self, cookie):
-                return [{"id": "ws-1", "name": "ci-空间"}]
+                return [{"id": "ws-1", "name": "分布式空间"}]
 
         api = _ExpiredAPI(fail_with=QzAPIError("CAS 要求验证码"))
         display = _SilentDisplay()

@@ -37,12 +37,12 @@
 
 # 测试里反复用到的固定 id。取成可读的假值，方便断言失败时一眼看出是哪个。
 WS_ID = "ws-11111111-1111-1111-1111-111111111111"
-WS_NAME = "CI-测试空间"
+WS_NAME = "分布式-测试空间"
 LCG_ID = "lcg-22222222-2222-2222-2222-222222222222"
-LCG_NAME = "ci-计算组"
+LCG_NAME = "示例计算组"
 OTHER_LCG_ID = "lcg-33333333-3333-3333-3333-333333333333"
 PROJECT_ID = "project-44444444-4444-4444-4444-444444444444"
-PROJECT_NAME = "ci-项目"
+PROJECT_NAME = "示例项目"
 SPEC_ID = "55555555-5555-5555-5555-555555555555"
 
 
@@ -52,7 +52,7 @@ def _compute_group(lcg_id=LCG_ID, name=LCG_NAME):
         "name": name,
         "compute_group_id": "cg-" + lcg_id[4:],
         "compute_group_name": name,
-        "cluster_id": "cluster-ci",
+        "cluster_id": "cluster-example",
         "workspace_id": WS_ID,
     }
 
