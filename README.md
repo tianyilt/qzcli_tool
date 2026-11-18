@@ -12,7 +12,7 @@
 - Issues: <https://github.com/tianyilt/qzcli_tool/issues>
 - License: [MIT](LICENSE)
 
-v0.6.0 起默认使用 **Python 原生官方 OAuth + `Offline` 离线刷新令牌**，无需安装外部 Go `qz`（Inspire-CLI），消除隔夜闲置 `invalid_grant: Session not active` 重复网页登录问题。详见 [认证实现与验收](docs/native_oauth.md)。
+v0.6.1+ 默认使用 **Python 原生官方设备码 OAuth**（scope `openid profile email`，与官方 `qz v1.0.0` 对齐），无需安装外部 Go `qz`（Inspire-CLI）；平台停用 `offline_access` 后，支持 `qzcli auth refresh` 定时保活，并为管线/Agent 提供 **`--auth-mode auto`（`QZCLI_AUTH_MODE=auto`）**：优先走 OAuth，OAuth 会话到期时自动回退本地 CAS 会话续跑，一旦遇到验证码或二次验证立即熔断停止并提示用户直接运行 `qzcli login`（桌面端自动弹出确认页）。详见 [认证实现与验收](docs/native_oauth.md)。
 
 ## 特性
 
