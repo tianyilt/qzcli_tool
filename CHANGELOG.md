@@ -1,5 +1,15 @@
 # Changelog
 
+## v0.6.1 - 2026-11-19
+
+**适配平台停用 `offline_access`：默认切换回官方 `openid profile email` 在线会话令牌，新增 `qzcli auth refresh` 保活与零配置无人值守 CAS 自动兜底。**
+
+- **对齐官方 `qz v1.0.0` OAuth scope**：平台 Keycloak 于 2026-11-18 晚移除 `offline_access` 授权，旧 `typ=Offline` 令牌刷新全部返回 `invalid_grant`。默认 `DEFAULT_SCOPE` 已改为 `openid profile email`；`qzcli auth status` 会识别残留 `Offline` 令牌并提示告警，直接执行 `qzcli login`（无需额外加 `--reauth`）即可自动覆盖为在线 `Refresh` 令牌。
+- **桌面端自动打开浏览器确认页**：本机交互终端运行 `qzcli login` / `qzcli init` 自动唤起默认浏览器直达预填授权码确认页；SSH、非交互子进程、`--no-browser` 或 `QZCLI_NO_BROWSER=1` 自动静默跳过。
+- **新增 `qzcli auth refresh [--check]` 主动续期保活**：即使当前 `access_token` 尚未到期，也会在跨进程锁保护下主动用 `refresh_token` 轮换新令牌对落盘，实测将服务端 12 小时 `SSO Session Idle` 到期窗口顺延重置。
+- **零配置 7×24 管线/Agent 无人值守自动兜底**：默认模式（`qz` 及显式 `auto`）平时优先使用 OAuth 令牌（零密码请求）；当 OAuth 会话在夜间或 7 天上限到期（`action_required`）且本机已配置 `~/.qzcli/.env` 或 `config.json` 凭据时，自动无缝回退至带文件锁与去重保护的本地 CAS 会话续跑，避免凌晨中断大规模管线；一旦遇到图形验证码、二次验证或密码冲突则 **0 次重试立即熔断**并提示运行 `qzcli login` 人工确认（如需严格禁止密码回退可显式指定 `--auth-mode native`）。
+- 完整单测增至 **737 项通过**，`test_no_secrets_in_repo` 与 `test_no_silent_swallow` 全绿，Mac 真机完成在线令牌签发、`auth refresh --check` 轮换顺延与业务列表验收。
+
 ## v0.6.0 - 2026-11-18
 
 **默认切换为 Python 原生官方设备码 OAuth 与 `offline_access` 离线刷新令牌，无需安装外部 Inspire-CLI（Go `qz`）。**
