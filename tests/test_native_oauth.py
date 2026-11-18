@@ -93,7 +93,8 @@ class NativeProtocolTests(unittest.TestCase):
         calls = self.http.post.call_args_list
         self.assertTrue(calls[0].args[0].endswith("/api/v1/public/auth/device-code"))
         self.assertEqual(calls[0].kwargs["json"], {"scope": DEFAULT_SCOPE})
-        self.assertIn("offline_access", DEFAULT_SCOPE)
+        self.assertEqual(DEFAULT_SCOPE, "openid profile email")
+        self.assertNotIn("offline_access", DEFAULT_SCOPE)
         self.assertEqual(
             calls[1].kwargs["json"],
             {"device_code": "private-device-value", "grant_type": DEVICE_GRANT},
@@ -374,6 +375,8 @@ class NativeProtocolTests(unittest.TestCase):
             self.assertEqual(st["refresh_token"]["state"], "unexpired")
             self.assertEqual(st["refresh_token"]["token_type"], "Offline")
             self.assertIsNone(st["refresh_token"]["expires_at"])
+            self.assertTrue(st.get("offline_deprecated"))
+            self.assertIn("offline_access", st.get("warning", ""))
             calls = self.http.post.call_args_list
             self.assertEqual(
                 calls[0].args[0],
@@ -383,7 +386,7 @@ class NativeProtocolTests(unittest.TestCase):
                 calls[0].kwargs["data"],
                 {"client_id": "inspire-code", "scope": DEFAULT_SCOPE},
             )
-            # Advance clock 3 days past AT expiry: offline RT must auto-refresh without login
+            # Advance clock 3 days past AT expiry: exp=0 RT still attempts refresh if server accepts
             rotated_at = make_jwt({"exp": int(NOW + 400000), "typ": "Bearer"})
             self.http.post.reset_mock()
             self.http.post.side_effect = None
@@ -398,6 +401,278 @@ class NativeProtocolTests(unittest.TestCase):
             later = OfficialAuth(root, now=lambda: NOW + 259200, oauth=self.oauth)
             self.assertEqual(later.token(), rotated_at)
             self.http.post.assert_called_once()
+
+    def test_revoked_offline_token_explains_reauth_and_plain_login_replaces_it(self):
+        import base64
+
+        def make_jwt(claims):
+            encoded = (
+                base64.urlsafe_b64encode(json.dumps(claims).encode())
+                .decode()
+                .rstrip("=")
+            )
+            return "header." + encoded + ".signature"
+
+        offline_rt = make_jwt(
+            {
+                "iss": "https://keycloak-inspire-prod.sii.edu.cn/realms/inf-internal",
+                "azp": "inspire-studio",
+                "typ": "Offline",
+                "exp": 0,
+            }
+        )
+        online_rt = make_jwt(
+            {
+                "iss": "https://keycloak-inspire-prod.sii.edu.cn/realms/inf-internal",
+                "azp": "inspire-studio",
+                "typ": "Refresh",
+                "exp": int(NOW + 604800),
+            }
+        )
+        valid_at = make_jwt({"exp": int(NOW + 1800), "typ": "Bearer"})
+        fresh_at = make_jwt({"exp": int(NOW + 3600), "typ": "Bearer"})
+
+        # 1. Refreshing a revoked Offline RT gives actionable message + preserves raw evidence
+        self.http.post.return_value = response(
+            {"code": -100000, "message": "invalid_grant"}, 400
+        )
+        with self.assertRaises(OfficialAuthError) as ctx:
+            self.oauth.refresh(offline_rt)
+        self.assertTrue(ctx.exception.action_required)
+        rendered = format_exception(ctx.exception)
+        self.assertIn("平台已停用离线刷新令牌", rendered)
+        self.assertIn("qzcli login --reauth", rendered)
+        self.assertIn("invalid_grant", rendered)
+        self.assertIn("trace-unique-end", rendered)
+
+        # 2. Plain `login()` replaces an existing Offline RT even while AT is still unexpired
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            config.save_qz_credentials(
+                root,
+                {
+                    "token": valid_at,
+                    "access_expires_at": NOW + 1800,
+                    "refresh_token": offline_rt,
+                    "refresh_expires_at": None,
+                },
+            )
+            self.http.post.reset_mock()
+            self.http.post.side_effect = [
+                self.device(),
+                response(tokens(fresh_at, online_rt)),
+            ]
+            provider = OfficialAuth(root, now=lambda: NOW, oauth=self.oauth)
+            st = provider.login(notify=Mock())
+            self.assertEqual(st["refresh_token"]["token_type"], "Refresh")
+            self.assertFalse(st.get("offline_deprecated", False))
+            self.assertEqual(self.http.post.call_count, 2)
+
+    def test_proactive_refresh_renews_even_when_access_token_is_still_valid(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            config.save_qz_credentials(
+                root,
+                {
+                    "token": "still-valid-access",
+                    "access_expires_at": NOW + 1800,
+                    "refresh_token": "active-online-refresh",
+                    "refresh_expires_at": NOW + 43200,
+                },
+            )
+            self.http.post.return_value = response(
+                tokens("proactively-rotated-access", "proactively-rotated-refresh")
+            )
+            provider = OfficialAuth(root, now=lambda: NOW, oauth=self.oauth)
+            st = provider.refresh()
+            self.http.post.assert_called_once()
+            saved = config.read_qz_credentials(root)
+            self.assertEqual(saved["token"], "proactively-rotated-access")
+            self.assertEqual(saved["refresh_token"], "proactively-rotated-refresh")
+            self.assertEqual(st["access_token"]["state"], "unexpired")
+
+    def test_notify_auto_opens_browser_only_on_interactive_local_desktop(self):
+        with (
+            patch.dict(os.environ, {}, clear=True),
+            patch("sys.platform", "darwin"),
+            patch("sys.stdout.isatty", return_value=True),
+            patch("webbrowser.open", return_value=True) as wb_open,
+        ):
+            OfficialAuth._notify("https://example.invalid/device", "ABCD-EFGH")
+            wb_open.assert_called_once_with("https://example.invalid/device")
+
+        for env_extra, isatty, open_flag in [
+            ({"SSH_CONNECTION": "1.2.3.4 1234 5.6.7.8 22"}, True, True),
+            ({"QZCLI_NO_BROWSER": "1"}, True, True),
+            ({}, False, True),
+            ({}, True, False),
+        ]:
+            with (
+                patch.dict(os.environ, env_extra, clear=True),
+                patch("sys.platform", "darwin"),
+                patch("sys.stdout.isatty", return_value=isatty),
+                patch("webbrowser.open", return_value=True) as wb_open,
+            ):
+                OfficialAuth._notify(
+                    "https://example.invalid/device",
+                    "ABCD-EFGH",
+                    open_browser=open_flag,
+                )
+                wb_open.assert_not_called()
+
+
+class AutoFallbackModeTests(unittest.TestCase):
+    def test_auto_mode_uses_oauth_when_valid_and_falls_back_to_cas_when_rt_expired(self):
+        from qzcli import api as api_mod
+
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            state = root / "state"
+            official = root / "official"
+            state.mkdir()
+            official.mkdir()
+            with (
+                patch.object(config, "CONFIG_DIR", state),
+                patch.object(config, "CONFIG_FILE", state / "config.json"),
+                patch.object(config, "COOKIE_FILE", state / ".cookie"),
+                patch.object(api_mod, "CONFIG_DIR", state),
+                patch.object(api_mod, "get_credentials", return_value=("fake-u", "fake-p")),
+                patch.object(
+                    api_mod,
+                    "get_credentials_with_source",
+                    return_value=("fake-u", "fake-p", "config", "config"),
+                ),
+                patch.object(api_mod, "credential_conflict", return_value=[]),
+            ):
+                api_mod._clear_relogin_failure()
+                # 1. Valid OAuth AT -> stays in qz mode, zero CAS calls
+                config.save_qz_credentials(
+                    official,
+                    {
+                        "token": "valid-auto-at",
+                        "access_expires_at": time.time() + 3600,
+                        "refresh_token": "valid-auto-rt",
+                        "refresh_expires_at": time.time() + 43200,
+                    },
+                )
+                client = api_mod.QzAPI(auth_mode="auto", qz_config_dir=official)
+                with (
+                    patch.object(
+                        api_mod,
+                        "_curl_post",
+                        return_value=response(
+                            {"Result": {"id": "user-fake", "name": "fake-auto"}}
+                        ),
+                    ) as post,
+                    patch.object(client, "login_with_cas") as cas_login,
+                ):
+                    user = client.get_user_detail()
+                    self.assertEqual(user["id"], "user-fake")
+                    self.assertEqual(client.auth_mode, "qz")
+                    cas_login.assert_not_called()
+                    self.assertIn(
+                        "Bearer valid-auto-at",
+                        post.call_args.kwargs["headers"]["authorization"],
+                    )
+
+                # 2. Expired OAuth RT (LoginRequired) -> seamlessly falls back to CAS session
+                config.save_qz_credentials(
+                    official,
+                    {
+                        "token": "expired-auto-at",
+                        "access_expires_at": time.time() - 60,
+                        "refresh_token": "",
+                    },
+                )
+                client2 = api_mod.QzAPI(auth_mode="auto", qz_config_dir=official)
+
+                def fake_post(url, **kwargs):
+                    hdrs = kwargs.get("headers") or {}
+                    if hdrs.get("cookie") == "inspire-session=fresh-cas-cookie":
+                        r = response({"Result": {"id": "user-cas", "name": "cas-ok"}})
+                        r.headers["Content-Type"] = "application/json"
+                        return r
+                    r = response({"error": "unauthorized"}, 401)
+                    r.headers["Content-Type"] = "application/json"
+                    return r
+
+                with (
+                    patch.object(api_mod, "_curl_post", side_effect=fake_post),
+                    patch.object(
+                        client2,
+                        "login_with_cas",
+                        return_value="inspire-session=fresh-cas-cookie",
+                    ) as cas_login,
+                ):
+                    user2 = client2.get_user_detail()
+                    self.assertEqual(user2["id"], "user-cas")
+                    self.assertEqual(client2.auth_mode, "legacy")
+                    self.assertTrue(client2._auto_fallback_active)
+                    cas_login.assert_called_once_with("fake-u", "fake-p")
+
+                # 2b. Default mode (no --auth-mode auto needed!) ALSO falls back at 3 AM when credentials exist,
+                # whereas explicit auth_mode="native" stays strict OAuth-only.
+                (state / ".cookie").unlink(missing_ok=True)
+                default_client = api_mod.QzAPI(qz_config_dir=official)
+                with (
+                    patch.object(api_mod, "_curl_post", side_effect=fake_post),
+                    patch.object(
+                        default_client,
+                        "login_with_cas",
+                        return_value="inspire-session=fresh-cas-cookie",
+                    ) as cas_login_def,
+                ):
+                    self.assertEqual(default_client.get_user_detail()["id"], "user-cas")
+                    cas_login_def.assert_called_once_with("fake-u", "fake-p")
+
+                strict_client = api_mod.QzAPI(auth_mode="native", qz_config_dir=official)
+                with patch.object(strict_client, "login_with_cas") as cas_login_strict:
+                    with self.assertRaises(api_mod.QzAPIError):
+                        strict_client.get_user_detail()
+                    cas_login_strict.assert_not_called()
+
+                # 3. Transient OAuth network failure (action_required=False) -> NO CAS fallback
+                client3 = api_mod.QzAPI(auth_mode="auto", qz_config_dir=official)
+                with (
+                    patch.object(
+                        client3._official_auth,
+                        "token",
+                        side_effect=OfficialAuthError("502 Bad Gateway", action_required=False),
+                    ),
+                    patch.object(client3, "login_with_cas") as cas_login,
+                ):
+                    with self.assertRaisesRegex(api_mod.QzAPIError, "502 Bad Gateway"):
+                        client3.get_user_detail()
+                    cas_login.assert_not_called()
+
+                # 4. CAS hits CAPTCHA -> 0 retries, immediate human-login prompt, cooldown blocks repeat
+                api_mod._clear_relogin_failure()
+                (state / ".cookie").unlink(missing_ok=True)
+                client4 = api_mod.QzAPI(auth_mode="auto", qz_config_dir=official)
+                captcha_err = api_mod.QzAPIError(
+                    "CAS 返回：请输入图形验证码\n当前密码登录方式尚不支持图形验证码输入。",
+                    401,
+                )
+                with (
+                    patch.object(
+                        api_mod,
+                        "_curl_post",
+                        return_value=response({"error": "unauthorized"}, 401),
+                    ),
+                    patch.object(
+                        client4, "login_with_cas", side_effect=captcha_err
+                    ) as cas_login,
+                ):
+                    for _ in range(2):
+                        c = api_mod.QzAPI(auth_mode="auto", qz_config_dir=official)
+                        with patch.object(c, "login_with_cas", cas_login):
+                            with self.assertRaises(api_mod.QzAPIError) as ctx:
+                                c.get_user_detail()
+                            self.assertIn("需人工介入", str(ctx.exception))
+                            self.assertIn("qzcli login", str(ctx.exception))
+                    # Cooldown prevents hammering CAS when CAPTCHA is active
+                    cas_login.assert_called_once()
+                api_mod._clear_relogin_failure()
 
 
 def _child_refresh(directory, gate, results):
@@ -517,7 +792,10 @@ class OrdinaryCliExpiryTests(unittest.TestCase):
                     )
                     value["data"]["expires_in"] = 2
                 elif self.path.endswith("/refresh"):
-                    if payload.get("refresh_token") != "fake-initial-cli-refresh":
+                    if payload.get("refresh_token") not in (
+                        "fake-initial-cli-refresh",
+                        "fake-rotated-cli-refresh",
+                    ):
                         self.send_response(401)
                         self.send_header("X-Trace-ID", "fake-http-trace")
                         self.end_headers()
@@ -525,9 +803,14 @@ class OrdinaryCliExpiryTests(unittest.TestCase):
                             b'{"error":"invalid_grant","error_description":"Session inactive ORIGINAL_END"}'
                         )
                         return
+                    next_rt = (
+                        "fake-rotated-cli-refresh"
+                        if payload.get("refresh_token") == "fake-initial-cli-refresh"
+                        else "fake-keepalive-cli-refresh"
+                    )
                     value = tokens(
                         jwt(time.time() + 3600, "renewed-cli-access"),
-                        "fake-rotated-cli-refresh",
+                        next_rt,
                     )
                 elif "Action=GetUserDetail" in self.path:
                     value = {"Result": {"id": "user-fake-cli", "name": "fake-user"}}
@@ -612,6 +895,17 @@ class OrdinaryCliExpiryTests(unittest.TestCase):
             self.assertEqual(sum(p.endswith("/device-code") for p, b in seen), 1)
             self.assertEqual(sum(p.endswith("/token") for p, b in seen), 1)
             self.assertEqual(sum(p.endswith("/refresh") for p, b in seen), 1)
+            # Proactive `qzcli auth refresh --check` renews even while AT is unexpired
+            keepalive = command("auth", "refresh", "--check")
+            self.assertEqual(
+                keepalive.returncode, 0, keepalive.stderr + keepalive.stdout
+            )
+            self.assertTrue(json.loads(keepalive.stdout)["authenticated"])
+            self.assertEqual(
+                config.read_qz_credentials(official)["refresh_token"],
+                "fake-keepalive-cli-refresh",
+            )
+            self.assertEqual(sum(p.endswith("/refresh") for p, b in seen), 2)
             # When renewal is impossible, preserve the actual cause at the CLI boundary.
             config.save_qz_credentials(
                 official,
@@ -623,7 +917,7 @@ class OrdinaryCliExpiryTests(unittest.TestCase):
             self.assertIn("刷新令牌缺失", output)
             self.assertIn(str(official), output)
             self.assertNotIn("Cookie 已过期", output)
-            self.assertEqual(sum(p.endswith("/refresh") for p, b in seen), 1)
+            self.assertEqual(sum(p.endswith("/refresh") for p, b in seen), 2)
 
             config.save_qz_credentials(
                 official,
@@ -640,4 +934,4 @@ class OrdinaryCliExpiryTests(unittest.TestCase):
                 self.assertIn("ORIGINAL_END", output)
                 self.assertIn("fake-http-trace", output)
                 self.assertNotIn("Cookie 已过期", output)
-            self.assertEqual(sum(p.endswith("/refresh") for p, b in seen), 2)
+            self.assertEqual(sum(p.endswith("/refresh") for p, b in seen), 3)

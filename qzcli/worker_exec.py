@@ -86,6 +86,8 @@ def _connect(job_id: str, instance_name: str, timeout: int = 30):
     from .auth_diag import AuthDiagnostic
 
     api = get_api()
+    if getattr(api, "_allow_cas_fallback", None) is True and api.auth_mode == "qz":
+        api.ensure_authenticated(probe=False)
     server = api.base_url.rstrip("/")
     official = getattr(api, "auth_mode", None) == "qz"
     token, cookie = "", ""

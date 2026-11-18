@@ -168,7 +168,7 @@ class OfficialAuth:
 
     def status(self):
         access, refresh, static = self._read()
-        return {
+        info = {
             "auth_mode": "qz",  # Historical config/API name for official OAuth.
             "provider": "native-oauth",
             "source": "INSPIRE_TOKEN" if static else str(self.directory),
@@ -178,6 +178,13 @@ class OfficialAuth:
             "access_token": access.status(self.now()),
             "refresh_token": refresh.status(self.now()),
         }
+        if not static and refresh.token_type == "Offline":
+            info["offline_deprecated"] = True
+            info["warning"] = (
+                "平台已停用 offline_access 离线刷新令牌；"
+                "请运行 qzcli login --reauth 切换为在线会话令牌"
+            )
+        return info
 
     def _refresh_locked(
         self, access, refresh, *, force_refresh=False, failing_token=None
@@ -265,17 +272,66 @@ class OfficialAuth:
                     failing_token=failing_token,
                 )
 
+    def refresh(self):
+        """Proactively exchange refresh_token to reset server-side session idle timeout."""
+        initial_access, initial_refresh, static = self._read()
+        if static:
+            raise OfficialAuthError("INSPIRE_TOKEN 是静态凭据，不支持 OAuth refresh 保活")
+        self._require_refresh(initial_refresh)
+        with self._lock:
+            with qz_refresh_lock(self.directory):
+                access, refresh, _ = self._read()
+                if (
+                    (access.value, refresh.value)
+                    != (initial_access.value, initial_refresh.value)
+                    and access.value
+                    and not access.expired(self.now())
+                ):
+                    return self.status()
+                self._require_refresh(refresh)
+                self._refresh_locked(access, refresh)
+                return self.status()
+
     @staticmethod
-    def _notify(uri, code):
+    def _should_open_browser(open_browser=True):
+        import sys
+
+        if not open_browser or os.environ.get("QZCLI_NO_BROWSER"):
+            return False
+        if os.environ.get("SSH_CONNECTION") or os.environ.get("SSH_TTY"):
+            return False
+        isatty = getattr(sys.stdout, "isatty", lambda: False)
+        if not isatty():
+            return False
+        if sys.platform in ("darwin", "win32"):
+            return True
+        return bool(os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY"))
+
+    @classmethod
+    def _notify(cls, uri, code, *, open_browser=True):
         print("请在浏览器完成官方网页授权：", flush=True)
         print(f"  URL:  {uri}", flush=True)
         print(f"  Code: {code}", flush=True)
+        if cls._should_open_browser(open_browser):
+            try:
+                import webbrowser
+
+                if webbrowser.open(uri):
+                    print("已自动在默认浏览器打开授权页，请在页面点击确认…", flush=True)
+                    return
+            except Exception as exc:
+                from .diag import swallowed
+
+                swallowed("login/open_browser", exc)
         print("等待授权…", flush=True)
 
-    def login(self, *, force=False, notify=None, oauth_client=None):
+    def login(self, *, force=False, notify=None, oauth_client=None, open_browser=True):
         if os.environ.get("INSPIRE_TOKEN"):
             raise OfficialAuthError("INSPIRE_TOKEN 正在覆盖官方凭据，请先移除该环境变量再进行网页登录")
         if oauth_client is not None:
+            force = True
+        _, existing_refresh, _ = self._read()
+        if existing_refresh.token_type == "Offline":
             force = True
         if not force:
             try:
@@ -297,7 +353,9 @@ class OfficialAuth:
                     except OfficialAuthError as exc:
                         if not exc.action_required:
                             raise
-            callback = notify or self._notify
+            callback = notify or (
+                lambda uri, code: self._notify(uri, code, open_browser=open_browser)
+            )
             pair = (
                 self.oauth.login(callback)
                 if oauth_client is None

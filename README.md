@@ -1,18 +1,18 @@
 # qzcli - 启智平台任务管理 CLI
 
-![Release](https://img.shields.io/github/v/release/tianyilt/qzcli_tool?sort=semver) ![Python](https://img.shields.io/badge/python-%3E%3D3.8-blue) ![Tests](https://img.shields.io/badge/tests-733%20passed-brightgreen) ![License](https://img.shields.io/badge/license-MIT-green)
+![Release](https://img.shields.io/github/v/release/tianyilt/qzcli_tool?sort=semver) ![Python](https://img.shields.io/badge/python-%3E%3D3.8-blue) ![Tests](https://img.shields.io/badge/tests-737%20passed-brightgreen) ![License](https://img.shields.io/badge/license-MIT-green)
 
 一个类似 `kubectl` / `docker` 风格的启智平台命令行工具，把资源查询、任务提交、任务管理、日志查看和 MCP/agent 工作流收敛到 CLI 里完成。
 
 ## 项目链接
 
-- GitHub: <https://github.com/tianyilt/qzcli_tool>（Release: <https://github.com/tianyilt/qzcli_tool/releases/tag/v0.6.0>）
+- GitHub: <https://github.com/tianyilt/qzcli_tool>（Release: <https://github.com/tianyilt/qzcli_tool/releases/tag/v0.6.1>）
 - Gitee 所内镜像: <https://gitee.sii.edu.cn/sii/repos/sii/qzcli/sources>（clone: `https://gitee.sii.edu.cn/sii/qzcli.git`）
 - Changelog: [CHANGELOG.md](CHANGELOG.md)
 - Issues: <https://github.com/tianyilt/qzcli_tool/issues>
 - License: [MIT](LICENSE)
 
-v0.6.0 起默认使用 **Python 原生官方 OAuth + `Offline` 离线刷新令牌**，无需安装外部 Go `qz`（Inspire-CLI），消除隔夜闲置 `invalid_grant: Session not active` 重复网页登录问题。详见 [认证实现与验收](docs/native_oauth.md)。
+v0.6.1+ 默认使用 **Python 原生官方设备码 OAuth**（scope `openid profile email`，与官方 `qz v1.0.0` 对齐），无需安装外部 Go `qz`（Inspire-CLI）；平台停用 `offline_access` 后，支持 `qzcli auth refresh` 定时保活，且**默认自带无人值守兜底**（若机器已配置 `~/.qzcli/.env` 或 `config.json` 凭据，OAuth 会话凌晨到期时自动无感回退本地 CAS 会话续跑，绝不中断管线；一旦遇到验证码或二次验证立即 0 重试熔断并提示用户运行 `qzcli login`；严格纯 OAuth 可显式传 `--auth-mode native`）。详见 [认证实现与验收](docs/native_oauth.md)。
 
 ## 特性
 

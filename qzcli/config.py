@@ -184,13 +184,23 @@ def select_auth(mode=None, qz_config_dir=None):
     _qz_dir_override = qz_config_dir
 
 
-def get_auth_mode(explicit=None):
+def _raw_auth_mode(explicit=None):
     mode = explicit or _auth_mode_override or os.environ.get("QZCLI_AUTH_MODE")
-    mode = mode or load_config().get("auth_mode", "qz")
+    return mode or load_config().get("auth_mode", "qz")
+
+
+def allows_cas_fallback(explicit=None) -> bool:
+    """Default ``qz`` and ``auto`` fall back to local CAS credentials when OAuth RT expires;
+    explicit ``native`` stays strict OAuth-only."""
+    return _raw_auth_mode(explicit) in ("qz", "auto")
+
+
+def get_auth_mode(explicit=None):
+    mode = _raw_auth_mode(explicit)
     if mode == "native":
         mode = "qz"  # Preserve existing API/config contracts for official OAuth.
-    if mode not in ("qz", "legacy"):
-        raise ConfigError("auth_mode 必须是 native、qz（兼容名称）或 legacy")
+    if mode not in ("qz", "legacy", "auto"):
+        raise ConfigError("auth_mode 必须是 auto、native、qz（兼容名称）或 legacy")
     return mode
 
 
